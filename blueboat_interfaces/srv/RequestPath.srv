@@ -1,0 +1,3 @@
+std_msgs/Float32MultiArray path_request
+---
+nav_msgs/Path path

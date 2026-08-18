@@ -1,0 +1,80 @@
+<?xml version="1.0"?>
+
+<xacro>
+
+<gazebo>
+    <plugin filename="ignition-gazebo-hydrodynamics-system" name="ignition::gazebo::systems::Hydrodynamics">
+
+<!--     <density>${density}</density> -->
+        
+    <!-- Ignition notations from Handbook of Marine Craft, Fossen, 2011 -->
+        
+    <link_name>${ns}/base_link</link_name>
+
+    <!-- BlueBoat Parameters -->
+    <!-- LIEVORE, MARCO. "Autonomous usv navigation and control for auv tracking via optimal, 
+    collision-free trajectory generation." -->
+
+    <!-- BlueROV2 parameters -->
+    <!-- M. von Benzon, F. F. Sørensen, E. Uth, J. Jouf-
+    froy, J. Liniger, and S. Pedersen, “An open-source
+    benchmark simulator: Control of a bluerov2 un-
+    derwater robot,” Journal of Marine Science and
+    Engineering, vol. 10, no. 12, p. 1898, 2022. -->
+        
+    <!-- BlueROV2 -->
+
+    <!-- Negative diagonal values of added mass matrix -->
+    <xDotU>-5.5</xDotU>
+    <yDotV>-12.7</yDotV>
+    <zDotW>-14.57</zDotW>
+    <kDotP>-0.12</kDotP>z
+    <mDotQ>-0.12</mDotQ>
+    <nDotR>-0.12</nDotR>
+    
+    <!-- Negative linear damping -->    
+    <xU>-25.15</xU>
+    <yV>-7.364</yV>
+    <zW>-17.955</zW>
+    <kP>-10.888</kP>
+    <mQ>-20.761</mQ>
+    <nR>-3.744</nR>
+                     
+    <!-- Negative quadratic damping -->          
+    <xUabsU>-33.800000000000004</xUabsU>
+    <yVabsV>-54.26875</yVabsV>
+    <zWabsW>-73.37135</zWabsW>
+    <kPabsP>-40.0</kPabsP>
+    <mQabsQ>-40.0</mQabsQ>
+    <nRabsR>-40.0</nRabsR>
+
+
+    <!-- BlueROV2 Heavy -->
+        
+    <!-- Negative diagonal values of added mass matrix -->
+    <!-- <xDotU>-6.36</xDotU>
+    <yDotV>-7.12</yDotV>
+    <zDotW>-18.68</zDotW>
+    <kDotP>-0.189</kDotP>z
+    <mDotQ>-0.135</mDotQ>
+    <nDotR>-0.222</nDotR> -->
+    
+    <!-- Negative linear damping -->    
+    <!-- <xU>-13.7</xU>
+    <yV>-0.</yV>
+    <zW>-33.</zW>
+    <kP>-0.</kP>
+    <mQ>-0.8</mQ>
+    <nR>-0.</nR> -->
+                     
+    <!-- Negative quadratic damping -->          
+    <!-- <xUabsU>-141</xUabsU>
+    <yVabsV>-217</yVabsV>
+    <zWabsW>-190</zWabsW>
+    <kPabsP>-1.19</kPabsP>
+    <mQabsQ>-0.47</mQabsQ>
+    <nRabsR>-1.9</nRabsR> -->
+         
+    </plugin>
+</gazebo>
+</xacro>

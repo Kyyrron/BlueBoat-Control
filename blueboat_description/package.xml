@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>blueboat_description</name>
+  <version>0.1.0</version>
+  <description>The blueboat_description package</description>
+
+  <maintainer email="yannick.noe@enib.fr">Yannick NOE</maintainer>
+
+  <license>MIT</license>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
