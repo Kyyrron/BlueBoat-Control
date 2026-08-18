@@ -1,0 +1,15 @@
+-e git+https://github.com/acados/acados.git@db1c3caa6571fbeadf06ac10081ed15965cd0926#egg=acados_template&subdirectory=interfaces/acados_template
+
+bluerobotics-ping==0.2.4
+casadi==3.7.2
+Cython==3.2.4
+matplotlib==3.10.8
+numpy==2.4.4
+pandas==3.0.2
+pyserial==3.5
+PyYAML==6.0.3
+requests==2.33.1
+scipy==1.17.1
+sympy==1.14.0
+transformations==2026.1.18
+lxml
