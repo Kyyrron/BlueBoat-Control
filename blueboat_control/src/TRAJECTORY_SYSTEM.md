@@ -500,11 +500,6 @@ anything called it. Nothing does. Delete it.
 `los_kpsi`, `los_kd`. These are exactly the knobs you want to change on a boat ramp without a
 rebuild. `declare_parameter` for each, with the current values as defaults, costs nothing.
 
-**F17 — Manual target cannot be the origin.**
-`manual_active` is `list(self.manual_target) != [0.0, 0.0]`
-([line 421](master_control.py#L421)) — the sentinel for "no manual target" is a legal
-coordinate. A separate Bool or a NaN sentinel would be cleaner.
-
 **F18 — No zero-thrust on loss of reference.** Several paths in `timer_callback` `return`
 early ([lines 371, 411, 514](master_control.py#L514)) without publishing. `robot_interface`
 keeps streaming the **last received** `thruster_input` to the motors

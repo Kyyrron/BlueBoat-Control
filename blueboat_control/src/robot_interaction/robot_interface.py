@@ -254,8 +254,8 @@ class BlueBoatController(Node):
                                   columns=self.data_columns)
 
         self.date = datetime.today().strftime('%Y_%m_%d-%H_%M_%S')
-        os.makedirs('../../../data/Robot_data', exist_ok=True)  # avoid every log write silently failing when the folder is missing
-        self.path = f'../../../data/Robot_data/{self.date}-{self.note}-poslog.csv'
+        os.makedirs('../../../../data/Robot_data', exist_ok=True)  # avoid every log write silently failing when the folder is missing
+        self.path = f'../../../../data/Robot_data/{self.date}-{self.note}-poslog.csv'
 
     def monitoring_data_callback(self, msg: Float32MultiArray):
         """
