@@ -13,6 +13,86 @@ import os
 from scipy.interpolate import PchipInterpolator
 
 
+#################### Run-artifact locations ####################
+# Every run artifact (the position CSV, the controller .npy) is written under one
+# root, resolved at runtime rather than inherited from the launch working
+# directory. Inheriting it meant the launcher decided where field record landed:
+# the same runs ended up scattered across the workspace, this repository and the
+# Mission Control Station's repository. Field data is write-once (CLAUDE.md #6),
+# so where it lands must not depend on the directory the operator happened to
+# stand in.
+
+def data_root(explicit: str = '') -> str:
+    """
+    Absolute root directory for run artifacts. Precedence:
+
+      1. `explicit`            -- the node's `data_dir` parameter, when non-empty
+      2. $BLUEBOAT_DATA_DIR
+      3. the sourced ROS workspace -- parent of the first $COLCON_PREFIX_PATH entry
+      4. the process working directory -- previous behaviour, last resort
+
+    (3) is what normally answers: COLCON_PREFIX_PATH is set by the same
+    `install/setup.bash` that makes `ros2 launch blueboat_control ...` resolve at
+    all, and its parent is the workspace root that already holds `data/`.
+    """
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+
+    env = os.environ.get('BLUEBOAT_DATA_DIR', '')
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+
+    prefix_path = os.environ.get('COLCON_PREFIX_PATH', '')
+    first = prefix_path.split(os.pathsep)[0] if prefix_path else ''
+    if first:
+        return os.path.dirname(os.path.abspath(first))
+
+    return os.getcwd()
+
+
+def ensure_data_dir(node, root: str, *parts) -> str:
+    """
+    Create `root/*parts` and return it. An unwritable root is fatal and says so:
+    a mission that cannot record is worse than a launch that refuses, and the
+    refusal happens dry rather than in the water. Callers log the artifact path
+    they build from it, so a run is never ambiguous about where it wrote.
+    """
+    target = os.path.join(root, *parts)
+    try:
+        os.makedirs(target, exist_ok=True)
+    except OSError as exc:
+        node.get_logger().error(
+            f"Cannot create the run-data directory '{target}': {exc}. "
+            f"Set the 'data_dir' launch argument or $BLUEBOAT_DATA_DIR to a "
+            f"writable location.")
+        raise
+    return target
+
+
+def reserve_run_file(directory: str, stem: str, suffix: str) -> str:
+    """
+    Reserve `directory/stem+suffix`, returning a path that did not already exist.
+
+    Run artifacts are stamped to the second, so two runs started inside the same
+    second used to resolve to the same name and the later one silently rewrote
+    the earlier - the exact loss CLAUDE.md #6 forbids for a write-once field
+    record. The name is claimed with O_EXCL, which also settles the race between
+    two processes reserving at once; on collision a `-2`, `-3`, ... suffix is
+    appended. Uncontended runs keep byte-identical names to before.
+
+    Returns the reserved path WITHOUT `suffix`, since np.save appends its own.
+    """
+    n = 1
+    while True:
+        stem_n = stem if n == 1 else f'{stem}-{n}'
+        path = os.path.join(directory, stem_n + suffix)
+        try:
+            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+            return os.path.join(directory, stem_n)
+        except FileExistsError:
+            n += 1
+
+
 def generate_interpolator():
     pwm = np.array([1100,1110,1136,1162,1188,1214,1240,1266,1292,1318,1344,1370,1396,1422,1448,1474,1500,1526,1552,1578,1604,1630,1656,1682,1708,1734,1760,1786,1812,1838,1864,1890,1900])
     thr = 9.80665*np.array([-2.81,-2.78,-2.64,-2.42,-2.21,-2.04,-1.83,-1.57,-1.42,-1.2,-0.98,-0.82,-0.6,-0.41,-0.24,-0.09,0,0.21,0.5,0.82,1.17,1.58,1.93,2.37,2.76,3.23,3.57,3.99,4.36,4.84,5.22,5.45,5.63])

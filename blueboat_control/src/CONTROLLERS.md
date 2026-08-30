@@ -37,7 +37,7 @@ Every plot is a **closed-loop simulation**, not a sketch.
 ## 1. What the boat can physically do
 
 No controller can beat these limits, so it is worth knowing them before blaming a controller.
-All derived from the model parameters in [master_control.py:375-388](master_control.py#L375-L388):
+All derived from the model parameters in [master_control.py:617-630](master_control.py#L617-L630):
 
 | Quantity | Value | Where it comes from |
 |---|---|---|
@@ -70,7 +70,7 @@ Two consequences that shape everything below:
 |---|---|---|---|---|
 | Selected by | `controller_type:=MPC` | `:=PID` | `:=LoS` | automatic (pinger / manual) |
 | Full name | Nonlinear model predictive control | Cascaded PID + lookahead LoS | Kinematic lookahead LoS | Body-frame pure pursuit |
-| Code | [MPC/ur_mpc.py](MPC/ur_mpc.py) | [PID/PID.py](PID/PID.py) | [master_control.py:289](master_control.py#L289) | [master_control.py:318](master_control.py#L318) |
+| Code | [MPC/ur_mpc.py](MPC/ur_mpc.py) | [PID/PID.py](PID/PID.py) | [master_control.py:293](master_control.py#L293) | [master_control.py:322](master_control.py#L322) |
 | Follows a **path**? | yes | yes | yes | **no — chases a point** |
 | Needs a boat model? | **yes** (mass, drag, added mass) | no | no | no |
 | Needs a solver? | **yes** (acados + CasADi) | no | no | no |
@@ -128,7 +128,7 @@ It is the only controller here that **knows what the boat is made of** — and t
 entire source of its advantage. Because drag is in the model, it works out the exact thrust
 needed to hold 0.5 m/s without anyone tuning a gain.
 
-**Parameters** — [master_control.py:131-157](master_control.py#L131-L157):
+**Parameters** — [master_control.py:153-179](master_control.py#L153-L179):
 
 | Parameter | Default | Meaning |
 |---|---|---|
@@ -201,7 +201,7 @@ at 0.3 rad/s". The inner loop turns that into Newtons. Steering comes from the L
 the path's authored speed is injected as a **feedforward** (`u_ff`), so the PID only has to
 correct the residual.
 
-**Parameters** — [master_control.py:160-180](master_control.py#L160-L180):
+**Parameters** — [master_control.py:182-202](master_control.py#L182-L202):
 
 | Parameter | Default | Meaning |
 |---|---|---|
@@ -256,7 +256,7 @@ N     = los_kpsi * psi_err - los_kd*r  # yaw moment
 The `cos(psi_err)` term is a nice touch: **the boat slows down while it is turning hard onto
 the path**, which stops it spiralling around a corner it cannot make.
 
-**Parameters** — [master_control.py:193-199](master_control.py#L193-L199):
+**Parameters** — [master_control.py:215-221](master_control.py#L215-L221):
 
 | Parameter | Default | Meaning |
 |---|---|---|
@@ -275,11 +275,13 @@ the path**, which stops it spiralling around a corner it cannot make.
 **Weaknesses**
 * **Worst tracker of the three**, and it cannot be fixed by gain tuning alone (§6).
 * **No integrator anywhere** → a permanent offset under any steady disturbance.
-* **It cannot station-keep.** With `U_d = 0` the surge command is identically zero no matter
-  how far off the target the boat is, so it just drifts. That makes it the wrong choice for
-  `station_keeping`, for the end of a finished mission, and for the
-  waiting-for-GPS-deployment fallback. (This is finding **F2** in
-  [TRAJECTORY_SYSTEM.md](TRAJECTORY_SYSTEM.md).)
+* Station keeping is a **bolted-on mode, not the guidance law**. Below `hold_speed` the surge
+  command blends to holding the reference point (steer at it, surge proportional to the range
+  outside `hold_radius`), because the path law itself commands zero surge at zero authored
+  speed. It works — 0.50 m in calm water, 1.00 m against a 10 N current, against unbounded
+  drift before — but it is a second law living inside the first, and the boat holds a *radius*,
+  not a point. `PID` needs the same treatment for a different reason and gets it the same way.
+  (Finding **F2** in [TRAJECTORY_SYSTEM.md](TRAJECTORY_SYSTEM.md), closed.)
 * Yaw loop is over-damped as shipped: ζ ≈ 1.38, so heading response is sluggish.
 
 **Literature.** The *guidance law* is canonical. This particular controller — proportional
@@ -312,11 +314,11 @@ thrust   = [v + 0.295*yaw_rate, v - 0.295*yaw_rate]
 ```
 
 Two things distinguish it: it works **entirely in the body frame** (so it needs no world
-position and is immune to odometry drift — which is why pinger mode is unaffected by the
-frame bug F8), and its speed is a **logarithmic** function of distance, so it approaches
-gently instead of charging.
+position and is immune to odometry drift — which is why pinger mode stayed out of the F8
+velocity-frame question, now settled with no change), and its speed is a **logarithmic**
+function of distance, so it approaches gently instead of charging.
 
-**Parameters** — [master_control.py:201-206](master_control.py#L201-L206):
+**Parameters** — [master_control.py:738-743](master_control.py#L738-L743):
 
 | Parameter | Simulation | Real boat | Meaning |
 |---|---|---|---|
@@ -339,7 +341,7 @@ gently instead of charging.
   is a positive feedback loop (see §5.5).
 * **The simulation gains diverge** on the model used here (finding **C8**).
 * `safety_distance = -1.0` **disables the stop condition**, so the arrival logic at
-  [master_control.py:343-348](master_control.py#L343-L348) is dead code.
+  [master_control.py:585-590](master_control.py#L585-L590) is dead code.
 * Thrust is a raw formula with no allocation or saturation logic — it is clipped downstream.
 
 **Literature.** This is **pure pursuit** (Coulter, CMU 1992) in all but name — the classic
@@ -351,6 +353,25 @@ to be, a path follower.
 
 ## 5. Head-to-head
 
+> **Every number in this section is simulation evidence.** It comes from the harness described
+> at the top of this document, not from the water.
+>
+> - **The MPC is graded against the very model it assumes.** The plant here *is* `ur_mpc.py`'s
+>   internal model — same mass, added mass, Coriolis, damping and allocation matrix. The MPC is
+>   scored with a perfect model of the boat; the other three controllers are not.
+> - **SciPy SLSQP substitutes for acados.** Same problem, same `Q`/`R`, same `N`/`T`, same
+>   reference construction — a different solver.
+> - **Trends and magnitudes hold; exact traces will not.** On the water, model error, unmodelled
+>   disturbance and actuator behaviour move the traces.
+> - **The MPC's advantage will narrow.** Most of the gap below is that modelling advantage, and
+>   it is the first thing real water takes away.
+>
+> The `PID`, `LoS` and `Point-LoS` rows carry no such qualification — that is the real code, run
+> unmodified, and they re-derive bit-for-bit by running the harness
+> (`cd docs/controllers && python3 run_sims.py && python3 analyze.py`). The
+> project-scope rule is `project_synthesis.md` §4 and §4.1: no layer of evidence is used above
+> its evidential weight.
+
 ### 5.1 Acquiring a path from a 5 m offset
 
 The boat starts 5 m to the side of a straight line authored at 0.50 m/s.
@@ -361,7 +382,15 @@ The boat starts 5 m to the side of a straight line authored at 0.50 m/s.
 |---|---|---|---|---|
 | **MPC** | **0.015 m** | **24 s** | **0.50 m/s** (100 %) | **1.00×** |
 | **PID** | 0.661 m | 59 s | 0.235 m/s (47 %) | 0.43× |
-| **LoS** | 1.184 m | never | 0.107 m/s (21 %) | 0.23× |
+| **LoS** | 0.033 m | 36 s | 0.202 m/s (40 %) | 0.39× |
+
+> The LoS row is at the current `los_ku = 20.0`. At the original 8.0 it read
+> 1.184 m / never / 0.107 m/s (21 %) / 0.23× — the numbers the prose below was written
+> against, and the ones the figures still show.
+>
+> The MPC row is the one number here that does not reproduce exactly: it is SciPy SLSQP,
+> not acados, and it moves with the SciPy and BLAS build (0.015–0.020 m, 24–25 s, observed).
+> The `PID` and `LoS` rows are pure numpy and reproduce bit-for-bit.
 
 Read the last column carefully: **"mission progress" is how fast the path parameter τ
 advances compared to real time.** At 0.23× the LoS controller takes *four times longer* than
@@ -557,7 +586,7 @@ achieved / commanded  =  k / (k + drag coefficient)
 |---|---|---|---|
 | PID surge — `inner_gains['u']` | 1.0 | 29.34 | **3.3 %** |
 | PID yaw rate — `inner_gains['r']` | 1.5 | 44.65 | **3.3 %** |
-| LoS surge — `los_ku` | 8.0 | 29.34 | **21.4 %** |
+| LoS surge — `los_ku` (was 8.0) | 20.0 | 29.34 | 40.4 % |
 
 Ask for 0.5 m/s, get 0.017 m/s. The loops only function at all because the *outer* loop
 error grows until its proportional term is large enough to compensate — the PID reaches a
@@ -583,9 +612,16 @@ of the target because there is no integral or feedforward term to close the last
 
 And the effect on actual path tracking, on the circle:
 
-| `inner_gains['r']` (PID) | **1.5 (shipped)** | 10.0 | 45.0 | 100.0 |
+| `inner_gains['r']` (PID) | **1.5 (current)** | 10.0 | 45.0 | 100.0 |
 |---|---|---|---|---|
 | Mean cross-track error | **1.745 m** | 0.240 m | **0.086 m** | 0.061 m |
+
+> **Read this row with its condition.** It was measured with `inner_gains['u']` already at
+> 10.0, which the row does not say. That matters twice. The `1.5` column is *not* the current
+> circle error — at the current `u = 1.0` the circle reads **0.097 m** RMS (§5.2), because the
+> boat is too slow to be anywhere near the authored speed. And raising `u` alone, without `r`,
+> makes the circle **14× worse** (0.097 → 1.360 m) with 49 % of samples on the ±20 N clamp.
+> The two gains have to move together.
 
 **A 20× improvement in tracking accuracy from changing two numbers.**
 
@@ -596,8 +632,8 @@ And the effect on actual path tracking, on the circle:
 self.inner_gains = {'u': (10.0, 0.0, 0.0),    # was 1.0
                     'r': (20.0, 0.0, 0.0)}    # was 1.5
 
-# master_control.py, LoS branch
-self.los_ku   = 30.0    # was 8.0
+# master_control.py, LoS branch  -- LANDED, as los_ku = 20.0
+self.los_ku   = 20.0    # was 8.0
 self.los_kpsi = 19.0    # was 10.0  -> critically damped yaw (zeta = 1.0)
 ```
 
@@ -651,7 +687,7 @@ choice. Raise it toward 4 m if the boat weaves; lower it toward 2 m for tighter 
 | Sharp corners / lawnmower patterns | **MPC** | Only one that turns *before* the corner |
 | No acados on the vehicle | **PID** *(with §6 gains)* | Close to MPC once the inner loops work |
 | First time on a new boat / debugging | **LoS** | Predictable, nothing to diverge, easy to reason about |
-| Station keeping / holding a position | **PID** | LoS cannot hold station at all (F2) |
+| Station keeping / holding a position | **LoS** | Both hold now (F2 closed), both through the same bolted-on mode. LoS is the tighter of the two at rest — 0.50 / 0.70 / 1.00 m in calm water, 4 N and 10 N of current, against PID's 0.63 / 0.90 / 2.14 m |
 | Windy day / strong current | **PID** *(with §6 gains, ideally + ILoS)* | Best of a bad set; ~1 m offset remains |
 | Homing on the pinger or a clicked point | *automatic* | Point-LoS takes over on its own |
 
@@ -661,10 +697,9 @@ In descending order of measured benefit — all five are one-line edits:
 
 | # | Change | From → to | Measured effect |
 |---|---|---|---|
-| 1 | `inner_gains['u']` | 1.0 → **10.0** | Cruise speed 0.267 → 0.501 m/s; mission 0.49× → 1.00× |
-| 2 | `inner_gains['r']` | 1.5 → **20–45** | Circle error 1.745 → 0.086 m |
+| 1 | `inner_gains['u']` **and** `['r']` together | 1.0 / 1.5 → **5.0 / 30.0** | Acquisition 0.661 → 0.015 m, circle 0.097 → 0.011 m, cruise 0.235 → 0.460 m/s, mission 0.43× → 0.86× |
 | 3 | `mpc_time` (+ `mpc_horizon` 15 → 30) | 2.5 s → **6.0 s** | MPC circle error 1.019 → 0.011 m |
-| 4 | `los_ku` (+ drag feedforward) | 8.0 → **30** | LoS cruise 0.107 → 0.253 m/s |
+| 4 | `los_ku` (+ drag feedforward) | 8.0 → **20** *(landed)* | LoS acquisition 1.184 → 0.033 m, cruise 0.107 → 0.202 m/s |
 | 5 | `safety_distance` | −1.0 → **1.5 m** | Point-LoS actually stops on arrival |
 
 ### Symptom → knob
@@ -679,15 +714,21 @@ In descending order of measured benefit — all five are one-line edits:
 | MPC runs wide on every curve, and too fast | `mpc_time` — raise 2.5 s → 5–6 s (C9) |
 | Heading hunts / oscillates | Lower `los_kpsi`, or raise `los_kd` / the inner r gain |
 | Thrusters slam back and forth (MPC) | Raise `R_weight` to 0.05–0.1 |
-| Boat drifts away while station-keeping | You are on `LoS` — switch to `PID` (F2) |
+| Boat drifts away while station-keeping | Not the old F2 — check `hold_speed` was not launched at 0 (that disables the hold in both controllers); on LoS, raise `los_hold_kx` to shrink the held radius |
 | Target runs away from the boat | It cannot — that is the governor's job. Check `e_along` |
 
-### The parameters worth exposing as ROS parameters
+### The parameters exposed as ROS parameters
 
-None of these are currently `declare_parameter`'d, so every change needs a rebuild
-(finding **F16**): `path_speed_scale`, `gov_Lmin`, `gov_Lmax`, `los_lookahead`,
-`pid_lookahead`, `los_ku`, `los_kpsi`, `los_kd`, `outer_gains`, `inner_gains`, `Q_weight`,
-`R_weight`.
+All of them, and more than this section originally asked for (finding **F16**, closed):
+`control_dt`, `path_speed_scale`, `gov_Lmin`, `gov_Lmax`, `gov_Emin`, `gov_Emax`,
+`los_lookahead`, `los_ku`, `los_kpsi`, `los_kd`, `los_speed_scale`, `hold_speed`,
+`hold_radius`, `los_hold_kx`, `los_hold_umax`, `pid_lookahead`,
+`outer_gains_x`, `outer_gains_psi`, `inner_gains_u`, `inner_gains_r`, `mpc_horizon`,
+`mpc_time`, `mpc_Q_diag`, `mpc_R_diag`, `point_k_v`, `point_k_psi`, `safety_distance`,
+`thrust_limit`. Every sweep in this section can now be run from a launch argument, and every
+one of them still defaults to the value it had when these numbers were measured. The interface
+nodes add one of their own, `thruster_input_timeout` (0.5 s), on `robot_interface` and
+`simulation_interface`.
 
 ---
 
@@ -696,8 +737,10 @@ None of these are currently `declare_parameter`'d, so every change needs a rebui
 These are new here, beyond the trajectory-system findings in
 [TRAJECTORY_SYSTEM.md](TRAJECTORY_SYSTEM.md).
 
-**C1 — 🔴 Inner-loop gains ~30× too low** (both `PID` and `LoS`). Section 6. Costs a 4×
-slower mission and a 20× worse tracking error. Two numbers.
+**C1 — 🟠 Inner-loop gains ~30× too low** (`PID`; the `LoS` half is fixed at
+`los_ku = 20.0`). Section 6. Costs a 4× slower mission and a 20× worse tracking error. The
+PID pair is unchanged by decision — it is the condition the existing field data was recorded
+at — and is now a launch argument rather than a rebuild. `TODO.md` C1.
 
 **C9 — 🔴 The MPC prediction horizon is shorter than one turning radius.** `mpc_time = 2.5 s`
 covers 0.80 m of travel; the boat's minimum turning radius is 1.89 m. Measured cost on the
@@ -708,15 +751,15 @@ be a solver artifact.
 **C2 — 🟠 The MPC does not handle heading wrap-around.**
 [ur_mpc.py:226-227](MPC/ur_mpc.py#L226-L227) normalises each reference yaw into [−π, π] and
 then `np.unwrap`s *forward across the horizon*, but the measured state
-([master_control.py:415](master_control.py#L415)) is also wrapped into [−π, π] and the two are
+([master_control.py:657](master_control.py#L657)) is also wrapped into [−π, π] and the two are
 never reconciled. When the reference heading crosses ±π — which happens on every circle, every
 loop, and any mission with a northward leg — the cost sees an error of up to 2π and commands a
 full turn the wrong way. **Fix:** unwrap the reference relative to the measured heading, i.e.
 `x_refs[:,2] = x_current[2] + wrap(x_refs[:,2] - x_current[2])` accumulated along the horizon.
 
 **C3 — 🟠 `Point-LoS` never stops.** `safety_distance = -1.0`
-([master_control.py:208](master_control.py#L208)) disables the arrival check, so the stopping
-sequence at [master_control.py:343-348](master_control.py#L343-L348) is dead code and the boat
+([master_control.py:318](master_control.py#L318)) disables the arrival check, so the stopping
+sequence at [master_control.py:585-590](master_control.py#L585-L590) is dead code and the boat
 never recognises arrival. Set it to ~1.5 m for real use.
 
 **C8 — 🟠 The `Point-LoS` simulation gains diverge** on the `ur_mpc.py` hull model — from every

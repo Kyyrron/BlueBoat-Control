@@ -23,6 +23,7 @@ from urdf_parser_py import urdf
 import uvr_mpc
 from blueboat_control import ROV
 from blueboat_interfaces.srv import RequestPath
+import os
 import custom_functions as cf
 
 class Controller(Node):
@@ -77,7 +78,11 @@ class Controller(Node):
         self.monitoring.append(['x','y','psi','x_d','y_d','psi_d','u1','u2','u3','t'])
 
         self.date = datetime.today().strftime('%Y_%m_%d-%H_%M_%S')
-        self.title = 'data/MPC_data/' + self.date + '-mpc_data'
+        # Same run-artifact anchor as master_control; these nodes previously
+        # wrote relative to the launch working directory and created no folder.
+        run_dir = cf.ensure_data_dir(self, cf.data_root(), 'data', 'MPC_data')
+        self.title = cf.reserve_run_file(run_dir, self.date + '-mpc_data', '.npy')
+        self.get_logger().info(f"Controller log: {self.title}.npy")
 
         self.t_record = self.get_time()
 

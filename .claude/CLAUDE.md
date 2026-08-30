@@ -8,6 +8,10 @@ stack: `blueboat_control/src/TRAJECTORY_SYSTEM.md` (where the reference target c
 and `blueboat_control/src/CONTROLLERS.md` (what each controller does with it, with measured
 closed-loop comparisons). Their defect registers are tracked in `TODO.md`.
 
+A third file, `blueboat_control/src/summary_controllers.md`, predates both and is **not
+maintained** — it still documents `los_ku = 8.0`, which the tree left behind. `CONTROLLERS.md`
+supersedes it.
+
 ---
 
 ## 0. What this module is
@@ -49,22 +53,19 @@ Downstream stacks run unmodified in both; divergence invalidates the sim-to-real
 the thesis rests on.
 
 **N3 — MAVROS twist is body-frame and must not be rotated.**
-`/mavros/local_position/odom` has `child_frame_id: base_link`, so `twist` is already
-body-frame (surge/sway/yaw-rate) while `pose` is world-frame. `robot_interface` re-expresses
-**pose** into a boot-relative frame (subtracting `x0, y0, yaw0`) and passes **twist** through
-untouched (`robot_interface.py:519-521`).
+`/mavros/local_position/odom` has `child_frame_id: base_link` and MAVROS has already rotated
+its `twist` into that frame, so it is surge/sway/yaw-rate while `pose` is world-frame; the ENU
+velocity is a separate topic, `/mavros/local_position/velocity_local`. `robot_interface`
+re-expresses **pose** into a boot-relative frame (subtracting `x0, y0, yaw0`) and passes
+**twist** through untouched (`robot_interface.py:492`). Two consumers depend on it staying
+body-frame: `master_control` reads `current_twist[0]` as surge for the inner speed loop of both
+`PID` and `LoS` (`master_control.py:401`), and the pinger dead-reckoning subtracts
+`self.vel + ω × p` from body-frame pinger coordinates (`robot_interface.py:534`).
 
-A block that would rotate the linear velocity by `-yaw0` sits **commented out** at
-`robot_interface.py:523-544`, with an in-file comment arguing it is required — that without
-it pose and twist live in two frames differing by a constant rotation, producing "a fixed
-diagonal drift and mirroring heading-swept paths". `master_control` reads `current_twist[0]`
-as body-frame surge (`master_control.py:416`), feeding the inner speed loop of both `PID` and
-`LoS`. The rule above and that comment assert opposite things, and the code currently follows
-the rule. Do not enable or delete the block on either authority alone; `TODO.md` holds the
-decision.
+Measured against mavros 2.14.0, not inferred: `TRAJECTORY_SYSTEM.md` F8 carries the numbers.
 
 **N4 — `enable_motors` gates thruster output.**
-The gate is the early return in `manualMove` (`robot_interface.py:316`): no thrust-bearing
+The gate is the early return in `manualMove` (`robot_interface.py:363`): no thrust-bearing
 PWM reaches the motors unless `enable_motors:=True`. Exactly two paths write to
 `/mavros/rc/override` around it, both deliberately, and neither carries thrust:
 `full_stop()` calls `manualMove([0,0], force=True)`, and `mode_callback()` calls
@@ -89,10 +90,10 @@ and is the project's scarcest resource.
 
 **N8 — The path reference advances from the boat's measured progress, never from wall-clock
 time.** A time-driven reference is an open-loop player rather than a follower, and no gain
-tuning can compensate for it. The governor at `master_control.py:274-284` is what enforces
-this.
+tuning can compensate for it. The governor at `master_control.py:584-643`
+(`path_progress_errors` + `advance_governor`) is what enforces this.
 
-`current_time = time.time() - self.initial_time` (`master_control.py:407`) still exists, but
+`current_time = time.time() - self.initial_time` (`master_control.py:391`) still exists, but
 it only timestamps `/monitoring_data` and the `.npy` log — it does not touch the reference.
 Do not "fix" it by routing it back into path generation; that is precisely the design this
 replaced.
@@ -102,7 +103,9 @@ replaced.
 LoS, PID and MPC alike; mixed frames corrupt the station map display. Each branch sets
 `world_target` and monitoring reads that. `/controller_target` deliberately keeps its original
 body-frame content for the pinger case — the two are different signals and must not be
-unified.
+unified, which is also why the publish is not hoisted into the other branches. A consumer that
+wants the target during path following or manual control reads `/monitoring_data[4:6]`, which
+is world-frame in every branch.
 
 ---
 
@@ -116,7 +119,9 @@ silently rename half the interface (N1).
 Two components use **relative** names instead, resolved through their node's namespace, and
 land on the same wire names: `path_publisher` (`set_path`, `path_request` — root namespace)
 and the `ROV` helper in `blueboat_control/__init__.py` (`odom`, `joint_states`,
-`robot_description`, `cmd_<thruster>` — under `blueboat`).
+`robot_description`, `cmd_<thruster>` and `cmd_<joint>`, plus the display-only
+`blueboat_<thruster>_wrench` and `blueboat_base` — all under `blueboat`, the namespace of every
+node that constructs it).
 
 ### 2.1 Nodes
 
@@ -136,7 +141,57 @@ which is why the sources import each other as bare modules (`import custom_funct
 | `MPC/ur_mpc_control.py` | `src/MPC/` | `mpc_control` (ns `blueboat`) | Standalone MPC node — installed, launched by nothing |
 | `MPC/uvr_mpc_control.py` | `src/MPC/` | `mpc_control` (ns `blueboat`) | Standalone 3-thruster MPC node — installed, launched by nothing |
 
-The last two claim the same node name and are started by neither launch file.
+Non-node library modules, installed the same flat way and imported as bare modules:
+
+| Module | Source path under `blueboat_control/` | Imports ROS? | Contents |
+|---|---|---|---|
+| `custom_functions.py` | `src/_custom_libraries/` | yes (`rclpy`, msgs) | Shared helpers: `data_root`, `odometry`, `compute_target`, quaternion/frame maths |
+| `yaml_trajectory.py` | `src/_custom_libraries/` | no | `blueboat_trajectory/1` loader, evaluated at time `t` |
+| `frame_math.py` | `src/_custom_libraries/` | **no** | `inRobotFrame()` — world→body geometry, with its full input/output contract |
+| `robot_log_schema.py` | `src/_custom_libraries/` | **no** | The position-CSV column layouts (`COLUMNS_PINGER`, `COLUMNS_NO_PINGER`, `columns_for`) |
+| `PID/PID.py`, `MPC/ur_mpc.py`, `MPC/uvr_mpc.py` | `src/PID/`, `src/MPC/` | no | Controller implementations |
+
+`frame_math.py` and `robot_log_schema.py` are **ROS-free by construction** — numpy only, or
+no imports at all. That is deliberate: both can be imported, diffed and checked from a plain
+Python prompt with no sourced workspace, which is what makes the geometry and the CSV format
+debuggable without a running graph. Keep them that way; anything needing `rclpy` belongs in
+`custom_functions.py` instead.
+
+The last two nodes claim the same node name and are started by neither launch file. They are
+byte-identical to each other on the interface: both subscribe `/blueboat/odom`, publish
+`/monitoring_data` and `/pose_arrow`, and hold a `/path_request` client, duplicating
+`master_control`'s side of those four rows. Both also construct the `ROV` helper.
+
+### 2.1.1 File organisation of the three long nodes
+
+`master_control.py`, `robot_interface.py` and `path_generation.py` each open with a FILE MAP
+comment and are divided by banner comments into numbered sections, ordered for a live field
+session rather than by history: wiring first, then the knobs, then the main loop, then the
+maths, then plumbing and logging last.
+
+| File | Section order |
+|---|---|
+| `master_control.py` | 1 wiring · 2 **tuning knobs** (`_declare_tuning_parameters`, every gain) · 3 control loop · 4 guidance · 5 callbacks/helpers |
+| `robot_interface.py` | 1 wiring · 2 main loop + watchdog · 3 thrust→PWM calibration · 4 operator commands · 5 pose/pinger · 6 telemetry · 7 MAVROS plumbing · 8 CSV logging |
+| `path_generation.py` | module scope (`SHAPES`, `is_valid_shape`, the `fsin` table) · 1 wiring · 2 service entry point · 3 `from_yaml` reload · 4 shape library |
+
+Method *order* is free to change; method *contents* are not, and neither is what file a thing
+lives in — see the constraint below and N1.
+
+**The `fsin` table must stay at `path_generation`'s module scope.** `_fsin_extend`,
+`_fsin_state` and the `_fsin_yaw/_x/_y` globals cannot move to another module even with a
+re-export: `docs/controllers/check_trajectory_library.py` resets the table by assigning
+`path_generation._fsin_yaw = np.zeros(1)`, and if the globals lived elsewhere that reset
+would silently become a no-op — the F1 purity check would then pass *vacuously*, which is
+worse than failing.
+
+**Three offline checks locate code by file, not by symbol table**, and crash rather than fail
+cleanly if it moves house: `check_pid_equivalence.py` needs `dbl('pid_lookahead', …)` inside
+`src/master_control.py`; `check_watchdog.py` needs `thruster_input_stale`, `timer_callback`,
+`'thruster_input_timeout', 0.5` and `self.last_thr_rx = time.time()` inside
+`robot_interface.py`, plus `timer_callback` inside `master_control.py`; `check_los_hold.py`
+needs `los_guidance`, `timer_callback` and the four `dbl('hold_*', …)` defaults inside
+`master_control.py`. All three are order-independent, so reordering within a file is safe.
 
 ### 2.2 Internal topics
 
@@ -146,8 +201,8 @@ The last two claim the same node name and are started by neither launch file.
 | `/blueboat/pinger_coordinates` | `std_msgs/Float32MultiArray` | `robot_interface` | `master_control` |
 | `/blueboat/controller_ready` | `std_msgs/Bool` | `robot_interface` · `simulation_interface` | `master_control` |
 | `/thruster_input` | `std_msgs/Float32MultiArray` | `master_control` | `robot_interface`, `simulation_interface` |
-| `/controller_target` | `std_msgs/Float32MultiArray` | `master_control` — **pinger branch only** | `robot_interface` |
-| `/monitoring_data` | `std_msgs/Float32MultiArray` | `master_control`, `simulation_interface` | `robot_interface` |
+| `/controller_target` | `std_msgs/Float32MultiArray` | `master_control` — **pinger branch only** | `robot_interface` (stored, never read) |
+| `/monitoring_data` | `std_msgs/Float32MultiArray` | `master_control` (`simulation_interface` creates the publisher but never publishes — its monitoring block is commented out) | `robot_interface` |
 | `/blueboat/param_str` | `std_msgs/String` | `robot_interface` | `param_set` |
 | `/blueboat/param_ready` | `std_msgs/Bool` | `param_set` | `robot_interface` |
 | `/blueboat/param_mode` | `std_msgs/String` | `param_set` | `robot_interface` |
@@ -159,9 +214,27 @@ uses depth 10 volatile and re-publishes every second; `simulation_interface` use
 volatile, which is compatible with both — a transient-local publisher satisfies a volatile
 subscriber, not the reverse. Making the subscriber latched would break the real-boat path.
 
+**`/thruster_input` is never silent while `master_control` runs.** Every early return in
+`timer_callback` publishes `[0, 0]` rather than skipping the publish, so a consumer can tell
+"commanded to stop" from "not being commanded at all" — and the staleness watchdogs in both
+interface nodes (§5) then mean the second case also ends in zero thrust.
+
+**`/blueboat/pinger_coordinates` carries three values, not two.** `robot_interface` seeds
+`self.pinger_coordinates` from the Water Linked *filtered* (`filaco`) x/y/z
+(`robot_interface.py:603`) and dead-reckons that 3-vector at odom rate, so the published array
+is body-frame `[x, y, z]`. `master_control` reads `pinger_target[:2]` in the `PID` branch and
+hands the whole array to `solve_LoS` in the `LoS` branch, which unpacks exactly three. The
+2-element world-frame `corrected_pinger` goes out on the same topic only under
+`self.fixed_pinger`, which is hard-coded `False` (`robot_interface.py:88`) and reachable from
+no parameter or topic.
+
 **`/controller_target` is published only inside the pinger branch**
-(`master_control.py:507-510`). During path following and manual-target control the topic is
-silent, even though `world_target` is computed in every branch.
+(`master_control.py:514-517`), by decision rather than omission. The topic carries the
+body-frame pinger vector; the world-frame target is carried by `/monitoring_data[4:6]` in
+every branch (N9), which is what the station map display and the no-pinger CSV layout read.
+`robot_interface` is the only subscriber in the project and stores the value without reading
+it, so during path following and manual-target control the topic is silent and nothing
+consumes it.
 
 ### 2.3 External-facing topics
 
@@ -190,9 +263,11 @@ plus `/mavros/param/get_parameters` and `/mavros/param/set_parameters` (`rcl_int
 deliberately does **not** block on service availability in its constructor; it checks lazily
 and lets `robot_interface` retry.
 
-FCU endpoint is hard-coded in `BlueBoat_launch.py`: `udp://:14550@192.168.2.2:14550`.
-**Port 14550 collides with a running QGroundControl**, which manifests as intermittent launch
-failures.
+FCU endpoint is the `fcu_url` argument of `BlueBoat_launch.py`, defaulting to
+`udp://:14550@192.168.2.2:14550`. **Port 14550 collides with a running QGroundControl**, which
+manifests as intermittent launch failures — `mavros_router` logs `link[1000] open failed:
+DeviceError:udp:bind: Address already in use`. Close QGC, or pass another port through
+`fcu_url:=`.
 
 ### 2.5 Service
 
@@ -215,9 +290,11 @@ ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: <value>"
 `enable` · `stop` · `override` · `default` · `arm` · `disarm` ·
 `move <left> <right> <seconds>`
 
-Any **unrecognised** string falls through to `move_callback` (`robot_interface.py:439`), so
-`1.0 1.0 5` is accepted as a move without the `move` keyword. A malformed command (not
-exactly four fields) is rejected with a log line and no action.
+Any **unrecognised** first token falls through to `move_callback`
+(`robot_interface.py:418`), which is handed the *whole* split string and still requires exactly
+four fields — so `x 1.0 1.0 5` is accepted as a move without the `move` keyword, while
+`1.0 1.0 5` (three fields) is not. Anything that is not exactly four fields is rejected with a
+log line and no action.
 
 ---
 
@@ -239,38 +316,160 @@ ros2 launch blueboat_control BlueBoat_launch.py enable_motors:=True controller_t
 ```
 
 **`BlueBoat_launch.py`** — arguments `enable_motors` (False), `note` (''), `controller_type`
-(''), `trajectory` ('station_keeping'), `use_pinger` (False). It always starts `mavros`,
+(''), `trajectory` ('station_keeping'), `use_pinger` (False), `fcu_url`
+('udp://:14550@192.168.2.2:14550', §2.4) and `data_dir` ('', §6). It always starts `mavros`,
 `robot_interface`, `uwgps_log` and `param_set`; it starts `master_control` only when
 `controller_type` is non-empty, and `path_generation` only when `use_pinger` is **False** —
 pinger mode needs no trajectory server. `use_pinger` reaches `robot_interface` under the
 different parameter name **`use_UWgps`**, which also selects the CSV layout (§6).
 
 **`Sim_launch.py`** — arguments `robot_file` ('thrusters_ur'), `trajectory`
-('station_keeping'), `controller_type` (**default `'MPC'`**). It includes
+('station_keeping'), `controller_type` (**default `'MPC'`**) and `data_dir` ('', §6). It includes
 `blueboat_description/world_launch.py` and starts `simulation_interface`, `path_generation`,
 `path_publisher` and `master_control`. It never starts `robot_interface`, accepts none of the
 real-only arguments, and always launches a controller — the "empty `controller_type` launches
 no controller" rule applies to the real-robot launch only.
 
-**Testing.** No lint, type-check or ROS-side automated test exists. What does exist is a
-checked-in closed-loop simulation harness at `blueboat_control/src/docs/controllers/` —
-`sim.py` (plant + controllers), `run_sims.py` (scenarios, cached), `gen_figures.py` (plots),
-`analyze.py` (summary tables). It needs only numpy, scipy and matplotlib: no ROS, no acados.
-It imports the **real** `PID.PIDLoS` class and reimplements `los_guidance`, `solve_LoS`, the
-governor, `single_pose` and `compute_target` verbatim, so controller changes can be evaluated
-without a workspace. It is the evidence behind every number in `CONTROLLERS.md`.
+**Testing.** No lint or type-check tooling exists, and there is no ROS-side automated test
+(no `pytest`, no `ament_*` test target). Two gates exist in the working tree, and **neither is
+committed**: `.gitignore` excludes `.claude/tools/`, `.claude/settings.json` and
+`.claude/specs/`, and the six harness scripts below (`check_*.py`, `replay.py`) are untracked.
+`git ls-files .claude/` returns `CLAUDE.md` and `TODO.md` only. A fresh clone has neither gate,
+so anything that says "the diff in the commit is the record" is aspirational, not current.
+
+*Interface-contract guard* — `.claude/tools/interface_inventory.py`. Static AST extraction of
+every publisher, subscriber, service, client and declared parameter in the repository — node,
+resolved wire name, message type and QoS — plus the field list of every `.msg` and `.srv` in
+`blueboat_interfaces`, compared against `.claude/tools/interface_baseline.json`
+(100 entries + the three interface definitions). A changed message field reports as
+`FIELDS <name> changed in blueboat_interfaces`.
 
 ```bash
-cd blueboat_control/src/docs/controllers && python run_sims.py && python gen_figures.py
+python3 .claude/tools/interface_inventory.py --emit                                        # read the inventory
+python3 .claude/tools/interface_inventory.py --check .claude/tools/interface_baseline.json  # 0 = unchanged, 2 = moved
 ```
+
+stdlib only — no ROS, no sourced workspace, ~0.15 s measured — and it is wired as a
+`PostToolUse` hook in `.claude/settings.json`, so an edit that renames or retypes an interface
+fails at the moment it is made (N1). The compared key carries no file path or line number, so
+moving code between files or renaming a local variable produces no diff; only a name, type or
+QoS change does. It also reports parameters a launch file passes to a node that does not
+declare them (`## launch cross-check` in `--emit`; currently empty). The baseline **matches the
+tree** — `--check` exits 0. A *deliberate* contract change is a cross-repo decision (N1):
+notify the consumers, then re-baseline with `--update`.
+
+*Closed-loop controller harness* at `blueboat_control/src/docs/controllers/` —
+`sim.py` (plant + controllers), `run_sims.py` (scenarios, cached), `gen_figures.py` (plots),
+`analyze.py` (summary tables). It needs only numpy, scipy and matplotlib: no ROS, no acados,
+and it runs end to end under `/usr/bin/python3` on this machine.
+It imports the **real** `PID.PIDLoS` class and reimplements `los_guidance`, `solve_LoS`, the
+governor, `single_pose` and `compute_target` verbatim, so controller changes can be evaluated
+without a workspace. Nothing in the language enforces that "verbatim", so
+`check_trajectory_library.py` asserts it for `single_pose` and `check_los_hold.py` for the two
+control laws. It is the evidence behind every number in `CONTROLLERS.md`. Its `PID`,
+`LoS` and `Point-LoS` results are the real code and reproduce bit-for-bit; its `MPC` result is
+SciPy SLSQP against the MPC's own internal model, so MPC comparisons are its weakest evidence
+and move with the SciPy/BLAS build. `sim.py` and `gen_figures.py` resolve their paths from
+`__file__`, so both run from any working directory and `gen_figures.py` writes beside itself.
+`run_sims.py` caches one `.pkl` per scenario into `docs/controllers/cache/` (gitignored) and
+`analyze.py` is importable — its report is behind `main()`. The cache is keyed on the scenario
+name alone,
+with no hash of the code that produced it, so it does **not** invalidate when a controller or
+the plant changes: delete `cache/` after touching either, or `analyze.py` reports numbers from
+whatever code last filled it.
+
+```bash
+cd blueboat_control/src/docs/controllers && python3 run_sims.py && python3 analyze.py
+python3 gen_figures.py            # rewrites the nine checked-in fig*.png in place
+```
+
+*Offline replay* — `replay.py` scores a **recording** rather than a simulated run: a rosbag2
+directory (`/blueboat/odom`, `/monitoring_data`, `/thruster_input`), a controller `.npy` log or
+a position `.csv`. It reports `analyze.py`'s own metrics for what the boat did against the
+target it was given, and optionally replays a chosen controller over the logged states to show
+what it would have commanded. Recordings are opened read-only (#6). `rosbag2_py` is imported
+lazily, so only the bag reader needs a sourced workspace; `tau` is not in any recording, so the
+progress column reads `n/a`.
+
+```bash
+python3 replay.py <bag-dir|log.npy|poslog.csv> [--controller PID|LoS|MPC]
+```
+
+*Five checks*, plain scripts with exit codes, no test framework. Untracked (see above), so
+they exist only in this working tree:
+
+```bash
+python3 check_pid_equivalence.py  # PIDLoS: Delta = 1/los_gain identity, the documented
+                                  # point-following defaults, and that master_control's
+                                  # pid_lookahead still implies the los_gain the equivalence
+                                  # was claimed for. Reads master_control.py statically (it
+                                  # cannot be imported without acados).
+python3 check_replay.py           # replay cross-validation: a simulation written out as a
+                                  # bag and as an .npy must read back and reproduce its own
+                                  # numbers. Skips the bag half without rosbag2_py.
+python3 check_watchdog.py         # loss-of-reference watchdog: the staleness predicate
+                                  # against a fake clock, and that both interface nodes and
+                                  # master_control's early returns still implement it.
+                                  # stdlib only - no numpy, no ROS.
+python3 check_los_hold.py         # zero-speed hold, both controllers: bit-identical logs
+                                  # with the hold on and disabled on every moving path, a
+                                  # bounded error at rest, and that the harness copies and
+                                  # master_control are still the same two laws.
+python3 check_trajectory_library.py  # every built-in shape against embedded reference poses
+                                  # (the field-data comparability guard), the t>500 clamp,
+                                  # fsin bit-identical to the original Euler loop and pure in
+                                  # t, an unknown shape diagnosable, and that sim.py's copy of
+                                  # single_pose has not drifted from path_generation. Imports
+                                  # path_generation, so it needs a sourced workspace; skips
+                                  # cleanly, exit 0, without one.
+```
+
+**All five pass on this machine** (exit 0 each, verified with the system `python3`).
+
+An earlier reading recorded `check_trajectory_library.py` as exiting 1 on
+`sin: 4 reference poses bit-identical -- moved at t=[500.0]` — a one-ULP
+`scipy.spatial.transform.Rotation` quaternion difference against the embedded reference table,
+not a shape change. It does not reproduce here. The check demands bit-identity of the
+quaternion columns, so it stays sensitive to the scipy/BLAS build it runs on and may exit 1
+again on a different interpreter; treat that specific failure as an environment difference,
+not a moved shape, and confirm x/y/yaw before believing it.
+
+The pre-rework `los_gain` is **not recoverable from this repository** — `PID.py` exists only
+from the initial commit and already carries the reworked signature. `check_pid_equivalence.py`
+therefore asserts 0.4 as a live coupling to `pid_lookahead = 2.5`, not as recovered history.
+
+**Interpreter.** Two interpreters, and they differ in what they carry.
+
+`~/ros2_ws/.venv` is where `acados_template`, `casadi` and `pandas` live, and it is what the
+**ROS nodes** need: without it `master_control` (acados + casadi), `robot_interface` (pandas)
+and `simulation_interface` (casadi, through `blueboat_control.ROV`) all fail at import. The
+installed executables carry `#!/usr/bin/env python3`, so activating the venv is what selects
+it.
+
+`/usr/bin/python3` carries numpy, scipy, matplotlib, sympy, PyYAML and `rclpy`, but **not**
+`casadi`, `acados_template` or `pandas`. Everything under `docs/controllers/` therefore runs
+there unchanged — `run_sims.py`, `analyze.py`, `gen_figures.py`, `replay.py` and all five
+checks, verified by running them. `check_watchdog.py` and `interface_inventory.py` are the only
+two that are stdlib-only.
+
+Beware the third one: on this machine an interactive shell resolves a bare `python3` to
+`SSS-Dataset-Aug-Studio/.venv/bin/python3` (numpy and scipy, **no matplotlib, no pandas**), so
+`python3 gen_figures.py` fails there while `/usr/bin/python3 gen_figures.py` succeeds. Name the
+interpreter.
 
 **Dependencies.** `requirements.txt` pins `acados_template` (from git), `bluerobotics-ping`,
 `casadi`, `Cython`, `matplotlib`, `numpy`, `pandas`, `pyserial`, `PyYAML`, `requests`,
-`scipy`, `sympy`, `transformations`, `lxml`. `casadi` and `sympy` are load-bearing:
+`scipy`, `sympy`, `transformations`, `lxml` (the only unpinned entry). `casadi` and `sympy` are
+load-bearing:
 `blueboat_control/__init__.py` builds the thrust-allocation matrix symbolically and
 `MPC/ur_mpc.py` builds the OCP with them. From apt: `xacro`, `simple_launch`, `mavros`,
 `urdf_parser_py`, and **acados** for the MPC solver. `slider_publisher` and `pose_to_tf` are
 required by `blueboat_description`'s spawn launch, not by any control node.
+
+`acados_template` and `casadi` are needed to **start `master_control` at all**, not just for
+`controller_type:='MPC'`: `import ur_mpc` and `from blueboat_control import ROV` sit at module
+scope, so the `PID` and `LoS` paths import both even though neither uses them. `TODO.md` holds
+it.
 
 ---
 
@@ -283,18 +482,27 @@ following** → **pinger** → nothing. `MPC` is unsupported in pinger mode.
 boat's own progress (N8):
 
 ```
-tau_dot = path_speed_scale * clip((gov_Lmax - e_along) / (gov_Lmax - gov_Lmin), 0, 1)
-tau    += tau_dot * dt
+fac_along = clip((gov_Lmax - e_along) / (gov_Lmax - gov_Lmin), 0, 1)
+fac_cross = clip((gov_Emax - |e_y|)  / (gov_Emax - gov_Emin), 0, 1)   # 1 when gov_Emax = 0
+tau_dot   = path_speed_scale * fac_along * fac_cross
+tau      += tau_dot * dt
 ```
 
 `e_along` is the along-track gap from boat to virtual target. When the boat keeps up, the
 target advances at the path's authored speed; as the gap grows it slows and finally pauses,
-so it cannot outrun the boat. `clip(..., 0, 1)` makes `tau` monotonic and bounds it at the
-authored speed. Because authored speed is the spatial rate of the path's own
-parameterisation, **a speed profile that varies along the path is followed without extra
-machinery** — this is how the "desired speed at any point on the path" requirement is met.
+so it cannot outrun the boat. Each factor is clipped to `[0, 1]` and they are multiplied, so
+`tau` is monotonic and bounded at the authored speed. Because authored speed is the spatial
+rate of the path's own parameterisation, **a speed profile that varies along the path is
+followed without extra machinery** — this is how the "desired speed at any point on the path"
+requirement is met. Nothing may scale `tau_dot` by more than unity without breaking that.
 
-Defaults: `path_speed_scale = 1.0`, `gov_Lmin = 0.5 m`, `gov_Lmax = 3.0 m`, `dt = 0.05`
+`fac_cross` answers the other half of "is the boat keeping up" — a boat abreast of its target
+but far off to the side is not. **It is disabled by default** (`gov_Emax = 0`), because it is
+only safe once the inner loops can close a lateral gap; `TODO.md` F5 holds the measurements
+and what gates it.
+
+Defaults: `path_speed_scale = 1.0`, `gov_Lmin = 0.5 m`, `gov_Lmax = 3.0 m`,
+`gov_Emin = 0.5 m`, `gov_Emax = 0` (cross-track gating off), `control_dt = 0.05`
 (20 Hz control loop). The request sent to `path_generation` is
 `linspace(tau, tau + path_time, path_steps)`, issued **asynchronously** — the result is
 collected on a later tick, so the reference window is typically one or two ticks stale and
@@ -329,15 +537,67 @@ equivalence to the pre-rework point controller holds only at the matching `Delta
 `solve_LoS` is a separate crude proportional point-following law (body-frame pure pursuit,
 logarithmic speed in range). It is not the path LoS and is known to work as-is.
 
-**Tuning knobs.** Governor: `path_speed_scale`, `gov_Lmin`, `gov_Lmax`. LoS guidance:
-`los_lookahead`, `los_ku`, `los_kpsi`, `los_kd`, `los_speed_scale`. PID: `pid_lookahead`,
-`outer_gains`, `inner_gains`. MPC: `mpc_horizon`, `mpc_time`, `Q_weight`, `R_weight`,
-`input_bounds`. Point-following: `k_v` / `k_psi` (2.0 / 16.0 in simulation, 0.15 / 10.0 on
-the real boat) and `safety_distance` (−1.0, which disables the arrival check).
+**Zero authored speed — the station-keeping hold.** `station_keeping`, a clamped-out mission
+and the awaiting-YAML fallback all give a **stationary** reference, so the window's spatial
+rate `U_d` is zero. Neither path controller can hold position on one, for two different
+reasons, and both get the same gate: `w = 1 - U_d/hold_speed`, plus `hold_radius`, the range
+inside which the boat counts as on station.
 
-**None of these are `declare_parameter`'d.** Every one is a hard-coded attribute in
-`master_control.__init__`, so changing any of them requires an edit and a rebuild.
-`CONTROLLERS.md` §6–§7 carries measured sweeps for most of them.
+* **`LoS`** — its surge command *is* the authored speed, so it is identically zero however far
+  off the boat is. Below the gate the law steers at the reference point instead of along a
+  tangent that means nothing when the reference does not move, and commands
+  `min(los_hold_umax, w * los_hold_kx * gap)` of surge for the range `gap` outside
+  `hold_radius`. It never commands reverse — a lookahead law steers the wrong way backwards,
+  so the yaw channel turns the boat round instead — and rides inside the same
+  `max(0, cos(psi_err))` shaping as the feedforward.
+* **`PID`** — `PIDLoS`'s outer `pid_x` loop does act on the along-track error whatever `u_ff`
+  is, but it projects onto the **path tangent**, and a stationary reference has none worth
+  projecting onto: a pure cross-track error produces no along-track error and therefore no
+  surge. So below the gate `master_control` rotates the `psi_path` it hands the class toward
+  the **bearing** to the hold point, by `w * g` where `g` fades in over `hold_radius`. The
+  class's own along-track error then *is* the range and its own LoS steering points at the
+  point — the same object and the same law, given a different tangent — and `slow_on_turn`
+  (also the class's own option) keeps it from driving away while it turns round.
+
+`w` is **exactly zero** for every authored trajectory in the library, so path following in
+both controllers is bit-identical to what it was — but the margin is not uniform. Authored
+speed over each shape's active range, measured off its own parameterisation at the 0.05 s
+window: `straight_line` and `square` 0.500, `sin` 0.280–0.564, `circle` 0.320,
+`seabed_scanning` 0.318–0.500, `kin_square` 0.300, and **`fsin` 0.080–0.100** — nominal surge
+0.1 m/s, so barely 1.6× the gate. Raising `hold_speed` above 0.08 would start altering `fsin`
+path following; above 0.28 it would reach `sin`.
+
+`check_los_hold.py` asserts the inertness rather than assuming it, but for **four shapes only**
+(`straight_line`, `circle`, `kin_square`, `sin`) — `sim.py`'s plant carries copies of five
+shapes and none of `fsin`, `square` or `seabed_scanning`, so those three are argued from the
+speeds above, not from a run.
+
+Every shape holds its last pose past the end of its parameter range (`sin` and `kin_square` at
+t = 500, `seabed_scanning` at t = 40 + 12π ≈ 77.7 s), so U_d falls to zero there and the hold
+takes over by design.
+
+**Tuning knobs — all `declare_parameter`'d.** `_declare_tuning_parameters` declares every
+one with today's value as its default, unconditionally (independent of `controller_type`), so
+`ros2 param list /blueboat/master_control` shows the whole set and a gain change costs a
+launch argument rather than an edit and a rebuild. Values are read once, at construction.
+
+| group | parameters |
+|---|---|
+| Control loop | `control_dt` (0.05) |
+| Governor | `path_speed_scale`, `gov_Lmin`, `gov_Lmax`, `gov_Emin`, `gov_Emax` |
+| LoS guidance | `los_lookahead` (2.5), `los_ku` (**20.0**), `los_kpsi` (10.0), `los_kd` (1.0), `los_speed_scale` (1.0) |
+| Station-keeping hold | `hold_speed` (0.05, the gate) and `hold_radius` (0.5), both shared by `PID` and `LoS`; `los_hold_kx` (1.0) and `los_hold_umax` (0.8), the LoS surge law only |
+| PID | `pid_lookahead` (2.5), `outer_gains_x`, `outer_gains_psi` (both `[3.0, 0.01, 0.0]`), `inner_gains_u` (`[1.0, 0, 0]`), `inner_gains_r` (`[1.5, 0, 0]`) |
+| MPC | `mpc_horizon` (15), `mpc_time` (2.5), `mpc_Q_diag`, `mpc_R_diag` |
+| Point following | `point_k_v` / `point_k_psi` (2.0 / 16.0 in simulation, 0.15 / 10.0 on the real boat), `safety_distance` (−1.0, which disables the arrival check) |
+| Thrust | `thrust_limit` (20.0 N) — feeds both the allocator clamp and the MPC input bounds |
+
+ROS 2 has no dict or tuple parameter type, so gain triples and the MPC weight diagonals are
+declared as double arrays and reassembled in the node. `path_time` and `path_steps` stay
+**derived** from `control_dt` / `mpc_time` / `mpc_horizon` and are deliberately not declared,
+so the reference window and the solver's horizon cannot disagree.
+
+`CONTROLLERS.md` §6–§7 carries measured sweeps for most of these.
 
 ---
 
@@ -361,8 +621,22 @@ the real boat) and `safety_distance` (−1.0, which disables the arrival check).
 - Thrust→PWM is a `PchipInterpolator` fitted to a measured bollard-pull table
   (`custom_functions.generate_interpolator`), so its useful range is asymmetric: about
   −27.6 N to +55.2 N.
-- PWM clamps to `[1100, 1900]`; thrust clamps to `±20 N`; allocation scales uniformly under
-  saturation to preserve direction.
+- PWM clamps to `[1100, 1900]`. Thrust is clamped twice, by two *independent* numbers:
+  `ThrustAllocator.allocate` scales uniformly under saturation to preserve direction, bounded by
+  the `thrust_limit` parameter (20.0 N); `manualMove` then re-clips each side to a **hard-coded**
+  `±20.` (`robot_interface.py:377-380`). Raising `thrust_limit` alone therefore buys nothing on
+  the real boat — the second clip has no parameter.
+- **Loss of reference zeroes the thrust at both ends.** `master_control` publishes an explicit
+  `[0, 0]` on each of its three early returns instead of falling silent, and both interface
+  nodes stop applying a command that has gone stale: `thruster_input_timeout` (0.5 s in each,
+  a declared parameter) against the producer's 20 Hz tick, so ten missed ticks — well outside
+  DDS jitter and well inside ArduPilot's own `RC_OVERRIDE_TIME`. The watchdog covers what a
+  publish cannot: a crashed or hung controller. It **zeroes thrust and does not disarm**, and
+  releases itself as soon as commands resume; `full_stop()` (which does disarm) stays bound to
+  the operator `stop` command, because these stalls are transient by design. On the real boat
+  the zeroing goes through `manualMove([0, 0])` **without** `force`, so it is behind the
+  `enable_motors` gate and is not a third `/mavros/rc/override` write path (N4). The
+  `controller_type == ''` manual-move timeout is unchanged and still owns that case.
 - `param_set`: `override` maps `SERVO1/3_FUNCTION` to RC passthrough (51/53) and sets
   `SYSID_MYGCS` / `MAV_GCS_SYSID` to the MAVROS sysid (1); `default` restores 74/73 and
   sysid 255. Which of the two sysid parameter names exists is resolved once at runtime by
@@ -380,13 +654,24 @@ the real boat) and `safety_distance` (−1.0, which disables the arrival check).
 
 | Artifact | Path | Nature |
 |---|---|---|
-| Position/pinger CSV | `../../../../data/Robot_data/{date}-{note}-poslog.csv` | **Raw field record — never overwrite or regenerate** |
-| Controller monitoring | `data/{ctrl}_data/{date}-{ctrl}_{sim}_data.npy` | Per-run result |
+| Position/pinger CSV | `<root>/data/Robot_data/{date}-{note}-poslog.csv` | **Raw field record — never overwrite or regenerate** |
+| Controller monitoring | `<root>/data/{ctrl}_data/{date}-{ctrl}_{sim}_data.npy` | Per-run result |
 
-Both paths are **relative to the process working directory**, so they depend on where the
-launch was invoked; changing either is a breaking change for downstream analysis scripts.
-Both directories are created with `os.makedirs(..., exist_ok=True)` at node start. `data/` is
-in `.gitignore`; the CSV's four-level path puts it outside the repository entirely.
+`<root>` is resolved at node start by `custom_functions.data_root`, first match wins: the
+`data_dir` parameter when non-empty → `$BLUEBOAT_DATA_DIR` → the sourced workspace, i.e. the
+parent of the first `$COLCON_PREFIX_PATH` entry → the process working directory. In normal use
+the third branch answers and both artifacts land under the workspace root (`~/ros2_ws/data/`),
+**independently of the directory the launch was invoked from** — which is what keeps a run
+started by the Mission Control Station from writing into the station's own repository. `data/`
+is in each repository's `.gitignore`, and the workspace root is outside every repository.
+
+`custom_functions.ensure_data_dir` creates the directory and makes an unwritable root a launch
+failure naming the path, rather than a silent fallback; each node logs the artifact it opened.
+Names are stamped to the second and claimed with `O_EXCL` by
+`custom_functions.reserve_run_file`, so two runs starting inside the same second get `-2`,
+`-3`, … instead of the later one rewriting the earlier (#6 / CM-7). The only reader in the
+project is this module's own `docs/controllers/replay.py`, which opens both layouts read-only;
+nothing writes them back.
 
 `.npy` schema: `['t','x','y','psi','x_d','y_d','psi_d','u1','u2']`, target columns world-frame
 per N9. The header is appended as a row of **strings** to the same list as the float rows, so
@@ -404,28 +689,53 @@ data. The CSV is rewritten in full on every write (crash safety); the `.npy` is 
 every 0.1 s to avoid corruption from a too-frequent callback. Field data is campaign-bound and
 weather-limited — treat it as irreplaceable.
 
+All of it comes from a single site, which bounds what any control result derived from it
+supports: state such a result as single-site, not general. `project_synthesis.md` §10 and §4.1
+govern how results from this project are phrased; §4's evidence layers cover the sonar and
+policy work and do not extend to control-loop performance, so these artifacts are the only
+evidence behind a control claim.
+
 ---
 
 ## 7. Trajectories
 
-`path_generation.single_pose(t, shape)` provides: `station_keeping`, `circle`,
-`straight_line`, `sin`, `fsin`, `square`, `kin_square`, `seabed_scanning`, and
-`from_yaml:<abs path>`. Every pose comes back with `frame_id: "world"`. The node also takes a
-`display_log` parameter for per-request logging.
+`PathGeneration.single_pose(t, shape)` — a **method**, not a module-level function, because
+the `from_yaml` branch reads the node's loaded trajectory — provides: `station_keeping`,
+`circle`, `straight_line`, `sin`, `fsin`, `square`, `kin_square`, `seabed_scanning`, and
+`from_yaml:<abs path>`. The module-level `SHAPES` tuple and `is_valid_shape()` are the
+importable half of the same contract. Every pose comes back with `frame_id: "world"`. The node
+also takes a `display_log` parameter for per-request logging.
 
-The function is stateless and pure in `t`, which is what lets the trajectory be swapped,
+The function is pure in `t`, which is what lets the trajectory be swapped,
 replayed or hot-reloaded with no coupling to the controller. **Speed is baked into each
 formula** — `x = 0.5*t` means 0.5 m/s; there is no separate speed setting.
 
 The hard-coded shapes are the reference conditions for existing field data; changing one
-invalidates comparison against earlier runs without raising any error. Several of them carry
-known defects (`fsin` re-integration cost, `square` discontinuity, `sin` / `kin_square`
-backward wrap) — see `TODO.md`.
+invalidates comparison against earlier runs without raising any error, which is why
+`check_trajectory_library.py` pins every one of them against embedded reference poses and
+`TRAJECTORY_SYSTEM.md` §3 carries a shape revision record. `square` still carries a known
+defect — an instantaneous 4 m discontinuity, `TRAJECTORY_SYSTEM.md` §9 F6.
+
+Not every shape ends. `straight_line`, `square` and `circle` are defined for all `t` and never
+clamp. The ones that do end hold their last pose, the YAML loader's convention: `sin` and
+`kin_square` at `t = 500`, `seabed_scanning` at `t = 40 + 12π ≈ 77.7 s`, `fsin` at
+`_FSIN_MAX_STEPS` (1e7 steps = 100 000 s). Past those points the reference stops moving, so the
+station-keeping hold takes over. `fsin` has no closed form and is
+integrated by Euler at a fixed 0.01 s step, read out of an append-only cumulative table built
+at module scope rather than re-integrated per pose. Each extension of that table continues the
+accumulation from its stored last value, so a given `t` yields the same pose whatever order
+poses are requested in — `single_pose` is pure in `t` for every shape.
+
+An unrecognised `trajectory:=` name is refused at construction: `path_generation` logs a FATAL
+naming the shape and the valid set, and exits. `single_pose` independently raises `ValueError`
+with the same message, so the `if`/`elif` chain has no fall-through.
 
 The YAML route (`blueboat_trajectory/1` — dense `[t, x, y, yaw]` samples, linear interpolation
 with short-way yaw wrap-around, clamped at the final pose or wrapped when `loop: true`) is
-selected either as `trajectory:=from_yaml:<abs path>` or as `trajectory:=from_yaml` with
-`yaml_path:=<path>`. It is **file-watched**: `_maybe_reload_yaml` runs on every service
+selected as `trajectory:=from_yaml:<abs path>`. `path_generation` also declares a dedicated
+`yaml_path` parameter that takes precedence when set, but **neither launch file passes it**, so
+through `ros2 launch` the path has to ride inside the `trajectory` argument; `yaml_path` is
+reachable only from `ros2 run` or a `--ros-args -p`. It is **file-watched**: `_maybe_reload_yaml` runs on every service
 request, reloads on mtime change, and returns a station-keeping pose at the origin until the
 file appears. That hold-until-present behaviour looks like a no-op but is load-bearing — it
 lets the Mission Control Station deploy a GPS-anchored mission only once the run's odom↔GPS
@@ -438,8 +748,15 @@ fit is established.
 The URDF/xacro model, meshes, Gazebo world, and the spawn/bridge launch chain
 `world_launch.py` → `upload_rov_launch.py` → `state_publisher_launch.py`.
 
-Hull: `mass = 16.01` kg, `izz = 5.6403125` — the same values `master_control` hands the MPC
-solver, so the simulated hull and the MPC's internal model agree by construction. Thrusters
+Hull: `mass = 16.01` kg (`blueboat.xacro:18`), `izz = 5.6403125` (`blueboat.xacro:42`).
+`master_control` hands the MPC `robot_mass = 16.01` and `iz = 5.64` — the mass agrees exactly,
+the yaw inertia is the URDF value rounded (0.006 % low). The **hydrodynamics do not agree at
+all**: `hydrodynamics.xacro` carries the BlueROV2 table (`xDotU -5.5`, `xU -25.15`, plus
+quadratic damping the MPC has no term for), while `master_control` passes `a_u = -26.77`,
+`a_v = -7.55`, `a_r = -21.77`, `d_u = -29.34`, `d_v = -51.54`, `d_r = -44.65`
+(`master_control.py:359-366`). So the Gazebo plant and the MPC's internal model share the rigid
+body and nothing else — an MPC result in simulation is not a solver-against-its-own-model
+result the way the offline harness's is. Thrusters
 sit at `x = -0.488`, `y = ∓0.295`, `z = -0.025`, with `thruster1` on the starboard side (§5).
 `thrusters_ur` (2 thrusters) is the default; `thrusters_uvr` (3) exists and is marked not
 functional.

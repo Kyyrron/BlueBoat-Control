@@ -11,8 +11,7 @@ import numpy as np
 import sim
 
 CACHE = os.path.join(os.path.dirname(__file__), "cache")
-OUT = r"c:\Users\killi\Desktop\Research Kyutech\BlueBoat\BlueBoat-SideScanSonar\blueboat_control\src\docs\controllers"
-os.makedirs(OUT, exist_ok=True)
+OUT = os.path.dirname(os.path.abspath(__file__))
 
 # ── validated palette (dataviz skill reference instance, light mode) ───────────
 SURFACE = "#fcfcfb"

@@ -21,11 +21,8 @@ import sys
 import numpy as np
 from scipy.optimize import minimize
 
-SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "..",
-                                   "Desktop", "Research Kyutech", "BlueBoat",
-                                   "BlueBoat-SideScanSonar", "blueboat_control", "src"))
-if not os.path.isdir(SRC):
-    SRC = r"c:\Users\killi\Desktop\Research Kyutech\BlueBoat\BlueBoat-SideScanSonar\blueboat_control\src"
+# blueboat_control/src/, two levels up from this file's own directory.
+SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, os.path.join(SRC, "PID"))
 import PID as PIDmod  # noqa: E402  (the real controller)
 
@@ -39,6 +36,14 @@ M = np.diag([MASS - A_U, MASS - A_V, IZ - A_R])
 M_INV = np.linalg.inv(M)
 D = np.diag([-D_U, -D_V, -D_R])
 THR_LIM = 20.0
+
+# Zero-authored-speed hold (master_control's hold_speed / los_hold_* parameters).
+# HOLD_SPEED is the shared gate: below it the reference is treated as stationary
+# by BOTH controllers. Inert on any real path - every trajectory in the library
+# runs at >= 0.28 m/s, so the blend weight is exactly 0 and both laws are
+# bit-identical to what they were before the hold existed.
+HOLD_SPEED = 0.05
+HOLD_KX, HOLD_UMAX, HOLD_RADIUS = 1.00, 0.80, 0.50
 
 
 def wrap(a):
@@ -85,16 +90,14 @@ def single_pose(t, shape):
     elif shape == "straight_line":
         x, y, yaw = 0.5 * t, 1.0, 0.0
     elif shape == "sin":
-        if t > 500:
-            t = 50
+        t = min(t, 500.0)
         a, f, vx = 3.5, 0.2, 0.4
         t *= 0.7
         x = 0.5 + vx * t
         y = a * (np.sin(f * t - np.pi / 2) + 1)
         yaw = np.arctan2(a * f * np.cos(f * t - np.pi / 2), vx)
     elif shape == "kin_square":
-        if t > 500:
-            t = 50
+        t = min(t, 500.0)
         seg_len, surge = 5.0, 0.3
         seg_time = seg_len / surge
         seg_i = int(t // seg_time)
@@ -115,10 +118,12 @@ def single_pose(t, shape):
 
 # ───────────────────────── governor (master_control) ───────────────────────────
 class Governor:
-    def __init__(self, path_time, path_steps, speed_scale=1.0, lmin=0.5, lmax=3.0):
+    def __init__(self, path_time, path_steps, speed_scale=1.0, lmin=0.5, lmax=3.0,
+                 emin=0.5, emax=0.0):     # emax = 0 disables cross-track gating
         self.tau = 0.0
         self.path_time, self.path_steps = path_time, path_steps
         self.scale, self.lmin, self.lmax = speed_scale, lmin, lmax
+        self.emin, self.emax = emin, emax
 
     def window(self, shape):
         ts = np.linspace(self.tau, self.tau + self.path_time, int(self.path_steps))
@@ -135,9 +140,15 @@ class Governor:
         e_y = -(xb - x0) * s + (yb - y0) * c
         return e_along, e_y, gamma_p, U_d
 
-    def advance(self, e_along, dt):
-        span = max(1e-6, self.lmax - self.lmin)
-        factor = float(np.clip((self.lmax - e_along) / span, 0.0, 1.0))
+    def advance(self, e_along, e_y, dt):
+        span_along = max(1e-6, self.lmax - self.lmin)
+        fac_along = float(np.clip((self.lmax - e_along) / span_along, 0.0, 1.0))
+        if self.emax > 0.0:
+            span_cross = max(1e-6, self.emax - self.emin)
+            fac_cross = float(np.clip((self.emax - abs(e_y)) / span_cross, 0.0, 1.0))
+        else:
+            fac_cross = 1.0
+        factor = fac_along * fac_cross
         self.tau += self.scale * factor * dt
         return factor
 
@@ -161,9 +172,13 @@ class LoSController:
     name = "LoS"
     path_time, path_steps = 0.05, 2
 
-    def __init__(self, lookahead=2.5, ku=8.0, kpsi=10.0, kd=1.0, speed_scale=1.0):
+    def __init__(self, lookahead=2.5, ku=20.0, kpsi=10.0, kd=1.0, speed_scale=1.0,
+                 hold_kx=HOLD_KX, hold_umax=HOLD_UMAX, hold_speed=HOLD_SPEED,
+                 hold_radius=HOLD_RADIUS):
         self.Delta, self.ku, self.kpsi, self.kd = lookahead, ku, kpsi, kd
         self.speed_scale = speed_scale
+        self.hold_kx, self.hold_umax = hold_kx, hold_umax
+        self.hold_speed, self.hold_radius = hold_speed, hold_radius
         self.alloc = PIDmod.ThrustAllocator(
             B_MAT, limits={"min": np.array([-THR_LIM] * 2), "max": np.array([THR_LIM] * 2)})
 
@@ -174,8 +189,24 @@ class LoSController:
         c, s = math.cos(gamma_p), math.sin(gamma_p)
         e_y = -(x - x_ref) * s + (y - y_ref) * c
         psi_d = gamma_p + math.atan2(-e_y, self.Delta)
+
+        # Zero-authored-speed hold. w is exactly 0 for any path with a speed, so
+        # everything below collapses to the pure feedforward law.
+        w = 1.0 - min(1.0, max(0.0, U_d / self.hold_speed)) if self.hold_speed > 0.0 else 0.0
+        u_hold = 0.0
+        if w > 0.0:
+            rng = math.hypot(x_ref - x, y_ref - y)
+            gap = max(0.0, rng - self.hold_radius)
+            if gap > 0.0:
+                # Steer at the hold point rather than along the (meaningless)
+                # tangent, and never command reverse: the yaw channel turns the
+                # boat round instead, which a lookahead law cannot do backwards.
+                bearing = math.atan2(y_ref - y, x_ref - x)
+                psi_d = psi_d + w * wrap(bearing - psi_d)
+                u_hold = min(self.hold_umax, w * self.hold_kx * gap)
+
         psi_err = wrap(psi_d - psi)
-        u_cmd = self.speed_scale * U_d * max(0.0, math.cos(psi_err))
+        u_cmd = (self.speed_scale * U_d + u_hold) * max(0.0, math.cos(psi_err))
         X = self.ku * (u_cmd - u)
         N = self.kpsi * psi_err - self.kd * r
         return self.alloc.allocate(np.array([X, 0.0, N])), t6
@@ -187,17 +218,36 @@ class PIDController:
     path_time, path_steps = 0.05, 2
 
     def __init__(self, dt, lookahead=2.5,
-                 outer=None, inner=None):
+                 outer=None, inner=None, hold_speed=HOLD_SPEED, hold_radius=HOLD_RADIUS):
         outer = outer or {"x": (3., 0.01, 0.), "psi": (3.0, 0.01, 0.)}
         inner = inner or {"u": (1., 0., 0.), "r": (1.5, 0., 0.)}
         self.c = PIDmod.PIDLoS(dt=dt, B=B_MAT, outer_gains=outer, inner_gains=inner,
                                lookahead=lookahead,
                                thruster_limits={"min": np.array([-THR_LIM] * 2),
                                                 "max": np.array([THR_LIM] * 2)})
+        self.hold_speed, self.hold_radius = hold_speed, hold_radius
 
     def __call__(self, win, state, dt):
         t6 = compute_target(win, dt)
-        thr, _ = self.c.compute(state, t6[:3], u_ff=t6[3], psi_path=t6[2])
+        psi_path, u_ff, slow = t6[2], t6[3], False
+        w = 1.0 - min(1.0, max(0.0, t6[3] / self.hold_speed)) if self.hold_speed > 0.0 else 0.0
+        if w > 0.0 and self.hold_radius > 0.0:
+            # Stationary reference: the path tangent is meaningless, and the
+            # along-track term alone cannot see a cross-track error. Rotate the
+            # tangent handed to the class toward the BEARING to the hold point -
+            # then its own along-track error is the range and its own LoS
+            # steering points at the point. Same object, same law, a different
+            # tangent. The rotation fades out inside hold_radius, so on station
+            # the call is exactly what it was before, and slow_on_turn (the
+            # class's own option) stops it driving away while it turns round.
+            rng = math.hypot(t6[0] - state[0], t6[1] - state[1])
+            g = min(1.0, max(0.0, (rng - self.hold_radius) / self.hold_radius))
+            if g > 0.0:
+                bearing = math.atan2(t6[1] - state[1], t6[0] - state[0])
+                psi_path = t6[2] + w * g * wrap(bearing - t6[2])
+                slow = True
+        thr, _ = self.c.compute(state, t6[:3], u_ff=u_ff, psi_path=psi_path,
+                                slow_on_turn=slow)
         return thr, t6
 
 
@@ -279,8 +329,10 @@ class PointLoS:
 
 # ───────────────────────── simulation driver ───────────────────────────────────
 def run(ctrl, shape="straight_line", start=(0., 0., 0.), T=80.0, dt=0.05,
-        force_world=(0., 0.), speed_scale=1.0, plant_h=0.01):
-    gov = Governor(ctrl.path_time, ctrl.path_steps, speed_scale=speed_scale)
+        force_world=(0., 0.), speed_scale=1.0, plant_h=0.01,
+        gov_lmin=0.5, gov_lmax=3.0, gov_emin=0.5, gov_emax=0.0):
+    gov = Governor(ctrl.path_time, ctrl.path_steps, speed_scale=speed_scale,
+                   lmin=gov_lmin, lmax=gov_lmax, emin=gov_emin, emax=gov_emax)
     s = np.array([start[0], start[1], start[2], 0., 0., 0.])
     log = {k: [] for k in
            ("t", "x", "y", "psi", "u", "v", "r", "xd", "yd", "psid",
@@ -291,7 +343,7 @@ def run(ctrl, shape="straight_line", start=(0., 0., 0.), T=80.0, dt=0.05,
         meas[2] = wrap(meas[2])                      # odom delivers wrapped yaw
         win = gov.window(shape)
         e_along, e_y, gamma_p, U_d = gov.errors(win, meas)
-        factor = gov.advance(e_along, dt)
+        factor = gov.advance(e_along, e_y, dt)
         thr, t6 = ctrl(win, meas, dt)
         thr = np.clip(np.asarray(thr, dtype=float), -THR_LIM, THR_LIM)
 

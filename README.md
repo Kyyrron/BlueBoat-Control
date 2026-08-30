@@ -81,6 +81,37 @@ The launch file that handles every robot interaction and control can be run with
 - 'enable_motors' (Real robot only): both for testing and safety purposes, no signal will be sent to the motors unless this is set to True
 - 'use_pinger' (Real robot only): in the case the robot is equipped with an underwater gps, the 'PID' and 'LoS' controller can be set to follow an acoustic pinger instead of a virtual one
 - 'note' (Real robot only): it is possible to add a comment to the name of the log file recorded when the code is ran.
+- 'fcu_url' (Real robot only): the MAVROS <-> autopilot endpoint. Defaults to `udp://:14550@192.168.2.2:14550`.
+- 'data_dir': root directory for the run artifacts (the position CSV and the controller .npy). Empty by default, which resolves them automatically - see 'Where run data is written' below.
+
+## Where run data is written
+
+Run artifacts are written under one root, resolved at startup rather than taken from the
+directory the launch was invoked in. Each node logs the file it opened, so a run is never
+ambiguous about where it wrote. The root is the first of:
+
+1. the `data_dir` launch argument, when non-empty;
+2. `$BLUEBOAT_DATA_DIR`;
+3. the sourced ROS workspace, i.e. the parent of the first `$COLCON_PREFIX_PATH` entry - normally `~/ros2_ws`;
+4. the process working directory, as a last resort.
+
+That gives `<root>/data/Robot_data/{date}-{note}-poslog.csv` for the position/pinger log and
+`<root>/data/{controller}_data/{date}-...npy` for the controller log. An unwritable root is a
+launch failure naming the path, not a silent fallback. Names are stamped to the second and are
+claimed exclusively, so two runs started in the same second get `-2`, `-3`, ... rather than one
+overwriting the other. Recorded runs are primary field data: never overwrite or regenerate them.
+
+## MAVROS and QGroundControl both want port 14550
+
+QGroundControl listens on UDP 14550 by default, and so does the default `fcu_url`. If QGC is
+already running, MAVROS cannot bind and the launch fails with:
+
+    [mavros_router]: link[1000] open failed: DeviceError:udp:bind: Address already in use
+
+It looks intermittent because it depends on whether QGC happens to be open. Either close QGC, or
+move this launch to another port:
+
+`ros2 launch blueboat_control BlueBoat_launch.py fcu_url:='udp://:14551@192.168.2.2:14551'`
 
 Below are example of launch commands:
 `ros2 launch blueboat_control BlueBoat_launch.py enable_motors:=True controller_type:='PID' note:='testing_gains'`

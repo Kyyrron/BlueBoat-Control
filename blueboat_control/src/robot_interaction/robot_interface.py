@@ -22,6 +22,26 @@
 # Everything else is byte-identical to the original.
 # ============================================================================
 
+# ----------------------------------------------------------------------------
+# FILE MAP (class BlueBoatController) -- sections are banner-commented below.
+#
+#   1. WIRING                     __init__
+#   2. MAIN LOOP AND SAFETY       timer_callback, thruster_input_stale, full_stop
+#   3. THRUST -> PWM              manualMove                   <-- calibration, N4 gate
+#   4. OPERATOR COMMANDS          str_input_callback, move_callback,
+#                                 request_param_mode
+#   5. POSE / PINGER              odom_callback                <-- frame re-zeroing
+#   6. INBOUND TELEMETRY          imu_, gps_, state_, uw_gps_, target_,
+#                                 thr_input_, monitoring_data_, param_, mode_
+#   7. MAVROS PLUMBING            set_servo, send_rc_override, setArmedStatus,
+#                                 SetMode, set_motors, publish
+#   8. CSV LOGGING                log_timer_callback
+#
+# Moved out of this file:
+#   CSV column layout  ->  _custom_libraries/robot_log_schema.py  (data only,
+#                          ROS-free; write-once field-data contract, CM-7)
+# ----------------------------------------------------------------------------
+
 # Common libraries import
 import os
 import time
@@ -46,6 +66,7 @@ from mavros_msgs.srv import CommandLong
 
 # Custom imports
 import custom_functions as cf
+import robot_log_schema as rls   # CSV column layout (ROS-free, _custom_libraries/)
 
 # RC override channel conventions (MAVLink / mavros)
 CHAN_RELEASE = 0        # give the channel back to the RC receiver
@@ -53,6 +74,11 @@ CHAN_NOCHANGE = 65535   # leave the channel untouched
 PWM_NEUTRAL = 1500
 
 class BlueBoatController(Node):
+
+    # ======================================================================
+    #  1. WIRING
+    #  parameters, topics, service clients, timers.
+    # ======================================================================
 
     def __init__(self):
         super().__init__('blueboat_controller')
@@ -74,6 +100,17 @@ class BlueBoatController(Node):
 
         self.declare_parameter('controller_type', '') 
         self.controller_type = self.get_parameter('controller_type').get_parameter_value().string_value
+
+        # Loss-of-reference watchdog. master_control publishes /thruster_input once
+        # per 20 Hz control tick; 0.5 s is ten consecutive missed ticks, well outside
+        # DDS jitter at that rate and well inside ArduPilot's own RC_OVERRIDE_TIME.
+        self.declare_parameter('thruster_input_timeout', 0.5)
+        self.thruster_input_timeout = self.get_parameter('thruster_input_timeout').get_parameter_value().double_value
+
+        # Empty means "resolve it" - see custom_functions.data_root for the order.
+        self.declare_parameter('data_dir', '')
+        self.data_root = cf.data_root(
+            self.get_parameter('data_dir').get_parameter_value().string_value)
 
         ################## ROS2 Communication ##################
         ## Publishers
@@ -137,6 +174,11 @@ class BlueBoatController(Node):
         self.last_ready_tx = 0.0
         self.ready_republish_period = 1.0
 
+        # Loss-of-reference watchdog state. last_thr_rx is None until the first
+        # /thruster_input arrives, which is itself a "no reference" condition.
+        self.last_thr_rx = None
+        self.thr_watchdog_tripped = False
+
         self.timer = self.create_timer(0.05, self.timer_callback)
         self.log_timer = self.create_timer(0.33, self.log_timer_callback) # 3 times per seconds 
 
@@ -175,76 +217,11 @@ class BlueBoatController(Node):
 
         ################## Initialize data collection ##################
 
-        # --- logging update: important columns first (names kept) ---
-        if not self.use_UWgps:
-                self.data_columns = ['Year',
-                                'Month',
-                                'Day',
-                                'Hour',
-                                'Minute',
-                                'Second',
-                                'MicroSecond',
-                                'relative_x',
-                                'relative_y',
-                                'relative_psi',
-                                'target_x',
-                                'target_y',
-                                'gps_latitude',
-                                'gps_longitude',
-                                'right_thr_in',
-                                'left_thr_in',
-                                'quat_x',
-                                'quat_y',
-                                'quat_z',
-                                'quat_w',
-                                'ang_vel_x',
-                                'ang_vel_y',
-                                'ang_vel_z',
-                                'lin_acc_x',
-                                'lin_acc_y',
-                                'lin_acc_z']
-
-        else:
-            self.data_columns = ['Year',
-                                'Month',
-                                'Day',
-                                'Hour',
-                                'Minute',
-                                'Second',
-                                'MicroSecond',
-                                'relative_x',
-                                'relative_y',
-                                'relative_psi',
-                                'corrected_pinger_x',
-                                'corrected_pinger_y',
-                                'gps_latitude',
-                                'gps_longitude',
-                                'pinger_latitude',
-                                'pinger_longitude',
-                                'right_thr_in',
-                                'left_thr_in',
-                                'aco_x',
-                                'aco_y',
-                                'aco_z',
-                                'ant_x',
-                                'ant_y',
-                                'ant_z',
-                                'lat',
-                                'lon',
-                                'dep',
-                                'filaco_x',
-                                'filaco_y',
-                                'filaco_z',
-                                'quat_x',
-                                'quat_y',
-                                'quat_z',
-                                'quat_w',
-                                'ang_vel_x',
-                                'ang_vel_y',
-                                'ang_vel_z',
-                                'lin_acc_x',
-                                'lin_acc_y',
-                                'lin_acc_z']
+        # Column layout lives in robot_log_schema.py (ROS-free, in
+        # _custom_libraries/). It is a WRITE-ONCE field-data contract: read the
+        # module docstring before touching a name or an order. Rows are filled
+        # by column NAME below, never by index, so the two cannot desynchronise.
+        self.data_columns = rls.columns_for(self.use_UWgps)
 
         self.data_size = len(self.data_columns)
 
@@ -254,58 +231,128 @@ class BlueBoatController(Node):
                                   columns=self.data_columns)
 
         self.date = datetime.today().strftime('%Y_%m_%d-%H_%M_%S')
-        os.makedirs('../../../../data/Robot_data', exist_ok=True)  # avoid every log write silently failing when the folder is missing
-        self.path = f'../../../../data/Robot_data/{self.date}-{self.note}-poslog.csv'
+        log_dir = cf.ensure_data_dir(self, self.data_root, 'data', 'Robot_data')
+        self.path = cf.reserve_run_file(
+            log_dir, f'{self.date}-{self.note}-poslog', '.csv') + '.csv'
+        self.get_logger().info(f"Position log: {self.path}")
 
-    def monitoring_data_callback(self, msg: Float32MultiArray):
+    # ======================================================================
+    #  2. MAIN LOOP AND SAFETY
+    #  20 Hz tick + loss-of-reference watchdog. Zero thrust on any doubt.
+    # ======================================================================
+
+    def timer_callback(self):
         """
-        Callback for monitoring data.
+        Main loop
         """
-        self.monitoring_data = msg.data
 
-    ################## Thruster interaction ##################
+        ################## Initialize robot ##################
+        if not self.init:
+            # Wait until connected
+            if not self.robot_state.connected:
+                self.get_logger().info('Waiting for FCU connection...')
+                return
 
-    def set_servo(self, n, pwm):
-        """
-        LEGACY fallback - send a single MAV_CMD_DO_SET_SERVO via the command service.
-        Note: this only works when SERVOn_FUNCTION is 0 (Disabled). It must NOT be
-        called at control-loop rate: every call is an acknowledged RPC, and a lost
-        ACK over WiFi stalls the mavros command plugin for seconds, which was the
-        source of the delayed/overrunning 'move' behavior.
-        """
-        req = CommandLong.Request()
-        req.command = 183
-        req.param1 = float(n)
-        req.param2 = float(pwm)
+            # Set mode
+            if self.robot_state.mode != "MANUAL": 
+                self.SetMode('MANUAL')
+                return
 
-        # explicitly set all remaining params as float
-        req.param3 = 0.0
-        req.param4 = 0.0
-        req.param5 = 0.0
-        req.param6 = 0.0
-        req.param7 = 0.0
+            self.request_param_mode('override')
 
-        self.cmd_client.call_async(req)
+            self.init = True
 
-    def send_rc_override(self, right_pwm=None, left_pwm=None, release=False):
-        """
-        Publish one RC override message (channel 1 = right/servo1, channel 3 = left/servo3).
-        Fire-and-forget, latest value wins - the same transport class QGC uses.
-        Requires 'override' mode: param_set maps SERVO1/3_FUNCTION to RCIN1/RCIN3
-        passthrough and points the autopilot's GCS sysid at mavros.
-        """
-        msg = OverrideRCIn()
-        channels = [CHAN_NOCHANGE] * 18
+        ################## Handshake maintenance ##################
+        # Re-send the mode request until param_set confirms it. This closes the
+        # discovery race that used to make the launch hang at random.
+        if (self.desired_param_mode is not None
+                and self.mode != self.desired_param_mode
+                and time.time() - self.last_param_tx > self.param_retry_period):
+            self.get_logger().info(f"Waiting for param mode '{self.desired_param_mode}' (current: '{self.mode}'), re-requesting...")
+            self.last_param_tx = time.time()
+            self.publish(String(), self.desired_param_mode, self.param_publisher)
 
-        if release:
-            channels[0] = CHAN_RELEASE
-            channels[2] = CHAN_RELEASE
+        # Wait for direct control to be enabled
+        if self.mode != 'override':
+            return
+
+        ################## Control loop ##################
+        
+        # Start recording time
+        if not self.time_set:
+            self.initial_time = time.time()
+
+            # Send ready msg to controller node
+            self.publish(Bool(), True, self.set_controller_publisher)
+            self.last_ready_tx = time.time()
+
+            self.time_set = True
+
+        # Periodically re-publish readiness so a controller node that finished
+        # starting late (e.g. blocked on the path service) still receives it
+        if time.time() - self.last_ready_tx > self.ready_republish_period:
+            self.last_ready_tx = time.time()
+            self.publish(Bool(), True, self.set_controller_publisher)
+        
+        current_time = time.time()
+        
+        ## Send input to thrusters
+
+        # If no controller is set, allow for manual input
+        if self.controller_type == '' and current_time - self.initial_time >= self.manual_move_timer:
+            self.manualMove([0, 0]) # If override + no controler, stop the robot after any manual move command
+
+        # Loss-of-reference watchdog: a controller is configured but has gone quiet.
+        # Zero the thrust and keep zeroing it until commands come back. Deliberately
+        # NOT full_stop(): that also disarms, and these stalls are transient by design.
+        # The call goes through manualMove without force, so the enable_motors gate
+        # still holds (N4) - this is not a new /mavros/rc/override bypass.
+        elif self.thruster_input_stale(current_time):
+            if not self.thr_watchdog_tripped:
+                self.thr_watchdog_tripped = True
+                self.get_logger().warn(
+                    f"No /thruster_input for {self.thruster_input_timeout:.2f} s "
+                    f"(controller_type='{self.controller_type}') - zeroing thrust.")
+            self.thruster_input = [0, 0]
+            self.manualMove([0, 0])
+
         else:
-            channels[0] = int(right_pwm)
-            channels[2] = int(left_pwm)
+            if self.thr_watchdog_tripped:
+                self.thr_watchdog_tripped = False
+                self.get_logger().info("/thruster_input resumed - releasing watchdog.")
+            self.manualMove(self.thruster_input)        
 
-        msg.channels = channels
-        self.rc_override_publisher.publish(msg)
+    def thruster_input_stale(self, now):
+        """
+        Loss-of-reference watchdog predicate.
+
+        True when a controller is configured but its /thruster_input has gone
+        quiet for longer than thruster_input_timeout - a stalled, crashed or
+        early-returning master_control. Without this the last received thrust
+        keeps being streamed to the motors indefinitely.
+
+        Inert when no controller is configured: that case already has its own
+        stale-command guard (manual_move_timer, set by the 'move' CLI command).
+        """
+        if self.controller_type == '':
+            return False
+        if self.last_thr_rx is None:
+            return True
+        return (now - self.last_thr_rx) > self.thruster_input_timeout
+
+    def full_stop(self):
+        """
+        Cancels any thruster input and set control parameters to False
+        """
+        self.thruster_input = [0,0]
+        self.manualMove([0,0], force=True)
+        self.setArmedStatus(False) 
+        self.set_motors(False)
+
+    # ======================================================================
+    #  3. THRUST -> PWM CALIBRATION
+    #  The enable_motors gate (N4) and the Newton->PWM mapping. Tunable.
+    # ======================================================================
 
     def manualMove(self, input, force=False):
         """
@@ -342,81 +389,10 @@ class BlueBoatController(Node):
         # which also keeps ArduPilot's RC_OVERRIDE_TIME watchdog fed)
         self.send_rc_override(right_pwm=right_pwm, left_pwm=left_pwm)
 
-
-    ################## User interaction ##################
-    def setArmedStatus(self,command):
-        """
-        Either arm or disarm the robot's thrusters. Note that the 'override' parameter completely disregards armed status
-        """
-        self.get_logger().info(f"{'Arming' if command else 'Disarming'} vehicle...")
-
-        if self.arming_client.wait_for_service(timeout_sec=1.0):
-            req = CommandBool.Request()
-            req.value = command
-            self.arming_client.call_async(req)
-
-    def SetMode(self, mode):
-        """
-        Set the robot's mode to the requested input.
-        """
-        self.get_logger().info(f"Current mode: {self.robot_state.mode}, switching to {mode}]")
-
-        if self.mode_client.wait_for_service(timeout_sec=1.0):
-            req = SetMode.Request()
-            req.custom_mode = mode
-            self.mode_client.call_async(req)
-    
-    def set_motors(self, inBool):
-        """
-        Set the bool value of enable_motors. 
-        This is meant as a safety as no input will be set to the thrusters intil this is set to True
-        """
-        self.enable_motors = inBool
-        self.get_logger().info(f" Enable motors: {self.enable_motors}")
-
-    def full_stop(self):
-        """
-        Cancels any thruster input and set control parameters to False
-        """
-        self.thruster_input = [0,0]
-        self.manualMove([0,0], force=True)
-        self.setArmedStatus(False) 
-        self.set_motors(False)
-
-    def publish(self, msg_type, in_msg, publisher):
-        """
-        Makes publishing within code neater
-        """
-        msg = msg_type
-        msg.data = in_msg
-        publisher.publish(msg)
-
-    def request_param_mode(self, mode):
-        """
-        Ask param_set for a mode and remember the request so the main loop can
-        re-send it until param_set confirms on /blueboat/param_mode.
-        A single publish can be lost if it races DDS discovery or if param_set is
-        still waiting on mavros - this was the main cause of the random launch hangs.
-        """
-        self.desired_param_mode = mode
-        self.last_param_tx = time.time()
-        self.publish(String(), mode, self.param_publisher)
-
-    def move_callback(self, in_str):
-        """
-        Called when input_str is 'move', the first two floats are left and right thruster inputs, 
-        the last one is the length (in seconds) of the applied thrust
-        """
-
-        # Make sure the command is valid
-        if len(in_str) != 4:
-            self.get_logger().info(f" Incorrect move command.")
-            return
-
-        # Start measuring time and apply thrust
-        self.initial_time = time.time()
-        left, right, self.manual_move_timer = map(float, in_str[1:])
-        self.thruster_input = [right,left]
+    # ======================================================================
+    #  4. OPERATOR COMMAND SURFACE
+    #  /blueboat/input_str: enable, stop, override, default, arm, disarm, move.
+    # ======================================================================
 
     def str_input_callback(self, msg: String):
         """
@@ -439,40 +415,37 @@ class BlueBoatController(Node):
         action = dispatch.get(command, lambda: self.move_callback(input_string))
         action()   
 
-    ################## ROS2 node interaction ##################
-
-    def param_callback(self, msg: String):
+    def move_callback(self, in_str):
         """
-        Prints true if the parameter changes are successful (used with the 'default' and 'override' command)
+        Called when input_str is 'move', the first two floats are left and right thruster inputs, 
+        the last one is the length (in seconds) of the applied thrust
         """
-        self.get_logger().info(f" Parameters ready: {msg.data}")
 
-    def mode_callback(self, msg: String):
+        # Make sure the command is valid
+        if len(in_str) != 4:
+            self.get_logger().info(f" Incorrect move command.")
+            return
+
+        # Start measuring time and apply thrust
+        self.initial_time = time.time()
+        left, right, self.manual_move_timer = map(float, in_str[1:])
+        self.thruster_input = [right,left]
+
+    def request_param_mode(self, mode):
         """
-        Displays the mode sent to the robot to confirm the changes
+        Ask param_set for a mode and remember the request so the main loop can
+        re-send it until param_set confirms on /blueboat/param_mode.
+        A single publish can be lost if it races DDS discovery or if param_set is
+        still waiting on mavros - this was the main cause of the random launch hangs.
         """
-        previous_mode = self.mode
-        self.mode = msg.data
+        self.desired_param_mode = mode
+        self.last_param_tx = time.time()
+        self.publish(String(), mode, self.param_publisher)
 
-        if previous_mode != self.mode:
-            self.get_logger().info(f" Mode received: {self.mode}")
-
-            # When leaving override, hand the RC channels back so the default
-            # thruster mapping (QGC / xbox controller) works again
-            if previous_mode == 'override':
-                self.send_rc_override(right_pwm=PWM_NEUTRAL, left_pwm=PWM_NEUTRAL)
-                self.send_rc_override(release=True)
-
-    def state_callback(self, msg):
-        """
-        Read the state of the robot
-        """
-        self.robot_state = msg
-
-    def imu_callback(self, msg: Imu):
-        self.orientation = msg.orientation                  # (quaternion)
-        self.angular_velocity = msg.angular_velocity        # (rad/s)
-        self.linear_acceleration = msg.linear_acceleration  # (m/s^2)
+    # ======================================================================
+    #  5. POSE RE-ZEROING AND PINGER DEAD RECKONING
+    #  Boot-relative frame (N3: pose is re-expressed, twist is NOT rotated).
+    # ======================================================================
 
     def odom_callback(self, msg: Odometry):
 
@@ -520,33 +493,15 @@ class BlueBoatController(Node):
         odom_out.pose.covariance = msg.pose.covariance
         odom_out.twist.covariance = msg.twist.covariance
 
-        # --- FRAME CONSISTENCY FIX -------------------------------------------
-        # The pose above is re-expressed in the boot-relative frame (position
-        # offset by (x0,y0), heading rotated by -yaw0). The linear velocity from
-        # MAVROS is still in the raw 'map' frame, so pose and twist lived in two
-        # frames differing by a constant rotation of yaw0. Any world->body
-        # transform downstream (inRobotFrame / PID) then rotated the velocity
-        # feedback by yaw0 relative to the position error, producing a fixed
-        # diagonal drift and mirroring heading-swept paths (e.g. sin onto -y).
-        # Pinger mode was immune because it zeroes position/yaw and works purely
-        # in body frame. Rotate the linear velocity by -yaw0 so the WHOLE
-        # /blueboat/odom message is in one consistent frame.
-        
-        # c0 = np.cos(self.yaw0)
-        # s0 = np.sin(self.yaw0)
-        # vx_raw = msg.twist.twist.linear.x
-        # vy_raw = msg.twist.twist.linear.y
-        # vx_rel =  c0 * vx_raw + s0 * vy_raw   # R(-yaw0) * v_map
-        # vy_rel = -s0 * vx_raw + c0 * vy_raw
-        # odom_out.twist.twist.linear.x = vx_rel
-        # odom_out.twist.twist.linear.y = vy_rel
-        
-        # ---------------------------------------------------------------------
+        # The pose above is re-expressed in the boot-relative frame, but the twist
+        # is NOT rotated with it, and must not be: MAVROS already publishes this
+        # odometry's twist in child_frame_id 'base_link' (the ENU velocity goes out
+        # separately on local_position/velocity_local). It is body-frame surge/sway,
+        # which is what master_control and the pinger dead-reckoning below both want.
+        # See N3.
 
         self.odom_publisher.publish(odom_out)
 
-        # x_t = vx_rel
-        # y_t = vy_rel
         x_t = msg.twist.twist.linear.x
         y_t = msg.twist.twist.linear.y
 
@@ -598,8 +553,24 @@ class BlueBoatController(Node):
 
         self.pinger_gps = [lat, lon]
 
+    # ======================================================================
+    #  6. INBOUND TELEMETRY
+    #  Sensor and status callbacks. None of these command anything.
+    # ======================================================================
+
+    def imu_callback(self, msg: Imu):
+        self.orientation = msg.orientation                  # (quaternion)
+        self.angular_velocity = msg.angular_velocity        # (rad/s)
+        self.linear_acceleration = msg.linear_acceleration  # (m/s^2)
+
     def gps_callback(self, msg : NavSatFix):
         self.gps_data = [msg.latitude, msg.longitude]
+
+    def state_callback(self, msg):
+        """
+        Read the state of the robot
+        """
+        self.robot_state = msg
 
     def uw_gps_callback(self, msg):
         """
@@ -683,6 +654,130 @@ class BlueBoatController(Node):
         Update the thruster inputs, used when interacting with the controller node
         """
         self.thruster_input = msg.data
+        self.last_thr_rx = time.time()
+
+    def monitoring_data_callback(self, msg: Float32MultiArray):
+        """
+        Callback for monitoring data.
+        """
+        self.monitoring_data = msg.data
+
+    ################## ROS2 node interaction ##################
+
+    def param_callback(self, msg: String):
+        """
+        Prints true if the parameter changes are successful (used with the 'default' and 'override' command)
+        """
+        self.get_logger().info(f" Parameters ready: {msg.data}")
+
+    def mode_callback(self, msg: String):
+        """
+        Displays the mode sent to the robot to confirm the changes
+        """
+        previous_mode = self.mode
+        self.mode = msg.data
+
+        if previous_mode != self.mode:
+            self.get_logger().info(f" Mode received: {self.mode}")
+
+            # When leaving override, hand the RC channels back so the default
+            # thruster mapping (QGC / xbox controller) works again
+            if previous_mode == 'override':
+                self.send_rc_override(right_pwm=PWM_NEUTRAL, left_pwm=PWM_NEUTRAL)
+                self.send_rc_override(release=True)
+
+    # ======================================================================
+    #  7. MAVROS / MAVLINK PLUMBING
+    #  RC override stream (N6), arming, mode. Rarely edited.
+    # ======================================================================
+
+    ################## Thruster interaction ##################
+
+    def set_servo(self, n, pwm):
+        """
+        LEGACY fallback - send a single MAV_CMD_DO_SET_SERVO via the command service.
+        Note: this only works when SERVOn_FUNCTION is 0 (Disabled). It must NOT be
+        called at control-loop rate: every call is an acknowledged RPC, and a lost
+        ACK over WiFi stalls the mavros command plugin for seconds, which was the
+        source of the delayed/overrunning 'move' behavior.
+        """
+        req = CommandLong.Request()
+        req.command = 183
+        req.param1 = float(n)
+        req.param2 = float(pwm)
+
+        # explicitly set all remaining params as float
+        req.param3 = 0.0
+        req.param4 = 0.0
+        req.param5 = 0.0
+        req.param6 = 0.0
+        req.param7 = 0.0
+
+        self.cmd_client.call_async(req)
+
+    def send_rc_override(self, right_pwm=None, left_pwm=None, release=False):
+        """
+        Publish one RC override message (channel 1 = right/servo1, channel 3 = left/servo3).
+        Fire-and-forget, latest value wins - the same transport class QGC uses.
+        Requires 'override' mode: param_set maps SERVO1/3_FUNCTION to RCIN1/RCIN3
+        passthrough and points the autopilot's GCS sysid at mavros.
+        """
+        msg = OverrideRCIn()
+        channels = [CHAN_NOCHANGE] * 18
+
+        if release:
+            channels[0] = CHAN_RELEASE
+            channels[2] = CHAN_RELEASE
+        else:
+            channels[0] = int(right_pwm)
+            channels[2] = int(left_pwm)
+
+        msg.channels = channels
+        self.rc_override_publisher.publish(msg)
+
+    ################## User interaction ##################
+    def setArmedStatus(self,command):
+        """
+        Either arm or disarm the robot's thrusters. Note that the 'override' parameter completely disregards armed status
+        """
+        self.get_logger().info(f"{'Arming' if command else 'Disarming'} vehicle...")
+
+        if self.arming_client.wait_for_service(timeout_sec=1.0):
+            req = CommandBool.Request()
+            req.value = command
+            self.arming_client.call_async(req)
+
+    def SetMode(self, mode):
+        """
+        Set the robot's mode to the requested input.
+        """
+        self.get_logger().info(f"Current mode: {self.robot_state.mode}, switching to {mode}]")
+
+        if self.mode_client.wait_for_service(timeout_sec=1.0):
+            req = SetMode.Request()
+            req.custom_mode = mode
+            self.mode_client.call_async(req)
+
+    def set_motors(self, inBool):
+        """
+        Set the bool value of enable_motors. 
+        This is meant as a safety as no input will be set to the thrusters intil this is set to True
+        """
+        self.enable_motors = inBool
+        self.get_logger().info(f" Enable motors: {self.enable_motors}")
+
+    def publish(self, msg_type, in_msg, publisher):
+        """
+        Makes publishing within code neater
+        """
+        msg = msg_type
+        msg.data = in_msg
+        publisher.publish(msg)
+
+    # ======================================================================
+    #  8. CSV LOGGING
+    #  Write-once field data. Columns in _custom_libraries/robot_log_schema.py.
+    # ======================================================================
 
     def log_timer_callback(self):
 
@@ -749,70 +844,6 @@ class BlueBoatController(Node):
                 self.df_log.to_csv(self.path)
             except Exception:
                 self.get_logger().warn(f" -- Not ready to log yet")
-
-
-    def timer_callback(self):
-        """
-        Main loop
-        """
-
-        ################## Initialize robot ##################
-        if not self.init:
-            # Wait until connected
-            if not self.robot_state.connected:
-                self.get_logger().info('Waiting for FCU connection...')
-                return
-
-            # Set mode
-            if self.robot_state.mode != "MANUAL": 
-                self.SetMode('MANUAL')
-                return
-
-            self.request_param_mode('override')
-
-            self.init = True
-
-        ################## Handshake maintenance ##################
-        # Re-send the mode request until param_set confirms it. This closes the
-        # discovery race that used to make the launch hang at random.
-        if (self.desired_param_mode is not None
-                and self.mode != self.desired_param_mode
-                and time.time() - self.last_param_tx > self.param_retry_period):
-            self.get_logger().info(f"Waiting for param mode '{self.desired_param_mode}' (current: '{self.mode}'), re-requesting...")
-            self.last_param_tx = time.time()
-            self.publish(String(), self.desired_param_mode, self.param_publisher)
-
-        # Wait for direct control to be enabled
-        if self.mode != 'override':
-            return
-
-        ################## Control loop ##################
-        
-        # Start recording time
-        if not self.time_set:
-            self.initial_time = time.time()
-
-            # Send ready msg to controller node
-            self.publish(Bool(), True, self.set_controller_publisher)
-            self.last_ready_tx = time.time()
-
-            self.time_set = True
-
-        # Periodically re-publish readiness so a controller node that finished
-        # starting late (e.g. blocked on the path service) still receives it
-        if time.time() - self.last_ready_tx > self.ready_republish_period:
-            self.last_ready_tx = time.time()
-            self.publish(Bool(), True, self.set_controller_publisher)
-        
-        current_time = time.time()
-        
-        ## Send input to thrusters
-
-        # If no controller is set, allow for manual input
-        if self.controller_type == '' and current_time - self.initial_time >= self.manual_move_timer:
-            self.manualMove([0, 0]) # If override + no controler, stop the robot after any manual move command
-        else:
-            self.manualMove(self.thruster_input)        
         
 rclpy.init()
 node = BlueBoatController()

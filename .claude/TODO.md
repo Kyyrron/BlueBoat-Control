@@ -13,14 +13,24 @@ guessed at.
 
 ## 1. Needs a running ROS 2 / Gazebo workspace
 
-- [ ] **Gazebo generation mismatch.** Every plugin in `blueboat_description` is declared with
-      Ignition Fortress names (`ignition-gazebo-*-system`,
-      `ignition::gazebo::systems::*`) across `world.sdf`, `blueboat.xacro`,
-      `hydrodynamics.xacro`, `thrusters_ur.xacro`, `thrusters_uvr.xacro`, while the README
-      states Gazebo Harmonic. Establish which generation the tree actually targets: either
-      the plugins resolve through a Harmonic compatibility path, or the names need porting to
-      `gz-sim-*` / `gz::sim::systems::*`.
-      **NOT VERIFIABLE ON THIS MACHINE (Windows, no ROS2/colcon)** — needs Gazebo.
+- [ ] **Gazebo generation mismatch — port the Fortress plugin names.** Every plugin in
+      `blueboat_description` is declared with Ignition Fortress names
+      (`ignition-gazebo-*-system`, `ignition::gazebo::systems::*`) across `world.sdf`,
+      `blueboat.xacro`, `hydrodynamics.xacro`, `thrusters_ur.xacro`, `thrusters_uvr.xacro`.
+      **Answered on the Linux machine:** the installed generation is Gazebo **Harmonic**,
+      `gz sim` 8.11.0, ROS 2 Jazzy — plugin libraries
+      `/opt/ros/jazzy/opt/gz_sim_vendor/lib/libgz-sim8-*-system.so`; Fortress is not
+      installed (no `ign` binary, no `*ignition-gazebo*system*` library on disk). The
+      Fortress names **do** load, through Harmonic's deprecated-name compatibility path —
+      `gz sim -s -r -v 4 blueboat_description/urdf/world.sdf` prints, per plugin,
+      `[Wrn] [SystemLoader.cc:75] Trying to load deprecated plugin [ignition-gazebo-physics-system].
+      Using [gz-sim-physics-system] instead.` plus the matching `SystemLoader.cc:136` line for
+      the class name, and then loads it. So this is a deprecation-warning and
+      forward-compatibility item (the shim is removed in gz-sim 9 / Ionic), not a live
+      failure. Remaining work: rename to `gz-sim-*` / `gz::sim::systems::*` in those five
+      files, accepting that it breaks any Fortress machine.
+      `BlueBoat-SSS-Sim` has already set its own side to `gz` everywhere (generated worlds
+      load with zero deprecation lines) and does not touch these files, per CM-3.
 - [ ] **`sliders` launch argument goes nowhere.** `Sim_launch.py` passes `sliders: False` to
       `world_launch.py`, which neither declares nor forwards it; `upload_rov_launch.py` is
       the file that declares `sliders` (default True) and is included without it, so
@@ -62,34 +72,43 @@ Each verified against the tree. Ordered by value; identifiers are those of
 `blueboat_control/src/TRAJECTORY_SYSTEM.md` (F-series, which skips F17) and `CONTROLLERS.md`
 (C-series), where the reasoning and the measured impact live.
 
-- [ ] **C1 — inner-loop gains ~30× below the drag coefficients.** `inner_gains['u'] = 1.0`
-      against `d_u = 29.34`, `inner_gains['r'] = 1.5` against `d_r = 44.65`, `los_ku = 8.0`.
-      Measured cost: cruise speed 0.267 m/s against an authored 0.50, mission progress
-      0.49×, circle error 1.745 m. `master_control.py:169-170, 195`.
+- [ ] **C1 — PID inner-loop gains ~30× below the drag coefficients.** `inner_gains['u'] = 1.0`
+      against `d_u = 29.34` and `inner_gains['r'] = 1.5` against `d_r = 44.65` are unchanged,
+      by decision: they remain the values the boat's existing field data was recorded at.
+      Measured cost on the harness: cruise 0.235 m/s against an authored 0.50, mission
+      progress 0.43×, acquisition RMS 0.661 m. The `los_ku` half of this item is done
+      (8.0 → 20.0). Both gains are now declared parameters, so a candidate set costs a launch
+      argument rather than a rebuild — sweep at the dock rather than in a rebuild loop.
+      A full u × r sweep is recorded in `CONTROLLERS.md` §6; of 35 sets, 8 improve every
+      scenario without steady-state saturation, `u = 5 / r = 30` being the strongest
+      (acquisition 0.661 → 0.015 m, circle 0.097 → 0.011 m, cruise 0.460 m/s, progress 0.86×).
+      **This gates F5 below.** `master_control.py:279-280`.
+- [ ] **`stopping_sequence` latches and is never reset.** `solve_LoS` sets it on arrival
+      (`master_control.py:676`) and nothing clears it — not `manual_target_callback` (`:210`),
+      not `pinger_callback` (`:200`) — so once armed, every later point-LoS command (manual
+      target *and* pinger) returns zero thrust for the rest of the run. Inert at the shipped
+      default `safety_distance = -1.0` (`:291`), which no launch file overrides. But it is a
+      declared parameter, so a launch argument arms it, and both `CONTROLLERS.md` §7 ("If you
+      change only five things", row 5) and finding **C3** recommend setting it to 1.5 m — the
+      recommendation and the latch have never been recorded together. Reset the flag when a
+      new target arrives. Surfaces on the basestation as a boat that stops responding with no
+      indication why; the station must not compensate, see
+      `BlueBoat-MCS/.claude/specs/robot-side-limitations-watchlist.SPEC.md`.
 - [ ] **C9 — MPC horizon shorter than one turning radius.** `mpc_time = 2.5 s` covers 0.80 m
-      of travel against a 1.89 m minimum turning radius. `master_control.py:132-133`.
-- [ ] **F2 — `LoS` cannot station-keep.** `u_cmd = los_speed_scale * U_d * max(0, cos(psi_err))`
-      is identically zero when the authored speed is zero, so `station_keeping`, a finished
-      mission and the awaiting-YAML fallback all drift with no restoring force.
-      `master_control.py:310`.
-- [ ] **F18 — no zero-thrust on loss of reference.** Several `timer_callback` paths return
-      early without publishing, and `robot_interface` keeps streaming the last received
-      `thruster_input` to the motors, so a stalled `master_control` leaves the boat running.
-      A watchdog on the interface side is the safer fix. `robot_interface.py:815`.
-- [ ] **F1 — `fsin` re-integrates from t=0 on every evaluation**, 0.01 s steps in a Python
-      loop, per pose. `path_publisher` requesting 10 001 poses makes this appear to hang the
-      launch. `path_generation.py:195-204`.
-- [ ] **F9 — an unknown `trajectory:=` name crashes the service.** `single_pose` is an
-      `if`-chain with no `else` and no defaults, so a typo leaves `x` unbound →
-      `UnboundLocalError` inside the handler → "Nothing to target yet." forever with no hint
-      why. `path_generation.py:101`.
-- [ ] **F8 — body-frame velocity correction commented out**, with an in-file comment arguing
-      it is needed. Conflicts directly with N3, which asserts the opposite. Resolve one way
-      or the other and make N3 and the code agree. Needs a bench test, not just an edit.
-      `robot_interface.py:523-544`.
-- [ ] **F5 — the governor ignores cross-track error.** Only `e_along` throttles `tau`, so a
-      boat abreast of its target but far off to the side sees no throttling at all.
-      `master_control.py:441`.
+      of travel against a 1.89 m minimum turning radius. `master_control.py:154-155`.
+- [ ] **F5 — the governor's cross-track term is built but disabled.** `advance_governor` now
+      takes `e_y` and applies a second unit-bounded factor, parameterised by `gov_Emin` /
+      `gov_Emax`; `gov_Emax = 0` disables it and is the default, so today's behaviour is
+      unchanged (verified bit-identical on all five harness scenarios).
+      It is off because **it is unsafe at the current inner gains**: throttling `tau` on an
+      error the controller cannot reduce is positive feedback — the target stalls, the boat
+      loses the forward authority it converges laterally with, and the offset grows. Measured
+      at the shipped gains: acquisition RMS 0.661 → 3.508 m and progress 0.43× → 0.11×;
+      the 10 N side-current case 5.483 → 12.469 m. At `u = 5 / r = 30` the same term is
+      neutral-to-better everywhere (acquisition 0.015 → 0.011 m, circle and square unchanged,
+      side-current +3 %). **Raise the inner gains (C1), then set `gov_Emax` — 5.0 is a
+      reasonable starting point — and re-run the five scenarios.**
+      `master_control.py:585-622`.
 - [ ] **F4 — MPC reads 16 poses from a 15-pose window** and pads by duplicating the last one,
       giving a zero-velocity terminal reference; separately the window spacing is 2.5/14 =
       0.1786 s while the solver divides by 2.5/15 = 0.1667 s, inflating every reference speed
@@ -98,75 +117,57 @@ Each verified against the tree. Ordered by value; identifiers are those of
 - [ ] **C2 — MPC heading wrap-around never reconciled.** Reference yaw is wrapped then
       unwrapped forward across the horizon while the measured state is separately wrapped, so
       a ±π crossing shows the cost an error of up to 2π. `ur_mpc.py:226-236`.
-- [ ] **F3 — `path_publisher` requests the path once, blocking, in `__init__`** and
-      republishes that frozen `Path` forever, so a GPS-anchored YAML mission shows as a single
-      dot at the origin for the whole run. `path_publisher.py:38-48`.
-- [ ] **F16 — every tuning constant is hard-coded** rather than `declare_parameter`'d, so
-      every gain change needs a rebuild. These are exactly the knobs wanted on a boat ramp.
-- [ ] **F7 — `sin` and `kin_square` jump backwards** when the parameter runs out
-      (`if t > 500: t = 50`) instead of clamping, unlike every other trajectory and the YAML
-      loader. `path_generation.py:166, 232`.
-- [ ] **F15 — `single_request` is dead code** publishing to a `self.pose_publisher` that is
-      never created. `path_generation.py:317`.
+- [ ] **`master_control` cannot start without acados, whatever the controller.**
+      `import ur_mpc` at `master_control.py:73` is unconditional and `ur_mpc.py:6` imports
+      `acados_template` at module level, so `controller_type:='PID'` and `'LoS'` die with
+      `ModuleNotFoundError` on a machine without acados. `from blueboat_control import ROV`
+      pulls in `casadi` the same way, and `master_control` never constructs `ROV`. Confirmed
+      by running it. Import `ur_mpc` inside the `controller_type == 'MPC'` branch and drop the
+      unused `ROV` import, so the PID and LoS paths need neither.
 
 ## 4. Unresolved decisions
 
 - [ ] **`compensation_gain` in `robot_interface.manualMove`.** The 1.2 / 0.75 conditional is
       dead behind a hard-coded `1.0`, and it keys on `input[1]` (left) while the gain is
       applied to `input[0]` (right). Decide the intended behaviour rather than deleting the
-      branch blindly. `robot_interface.py:322-333`.
-- [ ] **Fragile relative data paths** (`../../../../data/Robot_data/`, `data/{ctrl}_data/`)
-      depend on the launch working directory. Worth making robust, but any change breaks
-      downstream analysis scripts — coordinate before touching.
-- [ ] **FCU port 14550 collides with a running QGroundControl.** Decide whether to
-      parameterise the endpoint or just document the constraint for operators.
+      branch blindly. Three unknowns, none of them answerable from the code: whether the right
+      thruster really is weaker, whether a single multiplicative gain stacked on an already
+      asymmetric bollard-pull interpolator is the right shape for the correction, and whether
+      keying on `input[1]` was a typo or a deliberate (odd) design. **Needs the boat on blocks**
+      with a thrust or current measurement; simulation cannot substitute, because
+      `simulation_interface` never calls `manualMove` and the asymmetry is physical. Establish
+      the `/thruster_input` → servo wiring (§2) **first**, or the measurement is read off the
+      wrong side. `robot_interface.py:358-369`.
 - [ ] **The two standalone MPC nodes.** `MPC/ur_mpc_control.py` and `MPC/uvr_mpc_control.py`
       are installed by `CMakeLists.txt`, both claim node name `mpc_control`, and neither
       launch file starts them. Decide whether they are superseded by `master_control`'s MPC
       branch and can go, or whether they are still wanted.
-- [ ] **`/controller_target` is published only in the pinger branch** (F10), so anything
-      downstream watching the target during path following or manual control receives
-      nothing. `world_target` is already computed in every branch; the publish just needs
-      hoisting — but that changes what a live topic emits, so treat it as an interface
-      decision under N1.
 
 ## 5. Tooling gaps
 
-- [ ] **The controller harness does not run as checked in.** `docs/controllers/sim.py:24-28`
-      resolves `SRC` from a path that predates the move into the `BlueBoat-Control/`
-      submodule directory, and the hard-coded fallback omits that directory level, so
-      `import PID` raises `ModuleNotFoundError`. Confirmed by running it. With the correct
-      path supplied externally the harness runs and reproduces `CONTROLLERS.md` §5.1 exactly
-      (PID: RMS 0.661 m, cruise 0.235 m/s, progress 0.43×; LoS: 1.184 m, 0.107 m/s, 0.23×).
-      One-line fix; do it before anyone trusts or re-runs the figures.
-- [ ] **Rosbag replay harness — still the strongest automation case.** The closed-loop
-      harness at `docs/controllers/` covers *simulated plant* evaluation and closes much of
-      the gain-tuning loop offline. What it does not do is replay a **recorded field bag**
-      through the controller and emit the trajectory-vs-target comparison, which is the cycle
-      N7 forbids repeating in the water. Build that on top of the existing harness rather
-      than starting fresh.
-- [ ] **`PIDLoS` point-following equivalence is untested and will regress silently.** The
-      class documents that its defaults (`lookahead = 1.0`, `u_ff = 0.0`, `psi_path = None`)
-      reproduce the pre-rework point controller, and the `Delta = 1/los_gain`
-      re-parameterisation is an exact algebraic identity. But `master_control` always
-      constructs it with `lookahead = 2.5`, so the equivalence holds only if the pre-rework
-      `los_gain` was 0.4 — and that value is not anywhere in the tree. Establish the old
-      gain, then commit a small runnable check (the harness already imports the real class,
-      so this is cheap).
-- [ ] **Interface-contract guard — a hook.** N1 is the constraint most exposed to an agentic
-      refactor. A pre-commit or post-edit hook that extracts the
-      publisher/subscriber/service/client inventory and fails on any name or type change
-      would enforce mechanically what vigilance currently enforces.
+- [ ] **The replay harness has never been run against a field bag.** `docs/controllers/replay.py`
+      is validated against a simulation round-trip (`check_replay.py`) and against the
+      2026-08-27 `.npy` logs in `~/ros2_ws/data/PID_data/`, both simulation-derived. No
+      recording from the boat exists on this machine — no `.mcap`, no `.db3`, and
+      `data/Robot_data/` is empty. Replay a real field bag before quoting any replayed number
+      as a field result. This needs an existing recording, not a field session.
+- [ ] **A recording cannot recover the reference the controller actually saw.**
+      `/monitoring_data` publishes one target pose per tick (`win[0]`), while the controller
+      consumes `win[1]` and the window's own span as the speed feedforward `U_d`. Neither is
+      on the wire, so `replay.counterfactual` rebuilds the window from consecutive logged
+      targets, which span the *governed* advance instead. At the current inner gains
+      (0.43× throttle) that costs ~0.17 N RMS on the replayed command; `check_replay.py`
+      bounds it at 0.25 N and measures it rather than tolerating it. Publishing `U_d` would
+      close it, but that is an interface change (N1) and a cross-repo decision — do not make
+      it to suit the harness alone.
+- [ ] **Recorded thrust exceeds the ±20 N clamp.** Replaying the two long 2026-08-27 logs
+      reports mean |thrust| 24.0 N with 100 % of the tail on the limiter, and single samples
+      at 30.6 N, against `thrust_limit = 20.0`. In the current tree the limits are built at
+      `master_control.py:318-321` and passed to both `PIDLoS` and the LoS allocator, and
+      `ThrustAllocator.allocate` scales uniformly, so the current code should not be able to
+      produce this. **Cause not established** — most likely the recordings predate that
+      wiring, or the run overrode `thrust_limit`. Reproduce with a Gazebo run before treating
+      it as a live defect. Surfaced by `replay.py`, not by inspection.
 
 Nothing beyond these is justified by evidence yet. In particular, do not add lint/format/docs
 pipeline scaffolding: no recurring need for it appears anywhere in this module's history.
-
-## 6. Known limitations to keep visible
-
-- [ ] Hard-coded trajectory shapes are the reference conditions for existing field data;
-      changing one invalidates comparison with earlier runs with no error raised.
-- [ ] Single-site field data caps how far any result generalises — state plainly in write-ups
-      rather than overreaching.
-- [ ] `CONTROLLERS.md`'s comparisons grade the MPC against the very model it assumes, and
-      substitute SciPy SLSQP for acados. Trends and magnitudes hold; exact traces will differ
-      on the water, and the MPC's advantage will narrow.

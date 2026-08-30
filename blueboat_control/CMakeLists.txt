@@ -31,6 +31,15 @@ install(PROGRAMS src/_custom_libraries/custom_functions.py
         DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS src/_custom_libraries/yaml_trajectory.py
         DESTINATION lib/${PROJECT_NAME})
+# ROS-free helper modules. They are imported as bare modules (`import
+# frame_math`) exactly like custom_functions, which only works because every
+# script below lands FLAT in lib/blueboat_control -- so a new file that is not
+# installed here works from the source tree and dies with ModuleNotFoundError
+# at node start after a clean colcon build.
+install(PROGRAMS src/_custom_libraries/frame_math.py
+        DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS src/_custom_libraries/robot_log_schema.py
+        DESTINATION lib/${PROJECT_NAME})
 
 install(PROGRAMS src/robot_interaction/robot_interface.py
         DESTINATION lib/${PROJECT_NAME})

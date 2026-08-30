@@ -55,11 +55,15 @@ def main():
         cached(f"current_{n}", lambda mk=mk: sim.run(mk(), "straight_line",
                                                      start=(0., 1., 0.), T=90,
                                                      force_world=(0., -10.)))
-    # E -- lookahead sweep (LoS)
+    # E -- lookahead sweep (LoS), the three values CONTROLLERS.md 7 "Setting the
+    # lookahead distance" reports. Run with the section-6 LoS gains, as that text
+    # states: at the shipped surge gain the boat moves too little for the three
+    # values to separate. 100 s because the 12 m case is still short at 100 s.
     print("E: lookahead")
-    for D in (1.0, 2.5, 6.0):
-        cached(f"look_{D}", lambda D=D: sim.run(sim.LoSController(lookahead=D),
-                                                "straight_line", start=(0., -4., 0.), T=60))
+    for D in (0.5, 2.5, 12.0):
+        cached(f"lookF_{D}", lambda D=D: sim.run(
+            sim.LoSController(lookahead=D, ku=30.0, kpsi=19.0),
+            "straight_line", start=(0., -4., 0.), T=100))
     # F -- surge-gain sweep
     print("F: surge gains")
 
@@ -76,13 +80,19 @@ def main():
         return out
     cached("surge_sweep", sweep)
 
-    # G -- point LoS (pinger / manual) from four starting poses
+    # G -- point LoS (pinger / manual) from four starting poses, at BOTH gain sets.
+    # master_control ships different point-following gains for simulation and the
+    # real boat (point_k_v / point_k_psi = 2.0 / 16.0 vs 0.15 / 10.0), and the two
+    # behave completely differently on this hull model -- that contrast is fig 8.
+    # 150 s so the "final distance after 120 s" comparison is inside the run.
     print("G: point LoS")
 
-    def pts():
+    def pts(k_v, k_psi):
         starts = [(0., 0., 0.), (0., 0., np.pi / 2), (0., 0., np.pi), (0., 0., -np.pi / 2)]
-        return [sim.run_point(sim.PointLoS(), (12., 6.), start=s, T=90) for s in starts]
-    cached("point_los", pts)
+        return [sim.run_point(sim.PointLoS(k_v=k_v, k_psi=k_psi), (12., 6.), start=s, T=150)
+                for s in starts]
+    cached("point_real", lambda: pts(0.15, 10.0))     # real-boat gains
+    cached("point_sim", lambda: pts(2.0, 16.0))       # simulation gains
 
     # H -- governor: boat cannot make the authored speed (headwind)
     print("H: governor")
@@ -91,6 +101,28 @@ def main():
     cached("gov_ok", lambda: sim.run(
         sim.PIDController(dt=0.05, inner={"u": (10., 0., 0.), "r": (1.5, 0., 0.)}),
         "straight_line", start=(0., 1., 0.), T=150))
+
+    # I -- station keeping (F2). The reference is stationary, so the authored
+    # speed is zero: this is what station_keeping, a clamped-out mission and the
+    # awaiting-YAML fallback all reduce to. "off" is the same LoS law with the
+    # hold term disabled, i.e. the behaviour before the fix, kept as the
+    # comparison rather than described from memory.
+    print("I: station keeping")
+    HOLD_CASES = {                       # label -> (start, force_world)
+        "calm":    ((2., 1., 0.),  (0., 0.)),      # displaced, no disturbance
+        "cur4":    ((0., 0., 0.),  (0., -4.)),     # 4 N lateral current
+        "cur10":   ((0., 0., 0.),  (0., -10.)),    # 10 N, as scenario D
+        "past":    ((3., 0., 0.),  (0., 0.)),      # 3 m PAST the hold point
+    }
+    for label, (start, force) in HOLD_CASES.items():
+        cached(f"hold_LoS_{label}", lambda s=start, f=force: sim.run(
+            sim.LoSController(), "station_keeping", start=s, T=150, force_world=f))
+        cached(f"hold_off_{label}", lambda s=start, f=force: sim.run(
+            sim.LoSController(hold_kx=0.0), "station_keeping", start=s, T=150,
+            force_world=f))
+        cached(f"hold_PID_{label}", lambda s=start, f=force: sim.run(
+            sim.PIDController(dt=0.05), "station_keeping", start=s, T=150,
+            force_world=f))
     print("done")
 
 
