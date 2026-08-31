@@ -457,14 +457,7 @@ def enu_to_gps(lat0_deg, lon0_deg, east, north):
 
     return math.degrees(lat), math.degrees(lon)
 
-def local_to_enu(x, y, yaw0):
-    # rotate local frame into ENU
-    theta = yaw0 - math.pi / 2.0
-
-    c = math.cos(theta)
-    s = math.sin(theta)
-
-    east  = c * x - s * y
-    north = s * x + c * y
-
-    return east, north
+# local_to_enu was removed: /blueboat/odom's world frame is local ENU by
+# construction (robot_interface translates position only and keeps yaw
+# absolute), so world -> east/north is the identity. The old function also
+# carried a spurious -pi/2 from treating an ENU yaw as a compass bearing.

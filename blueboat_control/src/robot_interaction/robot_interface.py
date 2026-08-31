@@ -482,7 +482,12 @@ class BlueBoatController(Node):
 
     # ======================================================================
     #  5. POSE RE-ZEROING AND PINGER DEAD RECKONING
-    #  Boot-relative frame (N3: pose is re-expressed, twist is NOT rotated).
+    #  Local-ENU frame: position is translated to the launch point, axes stay
+    #  ENU (+x = East, +y = North) and yaw stays ABSOLUTE ENU (0 = East,
+    #  CCW-positive). Yaw is deliberately NOT re-zeroed: subtracting yaw0
+    #  without also rotating the position axes produced a hybrid frame that
+    #  was only self-consistent when the boat launched facing East.
+    #  The twist is NOT rotated either (N3): it is body-frame from MAVROS.
     # ======================================================================
 
     def odom_callback(self, msg: Odometry):
@@ -505,16 +510,16 @@ class BlueBoatController(Node):
             self.lon0 = self.gps_data[1]
             self.origin_set = True
 
-        # Position offset
+        # Position offset (translation only -- axes stay ENU)
         x_rel = msg.pose.pose.position.x - self.x0
         y_rel = msg.pose.pose.position.y - self.y0
         z_rel = msg.pose.pose.position.z - self.z0
 
-        # Yaw offset
-        yaw = cf.quaternion_to_yaw(msg.pose.pose.orientation)        
-        yaw_rel = cf.normalize_angle(yaw - self.yaw0)
+        # Yaw stays absolute ENU (0 = East, CCW+). yaw0 is latched above for
+        # the origin sidecar only; it is no longer part of the frame.
+        yaw = cf.quaternion_to_yaw(msg.pose.pose.orientation)
 
-        self.relative_coordinates = [x_rel,y_rel,yaw_rel]
+        self.relative_coordinates = [x_rel, y_rel, yaw]
 
         # Build modified odometry
         odom_out = Odometry()
@@ -524,19 +529,19 @@ class BlueBoatController(Node):
         odom_out.pose.pose.position.x = x_rel
         odom_out.pose.pose.position.y = y_rel
         odom_out.pose.pose.position.z = z_rel
-        odom_out.pose.pose.orientation = cf.yaw_to_quaternion(yaw_rel)
+        odom_out.pose.pose.orientation = cf.yaw_to_quaternion(yaw)
 
         # Preserve velocity and covariance
         odom_out.twist = msg.twist
         odom_out.pose.covariance = msg.pose.covariance
         odom_out.twist.covariance = msg.twist.covariance
 
-        # The pose above is re-expressed in the boot-relative frame, but the twist
-        # is NOT rotated with it, and must not be: MAVROS already publishes this
-        # odometry's twist in child_frame_id 'base_link' (the ENU velocity goes out
-        # separately on local_position/velocity_local). It is body-frame surge/sway,
-        # which is what master_control and the pinger dead-reckoning below both want.
-        # See N3.
+        # The pose above is translated to the launch point (axes ENU, yaw
+        # absolute), but the twist is NOT rotated, and must not be: MAVROS
+        # already publishes this odometry's twist in child_frame_id 'base_link'
+        # (the ENU velocity goes out separately on local_position/velocity_local).
+        # It is body-frame surge/sway, which is what master_control and the
+        # pinger dead-reckoning below both want. See N3.
 
         self.odom_publisher.publish(odom_out)
 
@@ -551,11 +556,11 @@ class BlueBoatController(Node):
         av = self.angular_velocity
 
         if self.fixed_pinger and not all(self.pinger_coordinates == np.zeros(3)): # Make sure the pinger has been detected
-            # rotate pinger coordinates into original frame
+            # rotate pinger coordinates into the local-ENU world frame
             x_body = self.pinger_coordinates[0]
             y_body = self.pinger_coordinates[1]
 
-            x_world, y_world = cf.transform_body_to_world(x_rel, y_rel, yaw_rel, x_body, y_body) # now relative to the original frame of reference 
+            x_world, y_world = cf.transform_body_to_world(x_rel, y_rel, yaw, x_body, y_body) # now in the local-ENU world frame
 
             self.corrected_pinger = [x_world, y_world]
             self.publish(Float32MultiArray(), self.corrected_pinger, self.pinger_publisher)
@@ -576,16 +581,17 @@ class BlueBoatController(Node):
         if not hasattr(self, "origin_set") or not self.origin_set:
             return  
 
-        # rotate pinger coordinates into original frame
+        # rotate pinger coordinates into the local-ENU world frame
         x_body = self.pinger_coordinates[0]
         y_body = self.pinger_coordinates[1]
 
-        x_world, y_world = cf.transform_body_to_world(x_rel, y_rel, yaw_rel, x_body, y_body) # now relative to the original frame of reference 
+        x_world, y_world = cf.transform_body_to_world(x_rel, y_rel, yaw, x_body, y_body) # now in the local-ENU world frame
 
         self.corrected_pinger = [x_world, y_world]
 
-        # convert local pinger into gps coordinates
-        east, north = cf.local_to_enu(x_world, y_world, self.yaw0)
+        # The world frame IS local ENU about (lat0, lon0), so world -> east/north
+        # is the identity by construction.
+        east, north = x_world, y_world
 
         lat, lon = cf.enu_to_gps(self.lat0, self.lon0, east, north)
 
@@ -796,22 +802,25 @@ class BlueBoatController(Node):
 
     def write_origin_sidecar(self):
         """
-        Record the boot-relative frame's own origin, once, beside the CSV.
+        Record the world frame's own origin, once, beside the CSV.
 
-        Every world-frame column in the log -- relative_x/y/psi, the target pair,
-        corrected_pinger_x/y -- is expressed in a frame whose origin and heading
-        are latched at the first odom callback and were, until this, written
-        nowhere. Without them a recorded run cannot be georeferenced afterwards
-        at all. Three numbers, so they go in a sidecar rather than in three
-        constant columns repeated on every row.
+        The world frame is local ENU: origin latched at the first odom
+        callback, axes East/North, yaw absolute ENU. Every world-frame column
+        in the log -- relative_x/y/psi, the target pair, corrected_pinger_x/y
+        -- is expressed in it, and (lat0, lon0) is what georeferences a
+        recorded run afterwards. yaw0_rad is the boat's ENU heading at the
+        latch instant, kept for provenance only (it is NOT part of the frame;
+        logs recorded before the local-ENU fix used yaw - yaw0 as relative_psi).
         """
         if self.origin_written or not getattr(self, 'origin_set', False):
             return
         try:
             with open(self.origin_path, 'w') as f:
-                f.write('# Origin of the boot-relative world frame used by every\n'
+                f.write('# Origin of the local-ENU world frame (translation only,\n'
+                        '# axes East/North, yaw absolute ENU) used by every\n'
                         '# world-frame column of the CSV beside this file. Latched\n'
-                        '# at robot_interface\'s first odom callback.\n')
+                        '# at robot_interface\'s first odom callback. yaw0_rad is\n'
+                        '# the boat\'s ENU heading at that instant, provenance only.\n')
                 f.write(f'latitude: {self.lat0}\n')
                 f.write(f'longitude: {self.lon0}\n')
                 f.write(f'yaw0_rad: {self.yaw0}\n')
@@ -844,7 +853,8 @@ class BlueBoatController(Node):
             'Hour': now.hour, 'Minute': now.minute, 'Second': now.second,
             'MicroSecond': now.microsecond,
 
-            # Robot pose, boot-relative world frame.
+            # Robot pose, local-ENU world frame (origin = launch point;
+            # relative_psi is ABSOLUTE ENU yaw, 0 = East, CCW+).
             'relative_x': self.relative_coordinates[0],
             'relative_y': self.relative_coordinates[1],
             'relative_psi': self.relative_coordinates[2],
@@ -910,20 +920,20 @@ class BlueBoatController(Node):
 
     def target_to_gps(self, target_xy):
         """
-        Convert a boot-relative world-frame target into WGS84 degrees.
+        Convert a local-ENU world-frame target into WGS84 degrees.
 
         Input  : target_xy -- [x, y] in the same frame as relative_x/y.
         Output : [latitude, longitude] in degrees, or [0.0, 0.0] before the
                  frame origin has been latched by the first odom callback.
 
-        Same two calls the pinger path already uses (cf.local_to_enu then
-        cf.enu_to_gps), so both target GPS columns are produced identically
-        whichever layout is in force.
+        The world frame is local ENU about (lat0, lon0), so world -> east/north
+        is the identity and only the equirectangular projection remains --
+        identical to the pinger path.
         """
         if not getattr(self, 'origin_set', False):
             return [0.0, 0.0]
 
-        east, north = cf.local_to_enu(target_xy[0], target_xy[1], self.yaw0)
+        east, north = target_xy[0], target_xy[1]
         lat, lon = cf.enu_to_gps(self.lat0, self.lon0, east, north)
         return [lat, lon]
 
