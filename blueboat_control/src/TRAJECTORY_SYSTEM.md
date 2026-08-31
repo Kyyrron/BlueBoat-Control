@@ -532,7 +532,8 @@ Measured against mavros 2.14.0 driven by a synthetic FCU holding 1 m/s due **nor
 two readings separate: at heading north the odom twist reads (1.000, 0.000), at heading NE it
 reads (0.707, 0.707) — the body-frame values — while `velocity_local` reads (0.000, 1.000) at
 both. End to end through `robot_interface` at `yaw0 = 45°`, `/blueboat/odom` carries (0.707,
-0.707) with the pose re-zeroed to the boot frame. So `master_control`'s `current_twist[0]`
+0.707) with the pose position translated to the launch point (since 2026-08-31 the frame is
+local ENU: yaw is no longer re-zeroed). So `master_control`'s `current_twist[0]`
 ([master_control.py:401](master_control.py#L401)) is already body-frame surge, and enabling the
 block would have turned a correct 0.707 into 1.000. The block and its argument are removed;
 N3 stands. Two independent facts agree: the pinger dead-reckoning at `robot_interface.py:505`

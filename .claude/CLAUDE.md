@@ -56,8 +56,9 @@ the thesis rests on.
 `/mavros/local_position/odom` has `child_frame_id: base_link` and MAVROS has already rotated
 its `twist` into that frame, so it is surge/sway/yaw-rate while `pose` is world-frame; the ENU
 velocity is a separate topic, `/mavros/local_position/velocity_local`. `robot_interface`
-re-expresses **pose** into a boot-relative frame (subtracting `x0, y0, yaw0`) and passes
-**twist** through untouched (`robot_interface.py:492`). Two consumers depend on it staying
+translates the **pose position** to the launch point (subtracting `x0, y0` only — axes stay
+ENU, yaw stays **absolute ENU**; the published frame is local ENU, see the §2.2 odom row) and
+passes **twist** through untouched (`robot_interface.py:492`). Two consumers depend on it staying
 body-frame: `master_control` reads `current_twist[0]` as surge for the inner speed loop of both
 `PID` and `LoS` (`master_control.py:401`), and the pinger dead-reckoning subtracts
 `self.vel + ω × p` from body-frame pinger coordinates (`robot_interface.py:534`).
@@ -198,7 +199,7 @@ needs `los_guidance`, `timer_callback` and the four `dbl('hold_*', …)` default
 
 | Topic | Type | Published by | Subscribed by |
 |---|---|---|---|
-| `/blueboat/odom` | `nav_msgs/Odometry` | `robot_interface` (real boat) · Gazebo bridge (simulation, §8) | `master_control`, `simulation_interface` |
+| `/blueboat/odom` | `nav_msgs/Odometry` | `robot_interface` (real boat) · Gazebo bridge (simulation, §8) | `master_control`, `simulation_interface` — frame is **local ENU** on both: origin = launch point (real) / Gazebo world origin (sim), axes East/North, yaw **absolute ENU** (0 = East, CCW+). Real yaw is NOT re-zeroed (fixed 2026-08-31: subtracting `yaw0` without rotating the position axes made a hybrid frame that was only consistent when the boat launched facing East — the cause of the East-only trajectory-following field symptom) |
 | `/blueboat/pinger_coordinates` | `std_msgs/Float32MultiArray` | `robot_interface` | `master_control` |
 | `/blueboat/controller_ready` | `std_msgs/Bool` | `robot_interface` · `simulation_interface` | `master_control` |
 | `/thruster_input` | `std_msgs/Float32MultiArray` | `master_control` | `robot_interface`, `simulation_interface` |
@@ -809,9 +810,13 @@ other two Euler angles carry everything the quaternion did in half the columns
 (`cf.quaternion_to_rpy`, which `quaternion_to_yaw` now delegates to).
 
 A `<stem>-origin.yaml` sidecar is written beside the CSV carrying `latitude`, `longitude` and
-`yaw0_rad`. Every world-frame column in the log lives in a frame latched at the first odom
-callback whose origin was previously recorded nowhere, which made a finished run impossible to
-georeference afterwards.
+`yaw0_rad`. Every world-frame column in the log lives in the local-ENU frame latched at the
+first odom callback (origin previously recorded nowhere, which made a finished run impossible
+to georeference afterwards). `yaw0_rad` is the boat's ENU heading at that instant —
+**provenance only, not part of the frame**: since the 2026-08-31 local-ENU fix,
+`relative_psi` is absolute ENU yaw; in logs recorded before it, `relative_psi` was
+`yaw − yaw0_rad` (and world positions were ENU regardless), so the sidecar is what
+disambiguates old data from new.
 
 Rows are still filled **by column name**, so order can change without desynchronising the
 data. Field data is campaign-bound and weather-limited — treat it as irreplaceable. The
@@ -838,6 +843,15 @@ also takes a `display_log` parameter for per-request logging.
 The function is pure in `t`, which is what lets the trajectory be swapped,
 replayed or hot-reloaded with no coupling to the controller. **Speed is baked into each
 formula** — `x = 0.5*t` means 0.5 m/s; there is no separate speed setting.
+
+**Trajectory frame:** every shape (and every YAML `points` row) is expressed in the
+`/blueboat/odom` world frame, which is **local ENU** (§2.2): origin = the boat's launch
+point, `+x = East`, yaw absolute. A shape authored to start at `(0, 0)` with `yaw = 0`
+therefore starts at the launch position heading **East**, identically on the real boat and
+in simulation. (Before the 2026-08-31 frame fix, the position stream was ENU while the yaw
+stream was launch-relative, so paths tracked correctly only when the boat launched facing
+East.) GPS-anchored station missions arrive already translated into this frame by the MCS
+deploy step; `path_generation` applies no transform of its own.
 
 The hard-coded shapes are the reference conditions for existing field data; changing one
 invalidates comparison against earlier runs without raising any error, which is why

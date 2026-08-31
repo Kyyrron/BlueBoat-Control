@@ -11,6 +11,25 @@ guessed at.
 
 ---
 
+## 0. Field verification of the 2026-08-31 local-ENU frame fix
+
+- [ ] **Verify the odom frame fix on the water.** `robot_interface.odom_callback` no longer
+      re-zeroes yaw: `/blueboat/odom` is now local ENU (position translated to the launch
+      point, yaw absolute — 0 = East, CCW+), matching the simulator's frame in kind. This
+      was the root cause of "trajectory following only works when launched facing East",
+      wrong manual-target behaviour and broken GPS anchoring (the old frame mixed ENU axes
+      with launch-relative yaw; the LoS heading error carried a constant `yaw0` bias, so
+      cross-track equilibrium was `Δ·tan(yaw0)`, divergent ≥ 90°). `cf.local_to_enu` (which
+      also carried a spurious −π/2) is deleted; pinger/target GPS conversions are identity
+      by construction now. **Requires rebuilding the boat's `/blueboat_ws`** — a stale boat
+      build silently reintroduces the hybrid frame. Field checks: trajectory following from
+      a non-East launch heading; manual target landing where clicked; `relative_psi` in the
+      CSV reading the compass-consistent ENU heading (note: logs recorded BEFORE the fix
+      have `relative_psi = yaw − yaw0_rad`; the `-origin.yaml` sidecar disambiguates).
+      **NOT VERIFIABLE ON THIS MACHINE** (needs the boat).
+
+---
+
 ## 1. Needs a running ROS 2 / Gazebo workspace
 
 - [ ] **Gazebo generation mismatch — port the Fortress plugin names.** Every plugin in
