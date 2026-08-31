@@ -16,6 +16,7 @@ from rclpy.qos import QoSProfile, QoSDurabilityPolicy
 # Custom libraries
 from blueboat_control import ROV
 import custom_functions as cf
+import thrust_limits as tl     # uniform thrust saturation (ROS-free)
 
 class Controller(Node):
     def __init__(self):
@@ -31,6 +32,14 @@ class Controller(Node):
         # ten missed producer ticks (five ticks of this node's own 10 Hz loop).
         self.declare_parameter('thruster_input_timeout', 0.5)
         self.thruster_input_timeout = self.get_parameter('thruster_input_timeout').get_parameter_value().double_value
+
+        # Same name, semantics and default as robot_interface and master_control.
+        # Simulation used to apply NO thrust limit at all -- ROV.move puts
+        # whatever arrives straight onto the Gazebo thrusters -- so a command the
+        # real boat would have saturated ran unbounded here and the two diverged
+        # exactly where N2/CM-2 says they must not.
+        self.declare_parameter('thrust_limit', 20.0)
+        self.thrust_limit = self.get_parameter('thrust_limit').get_parameter_value().double_value
 
         self.rov = ROV(self, thrust_visual = True)
 
@@ -104,7 +113,20 @@ class Controller(Node):
             self.thr_watchdog_tripped = False
             self.get_logger().info("/thruster_input resumed - releasing watchdog.")
 
-        r,l = self.thr_input
+        # Saturate the same way the real boat does: one scale factor for both
+        # thrusters, so the right:left ratio and the direction of the commanded
+        # wrench survive the clamp (thrust_limits.py explains why per-side
+        # clipping does not). master_control already limits at its publisher, so
+        # this normally does nothing -- it is here so that a command reaching
+        # Gazebo from anywhere else is bounded like the hardware is.
+        limited, scale = tl.scale_to_limit(self.thr_input, self.thrust_limit)
+        if scale < 1.0:
+            self.get_logger().warn(
+                f"Thrust {list(self.thr_input)} exceeds thrust_limit="
+                f"{self.thrust_limit:.1f} N - scaled by {scale:.3f}.",
+                throttle_duration_sec=2.0)
+
+        r, l = float(limited[0]), float(limited[1])
         # Apply force to thrusters
         self.rov.move([r,l])
 

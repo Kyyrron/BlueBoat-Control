@@ -94,6 +94,17 @@ Each verified against the tree. Ordered by value; identifiers are those of
       new target arrives. Surfaces on the basestation as a boat that stops responding with no
       indication why; the station must not compensate, see
       `BlueBoat-MCS/.claude/specs/robot-side-limitations-watchlist.SPEC.md`.
+- [ ] **`solve_LoS` uses the moment arm the wrong way round.** It builds
+      `[v + 0.295*yaw_rate, v - 0.295*yaw_rate]` (`master_control.py:716-717`), *multiplying*
+      by the arm `r = 0.295`, where `ThrustAllocator` *divides* by it
+      (`1/(2r) = 1.695`) — a factor of 5.75 between the two for the same nominal moment. On
+      top of that `v` and `yaw_rate` are kinematic quantities (m/s, rad/s) written straight
+      into a topic every consumer reads as Newtons, so the law's gains are only meaningful
+      relative to themselves. Not changed with the 2026-08-31 dead-zone work, which
+      deliberately touched only the surge term: correcting the arm rescales all steering
+      authority in the pinger and manual-target branches at once and needs a dock test, not an
+      edit. `point_k_psi` is a declared parameter, so a candidate value costs a launch
+      argument.
 - [ ] **C9 — MPC horizon shorter than one turning radius.** `mpc_time = 2.5 s` covers 0.80 m
       of travel against a 1.89 m minimum turning radius. `master_control.py:154-155`.
 - [ ] **F5 — the governor's cross-track term is built but disabled.** `advance_governor` now
@@ -160,14 +171,25 @@ Each verified against the tree. Ordered by value; identifiers are those of
       bounds it at 0.25 N and measures it rather than tolerating it. Publishing `U_d` would
       close it, but that is an interface change (N1) and a cross-repo decision — do not make
       it to suit the harness alone.
-- [ ] **Recorded thrust exceeds the ±20 N clamp.** Replaying the two long 2026-08-27 logs
-      reports mean |thrust| 24.0 N with 100 % of the tail on the limiter, and single samples
-      at 30.6 N, against `thrust_limit = 20.0`. In the current tree the limits are built at
-      `master_control.py:318-321` and passed to both `PIDLoS` and the LoS allocator, and
-      `ThrustAllocator.allocate` scales uniformly, so the current code should not be able to
-      produce this. **Cause not established** — most likely the recordings predate that
-      wiring, or the run overrode `thrust_limit`. Reproduce with a Gazebo run before treating
-      it as a live defect. Surfaced by `replay.py`, not by inspection.
+- [x] **Recorded thrust exceeds the ±20 N clamp — CAUSE FOUND, 2026-08-31.** The premise
+      that "the current code should not be able to produce this" was wrong: `solve_LoS`
+      (manual target, and pinger + LoS) built its `[right, left]` array by hand and went
+      through **no allocator and no limit at all**, so it could emit 30–40 N — the yaw term
+      alone reaches ±9.3 N on the real boat and the manual double-log surge reaches ~25 N at
+      50 m. Nothing clipped it in simulation either (`simulation_interface` → `ROV.move`, both
+      clip-free), and on the real boat `manualMove`'s per-side clip reshaped the wrench rather
+      than rejecting it. All three now saturate uniformly through
+      `thrust_limits.scale_to_limit` against one `thrust_limit` parameter, and
+      `publish_thrust` returns the saturated vector so the `.npy` records what went on the
+      wire. The 30.6 N sample is explained; no recording is needed to close it.
+- [ ] **`replay.read_poslog_csv` cannot read any CSV this system produces.** It requires
+      columns named `x`, `y` and hard-raises without them, and reads `psi`, `t`, `u1`, `u2`;
+      the schema has always called these `relative_x`, `relative_y`, `relative_psi`,
+      `right_thr_in`, `left_thr_in` plus seven date fields. This predates the 2026-08-31
+      schema revision — it has never worked — and is why §5's "never run against a field bag"
+      item could not have been closed even with a bag in hand. It is a ~6-line column map in
+      `docs/controllers/replay.py`; the `.npy` reader is fine and is what
+      `check_replay.py` exercises.
 
 Nothing beyond these is justified by evidence yet. In particular, do not add lint/format/docs
 pipeline scaffolding: no recurring need for it appears anywhere in this module's history.

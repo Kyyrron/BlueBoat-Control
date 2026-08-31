@@ -390,11 +390,38 @@ def seabed_scanning(t):
 
     return xr, yr, zr, phir, thetar, psir
 
-def quaternion_to_yaw(q: Quaternion):
+def quaternion_to_rpy(q: Quaternion):
+    """
+    Convert a quaternion to (roll, pitch, yaw) in radians, ZYX convention.
+
+    Input  : q -- geometry_msgs Quaternion (any object with .x/.y/.z/.w).
+    Output : (roll, pitch, yaw) tuple of floats.
+
+    Pitch is clamped rather than passed to asin directly, so a quaternion that
+    is a hair off unit length from accumulated float error cannot raise a
+    domain error at +/-90 degrees. The yaw branch is the one quaternion_to_yaw
+    has always used, so both functions agree by construction.
+    """
+    # roll (X axis rotation)
+    sinr_cosp = 2.0 * (q.w * q.x + q.y * q.z)
+    cosr_cosp = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+
+    # pitch (Y axis rotation)
+    sinp = 2.0 * (q.w * q.y - q.z * q.x)
+    pitch = math.asin(max(-1.0, min(1.0, sinp)))
+
     # yaw (Z axis rotation)
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
     cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    return math.atan2(siny_cosp, cosy_cosp)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
+
+    return roll, pitch, yaw
+
+def quaternion_to_yaw(q: Quaternion):
+    # yaw (Z axis rotation). One conversion, shared with quaternion_to_rpy
+    # above, so the two can never drift apart.
+    return quaternion_to_rpy(q)[2]
 
 def yaw_to_quaternion(yaw: float):
     q = Quaternion()

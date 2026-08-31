@@ -148,11 +148,12 @@ Non-node library modules, installed the same flat way and imported as bare modul
 | `custom_functions.py` | `src/_custom_libraries/` | yes (`rclpy`, msgs) | Shared helpers: `data_root`, `odometry`, `compute_target`, quaternion/frame maths |
 | `yaml_trajectory.py` | `src/_custom_libraries/` | no | `blueboat_trajectory/1` loader, evaluated at time `t` |
 | `frame_math.py` | `src/_custom_libraries/` | **no** | `inRobotFrame()` — world→body geometry, with its full input/output contract |
-| `robot_log_schema.py` | `src/_custom_libraries/` | **no** | The position-CSV column layouts (`COLUMNS_PINGER`, `COLUMNS_NO_PINGER`, `columns_for`) |
+| `robot_log_schema.py` | `src/_custom_libraries/` | **no** | The position-CSV column layouts (`COLUMNS_PINGER`, `COLUMNS_NO_PINGER`, `columns_for`, `target_columns_for`, the `ACT_*` constants) |
+| `thrust_limits.py` | `src/_custom_libraries/` | **no** | `scale_to_limit()` — uniform per-thruster saturation, and the argument for why it is not two clips |
 | `PID/PID.py`, `MPC/ur_mpc.py`, `MPC/uvr_mpc.py` | `src/PID/`, `src/MPC/` | no | Controller implementations |
 
-`frame_math.py` and `robot_log_schema.py` are **ROS-free by construction** — numpy only, or
-no imports at all. That is deliberate: both can be imported, diffed and checked from a plain
+`frame_math.py`, `robot_log_schema.py` and `thrust_limits.py` are **ROS-free by construction**
+— numpy only, or no imports at all. That is deliberate: both can be imported, diffed and checked from a plain
 Python prompt with no sourced workspace, which is what makes the geometry and the CSV format
 debuggable without a running graph. Keep them that way; anything needing `rclpy` belongs in
 `custom_functions.py` instead.
@@ -441,10 +442,12 @@ therefore asserts 0.4 as a live coupling to `pid_lookahead = 2.5`, not as recove
 **Interpreter.** Two interpreters, and they differ in what they carry.
 
 `~/ros2_ws/.venv` is where `acados_template`, `casadi` and `pandas` live, and it is what the
-**ROS nodes** need: without it `master_control` (acados + casadi), `robot_interface` (pandas)
-and `simulation_interface` (casadi, through `blueboat_control.ROV`) all fail at import. The
-installed executables carry `#!/usr/bin/env python3`, so activating the venv is what selects
-it.
+**ROS nodes** need: without it `master_control` (acados + casadi) and `simulation_interface`
+(casadi, through `blueboat_control.ROV`) fail at import — verified by running
+`Sim_launch.py` outside the venv, where both die with `ModuleNotFoundError` before reaching
+`rclpy.init`. `robot_interface` no longer needs it: its CSV writer stopped using pandas with
+the 2026-08-31 logging rework (§6), so numpy is its only non-ROS dependency. The installed
+executables carry `#!/usr/bin/env python3`, so activating the venv is what selects it.
 
 `/usr/bin/python3` carries numpy, scipy, matplotlib, sympy, PyYAML and `rclpy`, but **not**
 `casadi`, `acados_template` or `pandas`. Everything under `docs/controllers/` therefore runs
@@ -590,7 +593,8 @@ launch argument rather than an edit and a rebuild. Values are read once, at cons
 | PID | `pid_lookahead` (2.5), `outer_gains_x`, `outer_gains_psi` (both `[3.0, 0.01, 0.0]`), `inner_gains_u` (`[1.0, 0, 0]`), `inner_gains_r` (`[1.5, 0, 0]`) |
 | MPC | `mpc_horizon` (15), `mpc_time` (2.5), `mpc_Q_diag`, `mpc_R_diag` |
 | Point following | `point_k_v` / `point_k_psi` (2.0 / 16.0 in simulation, 0.15 / 10.0 on the real boat), `safety_distance` (−1.0, which disables the arrival check) |
-| Thrust | `thrust_limit` (20.0 N) — feeds both the allocator clamp and the MPC input bounds |
+| Thrust | `thrust_limit` (20.0 N) — feeds the allocator clamp, the MPC input bounds **and, since 2026-08-31, `publish_thrust`'s own uniform saturation**. `robot_interface` and `simulation_interface` each declare a parameter of the same name and default (§5) |
+| Dead zone | `min_thrust` (2.0 N) — the propeller-breakaway floor on `solve_LoS`'s surge term. `0.0` disables it and restores the pre-2026-08-31 law exactly (§5) |
 
 ROS 2 has no dict or tuple parameter type, so gain triples and the MPC weight diagonals are
 declared as double arrays and reassembled in the node. `path_time` and `path_steps` stay
@@ -621,11 +625,93 @@ so the reference window and the solver's horizon cannot disagree.
 - Thrust→PWM is a `PchipInterpolator` fitted to a measured bollard-pull table
   (`custom_functions.generate_interpolator`), so its useful range is asymmetric: about
   −27.6 N to +55.2 N.
-- PWM clamps to `[1100, 1900]`. Thrust is clamped twice, by two *independent* numbers:
-  `ThrustAllocator.allocate` scales uniformly under saturation to preserve direction, bounded by
-  the `thrust_limit` parameter (20.0 N); `manualMove` then re-clips each side to a **hard-coded**
-  `±20.` (`robot_interface.py:377-380`). Raising `thrust_limit` alone therefore buys nothing on
-  the real boat — the second clip has no parameter.
+- **Saturation is uniform everywhere, and it is one number.** PWM still clamps to
+  `[1100, 1900]`, but thrust is now bounded by a single rule at every point it can leave a
+  node: `ThrustAllocator.allocate`, `master_control.publish_thrust`,
+  `robot_interface.manualMove` and `simulation_interface` all scale the pair by **one factor**
+  rather than clipping each side, and all four read a `thrust_limit` parameter defaulting to
+  20.0 N. `thrust_limits.scale_to_limit` is the shared implementation.
+
+  **Why uniform, not per-side.** The two thrusters do not carry independent signals — they
+  carry one wrench, split into a common mode and a differential (`f = X/2 ± N/0.59`). Clipping
+  each side on its own does not clamp that command, it *rewrites* it:
+
+  | | right, left | surge X | yaw N |
+  |---|---|---|---|
+  | commanded | `[+45, +18]` | 63.0 N | 27.0 N |
+  | old per-side clip | `[+20, +18]` | 38.0 N | **2.0 N** |
+  | uniform scale | `[+20, +8]` | 28.0 N | 12.0 N |
+
+  The old clip collapsed the differential from 27 N to 2 N, so the harder the controller asked
+  for a turn the straighter the boat went — it diverged from the path instead of converging.
+  Uniform scaling keeps the right:left ratio, so the direction of the wrench survives and the
+  boat holds its commanded turn-per-metre and simply travels it more slowly.
+
+  Two consequences worth knowing. `publish_thrust` returns the saturated vector and
+  `timer_callback` reassigns `u` from it, so `/monitoring_data[7:9]`, the `.npy` `u1/u2` and
+  the CSV's `right_thr_in`/`left_thr_in` all now agree on what actually went on the wire.
+  And this closes `TODO.md` §5's unexplained "recorded thrust exceeds the ±20 N clamp":
+  **`solve_LoS` went through no allocator at all** and could emit 30–40 N, which the per-side
+  clip then reshaped rather than rejected. Simulation applied no limit whatsoever.
+- **The 0–2 N band does not turn the propellers, and one law lives in it.** The bollard-pull
+  table maps 0 N → PWM 1500, 1 N → 1514, 2 N → 1525, so the whole 0–2 N command range lands
+  inside a T200 ESC's ~±25 µs neutral deadband. The table itself has no deadband — it crosses
+  zero smoothly — so nothing in software knew. Per-law radius at which per-thruster force
+  falls under 2 N:
+
+  | law | channel | radius |
+  |---|---|---|
+  | `solve_LoS`, pinger, **real boat** (`k_v = 0.15`) | surge | **3.28 m** |
+  | `solve_LoS`, pinger, simulation (`k_v = 2.0`) | surge | 0.25 m |
+  | `solve_LoS`, manual target, real boat (double log) | surge | 0.30 m |
+  | PID point-following | along-track | 1.33 m |
+  | LoS station-keeping hold | surge | 0.70 m |
+  | PID path-following | cross-track | 0.67 m |
+  | LoS path-following | cross-track | 0.30 m |
+
+  Only the first exceeds 2 m, so only it is floored. `solve_LoS` raises its **surge** term to
+  `min_thrust * g * max(0, cos(bearing))`, where `g` ramps 0→1 over `hold_radius`. Both
+  factors only ever *reduce* the floor, and both reuse a blend this file already applies
+  elsewhere — `g` is the PID/LoS station-keeping fade, `max(0, cos)` is `los_guidance`'s own
+  feedforward shaping. They are not decoration:
+
+  * **`max(0, cos(bearing))`** — forward surge closes the range by `cos(bearing)` only. An
+    ungated floor pushed the boat *away* from a target abeam or behind it while it turned
+    round; the unfloored law does not, because its surge is ~0 there. The turn needs no help
+    at those bearings — the differential is already 4.6 N per side at 90°, well clear of the
+    deadband. Gating cut the modified region from every bearing to **|bearing| ≤ 69.5°**.
+  * **`g`** — without it the commanded surge stepped by 1.64 N as the boat crossed 0.5 m
+    inbound. With it the command is continuous in `d` (verified: the largest sample-to-sample
+    jump scales linearly with sample spacing, slope `min_thrust/hold_radius` = 4 N/m).
+
+  **What is provably not touched.** The `± 0.295*yaw_rate` differential — and therefore the
+  yaw moment, which way the boat turns and how hard — is bit-identical across 865 200
+  (range, bearing) grid points, and the floor never *lowers* the surge at any of them. The
+  modified region is **0.61–3.27 m at |bearing| ≤ 69.5°, 5.7 % of the `d ≤ 12 m` plane**;
+  everywhere else the output is bit-identical, and `min_thrust = 0.0` reproduces the original
+  law exactly. The manual-target branch never engages it at all (its own radius is 0.30 m,
+  inside the fade-in).
+
+  **What it does change, stated plainly.** Inside that region the floor raises `X` while
+  holding `N`, so the commanded surge/yaw ratio rises and the turn radius grows — at
+  `d = 1 m`, `X/N` goes 2.68 → 7.66. That is a real change to the commanded wrench. It is
+  defensible only because the unfloored command in that region *produces no motion at all*:
+  a closed-loop check against an explicit 2 N-per-side deadband has the boat starting 0.8–3.2 m
+  dead ahead of a pinger and **never moving**, and starting at 5–8 m it closes to 3.07 m and
+  stalls there — the predicted boundary. With the floor it converges from every start, with no
+  hunting (tail swing < 0.01 m).
+
+  It settles at **~0.81 m**, not at `hold_radius`: the fade-in itself dips back under the 2 N
+  breakaway around 0.8 m, so the boat parks there. That is the price of continuity over a hard
+  step, and it is well inside the 2 m bar this work was measured against.
+
+  Two limits worth keeping in mind. The floor applies to the **common-mode surge**, not per
+  side, so the inner thruster can still sit under 2 N — flooring per-side would alter the
+  differential, the one thing this must not do, and a per-side deadband is not invertible
+  without changing the wrench. And the modified region still reaches 3.27 m rather than 2 m;
+  pulling that in means raising `point_k_v` (0.15 → 0.246 puts the law's own 2 N crossing at
+  exactly 2.00 m), which is a change to the control law itself — it lifts far-field surge at
+  50 m from 10.70 N to 12.94 N — and has deliberately **not** been made here.
 - **Loss of reference zeroes the thrust at both ends.** `master_control` publishes an explicit
   `[0, 0]` on each of its three early returns instead of falling silent, and both interface
   nodes stop applying a command that has gone stale: `thruster_input_timeout` (0.5 s in each,
@@ -671,23 +757,66 @@ Names are stamped to the second and claimed with `O_EXCL` by
 `custom_functions.reserve_run_file`, so two runs starting inside the same second get `-2`,
 `-3`, … instead of the later one rewriting the earlier (#6 / CM-7). The only reader in the
 project is this module's own `docs/controllers/replay.py`, which opens both layouts read-only;
-nothing writes them back.
+nothing writes them back — though `replay.read_poslog_csv` looks for columns named `x`, `y`,
+`psi`, `t`, `u1`, `u2`, which **no revision of the schema has ever contained**, so it cannot
+in fact read a CSV this system produces. That predates the 2026-08-31 revision; `TODO.md` §5
+holds it.
 
 `.npy` schema: `['t','x','y','psi','x_d','y_d','psi_d','u1','u2']`, target columns world-frame
 per N9. The header is appended as a row of **strings** to the same list as the float rows, so
 `np.save` coerces the whole array to strings — analysis scripts must cast back on load.
 
-The CSV has two layouts, chosen by `use_UWgps`:
+The CSV still has two layouts, chosen by `use_UWgps` — a pinger is a target with genuinely
+specific fields — but **as of 2026-08-31 they share the same first 19 columns structurally**:
+time (7) → robot pose, world (3) → target pose, same world frame (2) → robot GPS (2) →
+target GPS (2) → `right_thr_in`, `left_thr_in`, `actuation_state` (3). Only the four target
+names differ, so the robot/target pair in each frame is adjacent and selects as a block.
 
-* **pinger** — `corrected_pinger_x/y` (world frame), `pinger_latitude/longitude`, and the 19
-  raw UGPS fields (date ×7, aco xyz, ant xyz, lat/lon/dep, filaco xyz);
-* **no pinger** — `target_x` / `target_y` taken from `/monitoring_data[4:6]`, so they are
-  world-frame for every controller. There is no `target_psi` column.
+* **no pinger, 27 columns** — target block is `target_x` / `target_y` (from
+  `/monitoring_data[4:6]`, world-frame in every controller branch, N9) and
+  `target_latitude` / `target_longitude`, the same point through the run's origin fix.
+* **pinger, 39 columns** — target block is `corrected_pinger_x/y` and
+  `pinger_latitude/longitude`, plus the raw UGPS fields (aco xyz, ant xyz, lat/lon/dep,
+  filaco xyz) after the shared block. `ant_*` is all-zero unless `uwgps_log` is given its
+  `--antenna` flag, which no launch file passes, and `dep` is set from the same value as
+  `aco_z` rather than an independent sensor.
 
-Both fill rows **by column name**, so column order can be changed without desynchronising the
-data. The CSV is rewritten in full on every write (crash safety); the `.npy` is saved at most
-every 0.1 s to avoid corruption from a too-frequent callback. Field data is campaign-bound and
-weather-limited — treat it as irreplaceable.
+`actuation_state` says whether the logged command could reach the water: `0` motors disabled,
+`1` live (enabled and in override), `2` enabled but not in override, `3` watchdog forcing
+zero. Without it a run with the motor gate off is byte-indistinguishable from a live one, and
+a watchdog trip is indistinguishable from a genuine zero command — the watchdog writes
+`[0, 0]` into the same field.
+
+Four things changed with the layouts, none of them cosmetic:
+
+* **One writer, both layouts.** The pinger CSV used to be assembled and written inside
+  `uw_gps_callback`, i.e. driven by the Water Linked link at 2 Hz, so a UGPS dropout stopped
+  recording the **robot** as well. That callback now only caches its packet;
+  `log_timer_callback` owns the file at 0.33 s for both layouts.
+* **Append, not rewrite.** The header goes out once and each row is appended and flushed. The
+  old writer accumulated a DataFrame and rewrote the whole file every row — O(n²), and despite
+  its "for safety in case of unexpected shutdowns" comment, strictly *less* safe: a kill
+  mid-rewrite truncates a whole file where an appended row is already on disk. The `.npy` is
+  unchanged and still saved at most every 0.1 s.
+* **`MicroSecond` is microseconds in both.** It was `now.microsecond // 1000`, i.e.
+  milliseconds, in the no-pinger layout and true microseconds in the other.
+* **No stray rows or columns.** The all-zero seed row and the unnamed pandas index column
+  (which read `0` on every row) are both gone. `robot_interface` no longer imports pandas at
+  all.
+
+`quat_x/y/z/w` became `roll, pitch` in both layouts — yaw was already `relative_psi`, so the
+other two Euler angles carry everything the quaternion did in half the columns
+(`cf.quaternion_to_rpy`, which `quaternion_to_yaw` now delegates to).
+
+A `<stem>-origin.yaml` sidecar is written beside the CSV carrying `latitude`, `longitude` and
+`yaw0_rad`. Every world-frame column in the log lives in a frame latched at the first odom
+callback whose origin was previously recorded nowhere, which made a finished run impossible to
+georeference afterwards.
+
+Rows are still filled **by column name**, so order can change without desynchronising the
+data. Field data is campaign-bound and weather-limited — treat it as irreplaceable. The
+schema revision is recorded in `robot_log_schema.py`'s docstring; `data/Robot_data/` was empty
+when it landed, so no recorded field CSV was invalidated (CM-7).
 
 All of it comes from a single site, which bounds what any control result derived from it
 supports: state such a result as single-site, not general. `project_synthesis.md` §10 and §4.1

@@ -40,6 +40,8 @@ install(PROGRAMS src/_custom_libraries/frame_math.py
         DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS src/_custom_libraries/robot_log_schema.py
         DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS src/_custom_libraries/thrust_limits.py
+        DESTINATION lib/${PROJECT_NAME})
 
 install(PROGRAMS src/robot_interaction/robot_interface.py
         DESTINATION lib/${PROJECT_NAME})

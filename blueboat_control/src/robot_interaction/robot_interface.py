@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
 
 # ============================================================================
-# PATCHED for the Mission Control Station (logging update). Marked with
-# "# --- logging update ---". Changes:
-#   1. CSV columns reorganised with the important ones FIRST (names kept):
-#      date, robot pose, target, [pinger + GPS], thrusters, then raw sensors.
-#   2. All log rows are filled BY COLUMN NAME (df.loc with the column label)
-#      instead of positional iloc indices, so the order can never silently
-#      de-synchronise from the data again.
-#   3. Fixed swapped thruster columns: thruster_input is [right, left]
-#      (master_control convention), but index 0 was written into
-#      'left_thr_in' in both logging paths.
-#   4. Pinger-mode CSV: removed the duplicated 'target_x/y/psi' columns
-#      (they were /controller_target = the same pinger vector as
-#      'corrected_pinger_x/y', just in the robot frame); the world-frame
-#      corrected_pinger columns are kept.
-#   5. Fixed the no-pinger target logging: /monitoring_data x_d/y_d are now
-#      world-frame for every controller (patched master_control), the two
-#      debug spam logs are removed, and an empty monitoring buffer logs
-#      zeros without raising.
-# Everything else is byte-identical to the original.
+# MAVROS bridge, thrust -> PWM, pose re-zeroing, pinger dead reckoning and the
+# position CSV. Two things here are easy to get wrong and are commented at the
+# point they happen rather than here:
+#
+#   * THRUST SATURATION IS UNIFORM, NOT PER-SIDE (manualMove, section 3). The
+#     two thrusters carry one wrench, so clipping each independently rewrites
+#     the command instead of clamping it -- [+45, +18] became [+20, +18], which
+#     collapses the turn and makes the boat diverge. See thrust_limits.py.
+#   * ONE CSV WRITER, BOTH LAYOUTS (section 8). The pinger layout used to be
+#     written from uw_gps_callback, so a Water Linked dropout stopped recording
+#     the robot too. That callback now only caches; the timer owns the file.
+#
+# Column layout, its revision history and the actuation_state encoding live in
+# _custom_libraries/robot_log_schema.py. Rows are filled BY COLUMN NAME so the
+# two can never desynchronise.
 # ============================================================================
 
 # ----------------------------------------------------------------------------
@@ -47,7 +43,6 @@ import os
 import time
 from datetime import datetime
 import numpy as np
-import pandas as pd
 
 # ROS2 import
 import rclpy
@@ -67,6 +62,7 @@ from mavros_msgs.srv import CommandLong
 # Custom imports
 import custom_functions as cf
 import robot_log_schema as rls   # CSV column layout (ROS-free, _custom_libraries/)
+import thrust_limits as tl       # uniform thrust saturation (ROS-free)
 
 # RC override channel conventions (MAVLink / mavros)
 CHAN_RELEASE = 0        # give the channel back to the RC receiver
@@ -106,6 +102,14 @@ class BlueBoatController(Node):
         # DDS jitter at that rate and well inside ArduPilot's own RC_OVERRIDE_TIME.
         self.declare_parameter('thruster_input_timeout', 0.5)
         self.thruster_input_timeout = self.get_parameter('thruster_input_timeout').get_parameter_value().double_value
+
+        # Per-thruster saturation, same name and default as master_control's.
+        # This used to be two hard-coded literals inside manualMove, which meant
+        # master_control's thrust_limit parameter bought nothing on the real boat:
+        # raising it there just moved the clamp to the one here that no parameter
+        # could reach. One name, one number, both ends.
+        self.declare_parameter('thrust_limit', 20.0)
+        self.thrust_limit = self.get_parameter('thrust_limit').get_parameter_value().double_value
 
         # Empty means "resolve it" - see custom_functions.data_root for the order.
         self.declare_parameter('data_dir', '')
@@ -222,18 +226,35 @@ class BlueBoatController(Node):
         # module docstring before touching a name or an order. Rows are filled
         # by column NAME below, never by index, so the two cannot desynchronise.
         self.data_columns = rls.columns_for(self.use_UWgps)
+        # ((world_x, world_y), (latitude, longitude)) under this layout's names,
+        # so the shared leading block is filled once instead of branched twice.
+        self.target_cols, self.target_gps_cols = rls.target_columns_for(self.use_UWgps)
 
-        self.data_size = len(self.data_columns)
-
-        self.uw_gps_log = [0]*self.data_size
-
-        self.df_log = pd.DataFrame(np.zeros(self.data_size).reshape(1, self.data_size),
-                                  columns=self.data_columns)
+        # Latest /uw_gps_data packet (19 raw values), CACHED here by
+        # uw_gps_callback. That callback used to assemble and write a CSV row
+        # itself, which tied the whole log -- robot pose included -- to the Water
+        # Linked link: a UGPS dropout stopped recording the boat. Now it only
+        # caches, and log_timer_callback is the single writer for both layouts.
+        self.uw_gps_log = [0.0] * 19
 
         self.date = datetime.today().strftime('%Y_%m_%d-%H_%M_%S')
         log_dir = cf.ensure_data_dir(self, self.data_root, 'data', 'Robot_data')
-        self.path = cf.reserve_run_file(
-            log_dir, f'{self.date}-{self.note}-poslog', '.csv') + '.csv'
+        stem = f'{self.date}-{self.note}-poslog' if self.note else f'{self.date}-poslog'
+        self.path = cf.reserve_run_file(log_dir, stem, '.csv') + '.csv'
+        self.origin_path = self.path[:-len('-poslog.csv')] + '-origin.yaml'
+
+        # Header once, then one appended-and-flushed row per tick. The previous
+        # version accumulated every row in a DataFrame and rewrote the WHOLE file
+        # on each write, which is O(n^2) in both time and bytes and, despite the
+        # comment claiming it was "for safety in case of unexpected shutdowns",
+        # is strictly less safe than this: a row appended and flushed is already
+        # on disk, and a kill mid-rewrite truncates a full file rather than one
+        # row. index=False drops the unnamed pandas index column the old writer
+        # emitted (it read 0 on every row), and there is no all-zero seed row.
+        self.log_file = open(self.path, 'w', buffering=1)
+        self.log_file.write(','.join(self.data_columns) + '\n')
+        self.log_file.flush()
+        self.origin_written = False
         self.get_logger().info(f"Position log: {self.path}")
 
     # ======================================================================
@@ -373,11 +394,28 @@ class BlueBoatController(Node):
             compensation_gain = 0.75
 
         compensation_gain=1.0
-        # Sanitize input
-        max_input = 20.
-        min_input = -20.
-        left = np.clip(input[1], min_input, max_input)
-        right = np.clip(input[0]*compensation_gain, min_input, max_input)
+        # Sanitize input.
+        #
+        # UNIFORM saturation, not two independent clips. The two thrusters do not
+        # carry independent signals: what the controller commands is a surge force
+        # and a yaw moment, split into a common mode and a differential. Clipping
+        # each side on its own therefore does not clamp the command, it rewrites
+        # it into a different one -- [+45, +18] became [+20, +18], collapsing a
+        # 27 N differential to 2 N, so the boat stopped turning and ran further
+        # from the path the harder the controller asked. One scale factor for both
+        # sides keeps the ratio, hence the turn, and only slows the boat down:
+        # [+45, +18] -> [+20, +8]. thrust_limits.py carries the full argument.
+        scaled, scale = tl.scale_to_limit(
+            [input[0] * compensation_gain, input[1]], self.thrust_limit)
+        if scale < 1.0:
+            self.get_logger().warn(
+                f"Thrust {list(input)} exceeds thrust_limit="
+                f"{self.thrust_limit:.1f} N - scaled by {scale:.3f} to "
+                f"[{scaled[0]:.1f}, {scaled[1]:.1f}] (direction preserved).",
+                throttle_duration_sec=2.0)
+
+        right = float(scaled[0])
+        left = float(scaled[1])
 
         # Convert thrust to PWM (double sanitation)
         max_PWM = 1900
@@ -574,74 +612,26 @@ class BlueBoatController(Node):
 
     def uw_gps_callback(self, msg):
         """
-        Read msg from the underwater_gps node, compile it with robot data and save the log
-        """
+        Cache the Water Linked UGPS packet and reseed the pinger dead reckoning.
 
+        This callback does NOT write the CSV any more. It used to assemble and
+        write a whole row, which meant the pinger-mode log was driven by the UGPS
+        link at 2 Hz and stopped entirely -- robot pose included -- whenever that
+        link dropped. log_timer_callback is now the single writer for both
+        layouts, and reads self.uw_gps_log from here.
+
+        /uw_gps_data layout, 19 values:
+            [date x7, aco xyz, ant xyz, lat, lon, dep, filaco xyz]
+        """
         if not self.use_UWgps:
             return
 
-        # Make sure the robot's data is available
-        if self.orientation is None or self.angular_velocity is None or self.linear_acceleration is None:
-            return
+        self.uw_gps_log = list(msg.data)
 
-        ## Compile data from gps, imu, and others
-        self.uw_gps_log = msg.data
-
-        # --- logging update: fill BY COLUMN NAME (order-independent) ------
-        # /uw_gps_data layout: [date(7), aco xyz, ant xyz, lat, lon, dep,
-        # filaco xyz] = 19 values.
-        df_tmp = pd.DataFrame(np.zeros(self.data_size).reshape(1, self.data_size), columns=self.data_columns)
-
-        raw_names = ['Year', 'Month', 'Day', 'Hour', 'Minute', 'Second',
-                     'MicroSecond', 'aco_x', 'aco_y', 'aco_z',
-                     'ant_x', 'ant_y', 'ant_z', 'lat', 'lon', 'dep',
-                     'filaco_x', 'filaco_y', 'filaco_z']
-        for name, value in zip(raw_names, msg.data):
-            df_tmp.loc[df_tmp.index[0], name] = value
-
-        t_x, t_y, t_z = msg.data[16], msg.data[17], msg.data[18]  # filaco
-        self.pinger_coordinates = np.array([t_x,t_y,t_z])
-
-        row = df_tmp.index[0]
-        df_tmp.loc[row, 'quat_x'] = self.orientation.x
-        df_tmp.loc[row, 'quat_y'] = self.orientation.y
-        df_tmp.loc[row, 'quat_z'] = self.orientation.z
-        df_tmp.loc[row, 'quat_w'] = self.orientation.w
-
-        df_tmp.loc[row, 'ang_vel_x'] = self.angular_velocity.x
-        df_tmp.loc[row, 'ang_vel_y'] = self.angular_velocity.y
-        df_tmp.loc[row, 'ang_vel_z'] = self.angular_velocity.z
-
-        df_tmp.loc[row, 'lin_acc_x'] = self.linear_acceleration.x
-        df_tmp.loc[row, 'lin_acc_y'] = self.linear_acceleration.y
-        df_tmp.loc[row, 'lin_acc_z'] = self.linear_acceleration.z
-
-        df_tmp.loc[row, 'relative_x'] = self.relative_coordinates[0]
-        df_tmp.loc[row, 'relative_y'] = self.relative_coordinates[1]
-        df_tmp.loc[row, 'relative_psi'] = self.relative_coordinates[2]
-
-        # --- logging update (2): target_x/y/psi removed from the pinger
-        # CSV — they were /controller_target, i.e. the SAME pinger vector as
-        # corrected_pinger_x/y but in the robot frame: duplicated
-        # information. corrected_pinger (world frame) is kept.
-        df_tmp.loc[row, 'corrected_pinger_x'] = self.corrected_pinger[0]
-        df_tmp.loc[row, 'corrected_pinger_y'] = self.corrected_pinger[1]
-
-        df_tmp.loc[row, 'gps_latitude'] = self.gps_data[0]
-        df_tmp.loc[row, 'gps_longitude'] = self.gps_data[1]
-
-        df_tmp.loc[row, 'pinger_latitude'] = self.pinger_gps[0]
-        df_tmp.loc[row, 'pinger_longitude'] = self.pinger_gps[1]
-
-        # thruster_input is [right, left] (master_control convention); the
-        # original wrote index 0 into 'left_thr_in' -> columns were swapped.
-        df_tmp.loc[row, 'right_thr_in'] = self.thruster_input[0]
-        df_tmp.loc[row, 'left_thr_in'] = self.thruster_input[1]
-        # ------------------------------------------------------------------
-
-        self.df_log = pd.concat([self.df_log, df_tmp])
-
-        self.df_log.to_csv(self.path) # Rewrite the entire file every time for safety in case of unexpected shutdowns
+        # filaco = the FILTERED acoustic position; it seeds the dead reckoning
+        # that odom_callback then propagates at odom rate.
+        t_x, t_y, t_z = msg.data[16], msg.data[17], msg.data[18]
+        self.pinger_coordinates = np.array([t_x, t_y, t_z])
 
     def target_callback(self, msg: Float32MultiArray):
         """
@@ -777,74 +767,190 @@ class BlueBoatController(Node):
     # ======================================================================
     #  8. CSV LOGGING
     #  Write-once field data. Columns in _custom_libraries/robot_log_schema.py.
+    #  ONE writer for BOTH layouts, on this node's own timer. The pinger layout
+    #  used to be written from uw_gps_callback instead, i.e. at the Water Linked
+    #  link's rate, so a UGPS dropout stopped recording the robot as well.
     # ======================================================================
 
-    def log_timer_callback(self):
+    def actuation_state(self):
+        """
+        One integer saying whether the logged thrust command could reach the water.
 
-        # Log here if no uw gps callback
-        if not self.use_UWgps: 
+        Output : int, see robot_log_schema for the encoding --
+                 0 motors disabled, 1 live (enabled and in override),
+                 2 enabled but not in override, 3 watchdog forcing zero.
 
-            # --- logging update -------------------------------------------
-            # /monitoring_data = [t, x, y, psi, x_d, y_d, psi_d, u1, u2];
-            # x_d/y_d are WORLD-frame for every controller with the patched
-            # master_control, so the logged path target is now correct also
-            # for LoS and manual-target sessions (it used to arrive in the
-            # robot frame for those). Empty buffer -> zeros, no spam logs.
+        Without this the CSV cannot distinguish a controller that commanded zero
+        from a boat that was never listening: enable_motors False produces a
+        completely normal-looking log with no PWM ever leaving the boat, and the
+        loss-of-reference watchdog writes [0, 0] into the same thruster_input
+        field a genuine zero command uses.
+        """
+        if self.thr_watchdog_tripped:
+            return rls.ACT_WATCHDOG
+        if not self.enable_motors:
+            return rls.ACT_MOTORS_DISABLED
+        if self.mode != 'override':
+            return rls.ACT_NOT_OVERRIDE
+        return rls.ACT_LIVE
+
+    def write_origin_sidecar(self):
+        """
+        Record the boot-relative frame's own origin, once, beside the CSV.
+
+        Every world-frame column in the log -- relative_x/y/psi, the target pair,
+        corrected_pinger_x/y -- is expressed in a frame whose origin and heading
+        are latched at the first odom callback and were, until this, written
+        nowhere. Without them a recorded run cannot be georeferenced afterwards
+        at all. Three numbers, so they go in a sidecar rather than in three
+        constant columns repeated on every row.
+        """
+        if self.origin_written or not getattr(self, 'origin_set', False):
+            return
+        try:
+            with open(self.origin_path, 'w') as f:
+                f.write('# Origin of the boot-relative world frame used by every\n'
+                        '# world-frame column of the CSV beside this file. Latched\n'
+                        '# at robot_interface\'s first odom callback.\n')
+                f.write(f'latitude: {self.lat0}\n')
+                f.write(f'longitude: {self.lon0}\n')
+                f.write(f'yaw0_rad: {self.yaw0}\n')
+                f.write(f'poslog: {os.path.basename(self.path)}\n')
+            self.origin_written = True
+            self.get_logger().info(f"Frame origin: {self.origin_path}")
+        except OSError as exc:
+            self.get_logger().warn(f"Could not write the frame origin sidecar: {exc}")
+
+    def build_log_row(self):
+        """
+        Assemble one CSV row for whichever layout this run selected.
+
+        Output : dict {column name: value} covering every column of
+                 self.data_columns. Filled BY COLUMN NAME, never by index, so
+                 the order in robot_log_schema can never silently desynchronise
+                 from the values written into it.
+
+        Raises AttributeError while the IMU has not reported yet; the caller
+        treats that as "not ready" rather than as a failure.
+        """
+        now = datetime.today()
+        roll, pitch, _ = cf.quaternion_to_rpy(self.orientation)
+
+        row = {
+            # Wall clock. MicroSecond is FULL microseconds in both layouts --
+            # the no-pinger path used to write now.microsecond // 1000, i.e.
+            # milliseconds under a column named MicroSecond.
+            'Year': now.year, 'Month': now.month, 'Day': now.day,
+            'Hour': now.hour, 'Minute': now.minute, 'Second': now.second,
+            'MicroSecond': now.microsecond,
+
+            # Robot pose, boot-relative world frame.
+            'relative_x': self.relative_coordinates[0],
+            'relative_y': self.relative_coordinates[1],
+            'relative_psi': self.relative_coordinates[2],
+
+            # Robot fix, immediately followed by the target's below so the two
+            # can be selected and plotted together.
+            'gps_latitude': self.gps_data[0],
+            'gps_longitude': self.gps_data[1],
+
+            # thruster_input is [right, left] (master_control's convention).
+            'right_thr_in': self.thruster_input[0],
+            'left_thr_in': self.thruster_input[1],
+            'actuation_state': self.actuation_state(),
+
+            # Attitude. Yaw is not repeated -- it is relative_psi above.
+            'roll': roll,
+            'pitch': pitch,
+
+            'ang_vel_x': self.angular_velocity.x,
+            'ang_vel_y': self.angular_velocity.y,
+            'ang_vel_z': self.angular_velocity.z,
+
+            'lin_acc_x': self.linear_acceleration.x,
+            'lin_acc_y': self.linear_acceleration.y,
+            'lin_acc_z': self.linear_acceleration.z,
+        }
+
+        # --- the target block, under whichever names this layout uses --------
+        if self.use_UWgps:
+            # The pinger IS the target. corrected_pinger is the dead-reckoned
+            # vector rotated into the world frame; pinger_gps is that same point
+            # in WGS84, both maintained by odom_callback.
+            target_xy = self.corrected_pinger
+            target_gps = self.pinger_gps
+        else:
+            # /monitoring_data = [t, x, y, psi, x_d, y_d, psi_d, u1, u2].
+            # x_d/y_d are world-frame in EVERY controller branch (CM-8 / N9), so
+            # no frame correction is applied here or downstream. An empty buffer
+            # (no controller running yet) logs zeros rather than raising.
             if len(self.monitoring_data) >= 6:
-                target_x = self.monitoring_data[4]
-                target_y = self.monitoring_data[5]
+                target_xy = [self.monitoring_data[4], self.monitoring_data[5]]
             else:
-                target_x = 0.0
-                target_y = 0.0
+                target_xy = [0.0, 0.0]
+            target_gps = self.target_to_gps(target_xy)
 
-            try:
-                df_tmp = pd.DataFrame(np.zeros(self.data_size).reshape(1, self.data_size), columns=self.data_columns)
-                row = df_tmp.index[0]
+        row[self.target_cols[0]] = target_xy[0]
+        row[self.target_cols[1]] = target_xy[1]
+        row[self.target_gps_cols[0]] = target_gps[0]
+        row[self.target_gps_cols[1]] = target_gps[1]
 
-                now = datetime.today()
+        # --- raw Water Linked packet, pinger layout only ---------------------
+        if self.use_UWgps:
+            # /uw_gps_data indices 7..18; 0..6 are its own date fields, which the
+            # wall-clock stamp above already covers.
+            ugps_names = ('aco_x', 'aco_y', 'aco_z',
+                          'ant_x', 'ant_y', 'ant_z',
+                          'lat', 'lon', 'dep',
+                          'filaco_x', 'filaco_y', 'filaco_z')
+            for name, value in zip(ugps_names, self.uw_gps_log[7:19]):
+                row[name] = value
 
-                df_tmp.loc[row, 'Year'] = now.year
-                df_tmp.loc[row, 'Month'] = now.month
-                df_tmp.loc[row, 'Day'] = now.day
-                df_tmp.loc[row, 'Hour'] = now.hour
-                df_tmp.loc[row, 'Minute'] = now.minute
-                df_tmp.loc[row, 'Second'] = now.second
-                df_tmp.loc[row, 'MicroSecond'] = now.microsecond // 1000
+        return row
 
-                df_tmp.loc[row, 'quat_x'] = self.orientation.x
-                df_tmp.loc[row, 'quat_y'] = self.orientation.y
-                df_tmp.loc[row, 'quat_z'] = self.orientation.z
-                df_tmp.loc[row, 'quat_w'] = self.orientation.w
+    def target_to_gps(self, target_xy):
+        """
+        Convert a boot-relative world-frame target into WGS84 degrees.
 
-                df_tmp.loc[row, 'ang_vel_x'] = self.angular_velocity.x
-                df_tmp.loc[row, 'ang_vel_y'] = self.angular_velocity.y
-                df_tmp.loc[row, 'ang_vel_z'] = self.angular_velocity.z
+        Input  : target_xy -- [x, y] in the same frame as relative_x/y.
+        Output : [latitude, longitude] in degrees, or [0.0, 0.0] before the
+                 frame origin has been latched by the first odom callback.
 
-                df_tmp.loc[row, 'lin_acc_x'] = self.linear_acceleration.x
-                df_tmp.loc[row, 'lin_acc_y'] = self.linear_acceleration.y
-                df_tmp.loc[row, 'lin_acc_z'] = self.linear_acceleration.z
+        Same two calls the pinger path already uses (cf.local_to_enu then
+        cf.enu_to_gps), so both target GPS columns are produced identically
+        whichever layout is in force.
+        """
+        if not getattr(self, 'origin_set', False):
+            return [0.0, 0.0]
 
-                df_tmp.loc[row, 'relative_x'] = self.relative_coordinates[0]
-                df_tmp.loc[row, 'relative_y'] = self.relative_coordinates[1]
-                df_tmp.loc[row, 'relative_psi'] = self.relative_coordinates[2]
+        east, north = cf.local_to_enu(target_xy[0], target_xy[1], self.yaw0)
+        lat, lon = cf.enu_to_gps(self.lat0, self.lon0, east, north)
+        return [lat, lon]
 
-                df_tmp.loc[row, 'gps_latitude'] = self.gps_data[0]
-                df_tmp.loc[row, 'gps_longitude'] = self.gps_data[1]
+    def log_timer_callback(self):
+        """
+        Append one row to the position CSV. The single writer, both layouts.
+        """
+        try:
+            row = self.build_log_row()
+        except (AttributeError, TypeError, IndexError) as exc:
+            # Normal before the first IMU / odom message; self.orientation and
+            # friends are None until then. Logged with the reason rather than a
+            # bare "not ready", so a genuine assembly bug is not hidden by it.
+            self.get_logger().warn(f" -- Not ready to log yet: {exc}",
+                                   throttle_duration_sec=5.0)
+            return
 
-                # [right, left] convention -> named columns (was swapped)
-                df_tmp.loc[row, 'right_thr_in'] = self.thruster_input[0]
-                df_tmp.loc[row, 'left_thr_in'] = self.thruster_input[1]
+        try:
+            self.log_file.write(
+                ','.join(repr(float(row[c])) for c in self.data_columns) + '\n')
+            self.log_file.flush()
+        except (OSError, ValueError) as exc:
+            self.get_logger().error(f"Could not append to {self.path}: {exc}")
+            return
 
-                df_tmp.loc[row, 'target_x'] = target_x
-                df_tmp.loc[row, 'target_y'] = target_y
-                # --------------------------------------------------------------
+        self.write_origin_sidecar()
 
-                self.df_log = pd.concat([self.df_log, df_tmp])
-
-                self.df_log.to_csv(self.path)
-            except Exception:
-                self.get_logger().warn(f" -- Not ready to log yet")
-        
 rclpy.init()
 node = BlueBoatController()
 rclpy.spin(node)

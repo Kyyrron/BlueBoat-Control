@@ -76,6 +76,7 @@ from blueboat_control import ROV
 from blueboat_interfaces.srv import RequestPath
 import custom_functions as cf
 import frame_math as fm         # pure world<->body geometry (ROS-free)
+import thrust_limits as tl     # uniform thrust saturation (ROS-free)
 
 
 def _wrap(a):
@@ -340,6 +341,17 @@ class Controller(Node):
                              "upper": np.array([ limit,  limit]),
                              "idx":   np.array([0, 1])}
 
+        # -- propeller breakaway ---------------------------------------------
+        # The thrust->PWM table maps 0..2 N onto PWM 1500..1525, which sits
+        # inside a T200 ESC's neutral deadband: commands in that band leave the
+        # propellers stationary, so the boat holds still while the log records
+        # a perfectly sensible small force. Only ONE law is measurably affected
+        # -- solve_LoS following a pinger on the real boat, where the surge
+        # command 5*ln(k_v*d + 1) stays under 2 N out to d = 3.28 m. Every
+        # other law is inside 1.4 m and needs no floor; see CLAUDE.md section 5.
+        # 0.0 disables the floor and restores the pre-2026-08-31 law exactly.
+        self.min_thrust = dbl('min_thrust', 2.0)
+
     # ======================================================================
     #  3. THE CONTROL LOOP
     #  Runs at 1/self.dt (20 Hz). This is the entry point.
@@ -535,8 +547,9 @@ class Controller(Node):
             f"Thrust: {thrust_str}"
         )
 
-        # Publish thruster input
-        self.publish_thrust(u)
+        # Publish thruster input. Reassigned so the monitoring row below records
+        # the saturated command that was actually sent (see publish_thrust).
+        u = self.publish_thrust(u)
 
         if self.pinger_target is not None and self.use_pinger:
             self.get_logger().info(f'\nPinger coordinates robot frame: \n{self.pinger_target}')
@@ -708,6 +721,43 @@ class Controller(Node):
         if list(self.manual_target) != [0.0,0.0]:
             v = 10*np.log(v+1) # If manual target, go faster. Don't need to be that precise here.
 
+        # Propeller breakaway. v is the common-mode surge force this law puts on
+        # BOTH thrusters, and 5*ln(k_v*d + 1) stays under min_thrust (2 N) out to
+        # d = 3.28 m at the real boat's k_v = 0.15 -- a range at which the ESC is
+        # still inside its neutral deadband, so the boat sits still while the log
+        # shows it being commanded forward. Floor the surge so it actually moves.
+        #
+        # ONLY THE SURGE. The +/- 0.295*yaw_rate differential below is untouched,
+        # so the yaw moment -- and with it which way the boat turns and how hard
+        # -- is bit-identical to the unfloored law at every range and bearing.
+        # The floor pushes the boat out of the deadband; it does not steer it.
+        #
+        # The floor is shaped by two factors, both of which only ever REDUCE it,
+        # and both of which reuse a blend this file already applies elsewhere:
+        #
+        #   g            fades the floor in over hold_radius, exactly as the PID
+        #                and LoS station-keeping holds fade theirs. Without it the
+        #                floor stepped by 1.64 N as the boat crossed 0.5 m
+        #                inbound; with it the commanded surge is continuous in d.
+        #   max(0, cos)  kills the floor when the target is abeam or behind, the
+        #                same shaping los_guidance puts on its own feedforward.
+        #                Forward surge closes the range by cos(bearing) only, so
+        #                past 90 degrees a floored surge would drive the boat AWAY
+        #                from the target while it turned round -- the unfloored
+        #                law does not, because its surge is ~0 there. The turn
+        #                itself needs no help at those bearings: the differential
+        #                is already 4.6 N per side at 90 degrees, well clear of
+        #                the deadband.
+        #
+        # v is never negative here (5*ln(x+1) with x >= 0), so no sign handling is
+        # needed, and the floor never lowers v. min_thrust = 0.0 disables the
+        # whole block and restores the original law exactly.
+        if self.min_thrust > 0.0 and self.hold_radius > 0.0:
+            g = min(1.0, max(0.0, (d - self.hold_radius) / self.hold_radius))
+            breakaway = self.min_thrust * g * max(0.0, np.cos(np.arctan2(y, x)))
+            if 0.0 < v < breakaway:
+                v = breakaway
+
         thruster_input = [0,0]
 
         # Convert to differential thrust
@@ -762,10 +812,37 @@ class Controller(Node):
         Publish /thruster_input. Used both for the computed command and to say
         "zero" explicitly whenever this node has nothing to command, so the
         interface nodes are never left re-applying a stale thrust.
+
+        The command is saturated to +/- thrust_limit here, UNIFORMLY: one scale
+        factor for both thrusters, so the right:left ratio -- and with it the
+        direction of the commanded wrench -- survives the clamp and the boat
+        keeps the turn it asked for, just slower. See thrust_limits.py for why
+        clipping each side on its own does not do that.
+
+        This is the single exit for thrust, so it is the one place the rule has
+        to hold. It is a no-op for MPC, PID and LoS, whose commands are already
+        bounded (the allocator scales the same way, and the MPC's input bounds
+        are the same number). It binds on solve_LoS, which builds its array by
+        hand, goes through no allocator, and can reach 30-40 N -- the most
+        likely source of the recorded thrust above the clamp that TODO.md
+        section 5 could not account for.
         """
+        limited, scale = tl.scale_to_limit(u, self.thrust_limit)
+        if scale < 1.0:
+            self.get_logger().warn(
+                f"Thrust command {np.array2string(np.asarray(u, dtype=float), precision=1)} "
+                f"exceeds thrust_limit={self.thrust_limit:.1f} N - scaled by {scale:.3f} "
+                f"to {np.array2string(limited, precision=1)} (direction preserved).",
+                throttle_duration_sec=2.0)
+
         msg = Float32MultiArray()
-        msg.data = [float(v) for v in u]
+        msg.data = [float(v) for v in limited]
         self.thruster_input_publisher.publish(msg)
+
+        # Returned so the caller logs what went on the wire, not what it wished
+        # for: /monitoring_data[7:9] and the .npy u1/u2 then agree with the CSV's
+        # right_thr_in/left_thr_in, which is read straight off /thruster_input.
+        return limited
 
     def get_time(self):
         s,ns = self.get_clock().now().seconds_nanoseconds()
