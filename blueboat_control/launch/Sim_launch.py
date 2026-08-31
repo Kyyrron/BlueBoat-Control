@@ -8,12 +8,14 @@ def generate_launch_description():
         sl_trajectory = sl.declare_arg('trajectory', default_value = 'station_keeping') # Trajectory reference for the control
         sl_controller = sl.declare_arg('controller_type', default_value = 'MPC')        # Controller to be used
         sl_data = sl.declare_arg('data_dir', default_value = '')                        # Root for the controller .npy log. Empty resolves to $BLUEBOAT_DATA_DIR, else the sourced workspace root.
+        sl_spawn_yaw = sl.declare_arg('spawn_yaw', default_value = 0.)                  # Boat spawn heading, RADIANS ENU (0 = East). Spawn stays at (0,0).
 
         # Launch gazebo and related simulation nodes
-        sl.include('blueboat_description', 
-                   'world_launch.py', 
-                   launch_arguments={'sliders': False, 
-                                     'thr': sl_robot})
+        sl.include('blueboat_description',
+                   'world_launch.py',
+                   launch_arguments={'sliders': False,
+                                     'thr': sl_robot,
+                                     'yaw': sl_spawn_yaw})
 
         # Simulation interaction
         sl.node('blueboat_control', 

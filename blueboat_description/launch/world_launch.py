@@ -7,7 +7,12 @@ def generate_launch_description():
     sl.declare_arg('gui', default_value=True)
     sl.declare_arg('spawn', default_value=True)
     sl.declare_arg('thr',default_value = 'thrusters_ur')
-    sl.declare_arg('spawn_pose', default_value = "0.0 0.0 0.0 0.0 0.0 0.0")
+    # Spawn heading in RADIANS (Gazebo -Y). Forwarded into upload_rov_launch's
+    # declared gazebo axes; x/y stay at their defaults deliberately -- the
+    # pre-deployment hold pose is world (0, 0), so a non-origin spawn would
+    # make the boat transit there. (Replaces the old dead 'spawn_pose' arg,
+    # which upload_rov_launch never read.)
+    sl.declare_arg('yaw', default_value=0.)
 
     with sl.group(if_arg='gui'):
         sl.gz_launch(sl.find('blueboat_description', 'world.sdf'), "-r")
@@ -23,7 +28,7 @@ def generate_launch_description():
 
     with sl.group(if_arg='spawn'):
         sl.include('blueboat_description', 'upload_rov_launch.py',
-                   launch_arguments={'thr': sl.arg('thr'), 'spawn_pose': sl.arg('spawn_pose')})
+                   launch_arguments={'thr': sl.arg('thr'), 'yaw': sl.arg('yaw')})
     return sl.launch_description()
 
 

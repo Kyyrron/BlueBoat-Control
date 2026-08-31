@@ -326,11 +326,16 @@ pinger mode needs no trajectory server. `use_pinger` reaches `robot_interface` u
 different parameter name **`use_UWgps`**, which also selects the CSV layout (§6).
 
 **`Sim_launch.py`** — arguments `robot_file` ('thrusters_ur'), `trajectory`
-('station_keeping'), `controller_type` (**default `'MPC'`**) and `data_dir` ('', §6). It includes
-`blueboat_description/world_launch.py` and starts `simulation_interface`, `path_generation`,
-`path_publisher` and `master_control`. It never starts `robot_interface`, accepts none of the
-real-only arguments, and always launches a controller — the "empty `controller_type` launches
-no controller" rule applies to the real-robot launch only.
+('station_keeping'), `controller_type` (**default `'MPC'`**), `data_dir` ('', §6) and
+`spawn_yaw` (0.0 — the boat's spawn heading in **radians ENU**, forwarded as
+`world_launch.py`'s `yaw` into `upload_rov_launch.py`'s declared gazebo axes and Gazebo's
+`-Y`; the spawn position stays (0, 0), since the pre-deployment hold pose is the world
+origin). It includes `blueboat_description/world_launch.py` and starts
+`simulation_interface`, `path_generation`, `path_publisher` and `master_control`. It never
+starts `robot_interface`, accepts none of the real-only arguments, and always launches a
+controller — the "empty `controller_type` launches no controller" rule applies to the
+real-robot launch only. The Mission Control Station passes a random `spawn_yaw` when
+launching a GPS-anchored mission in simulation, to rehearse anchoring at arbitrary headings.
 
 **Testing.** No lint or type-check tooling exists, and there is no ROS-side automated test
 (no `pytest`, no `ament_*` test target). Two gates exist in the working tree, and **neither is
@@ -890,6 +895,10 @@ fit is established.
 
 The URDF/xacro model, meshes, Gazebo world, and the spawn/bridge launch chain
 `world_launch.py` → `upload_rov_launch.py` → `state_publisher_launch.py`.
+`world_launch.py` declares `yaw` (radians, default 0) and forwards it into
+`upload_rov_launch.py`'s `declare_gazebo_axes` arguments, reaching the spawn as
+`ros_gz_sim create … -Y <yaw>`; its old `spawn_pose` argument was dead (never read
+downstream) and is removed.
 
 Hull: `mass = 16.01` kg (`blueboat.xacro:18`), `izz = 5.6403125` (`blueboat.xacro:42`).
 `master_control` hands the MPC `robot_mass = 16.01` and `iz = 5.64` — the mass agrees exactly,
