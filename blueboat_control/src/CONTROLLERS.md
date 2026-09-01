@@ -37,21 +37,54 @@ Every plot is a **closed-loop simulation**, not a sketch.
 ## 1. What the boat can physically do
 
 No controller can beat these limits, so it is worth knowing them before blaming a controller.
-All derived from the model parameters in [master_control.py:617-630](master_control.py#L617-L630):
+⚠ **There are two different boats here, and this section used to conflate them.**
+The left column below is the model `master_control` hands the MPC for the **real boat**;
+the right is what the **Gazebo simulator** actually integrates
+(`blueboat_description/urdf/hydrodynamics.xacro`). They are not the same system, and the
+figures this table used to publish were the left column's — which is why "max surge speed
+1.36 m/s" appeared here while the simulated boat could not exceed 0.78 m/s.
 
-| Quantity | Value | Where it comes from |
+The decisive difference is that the plant has **quadratic** damping and the MPC's model
+formulation has none: `export_underwater_model` carries a linear `D` only. Below ~0.4 m/s
+the two roughly agree; above it they diverge fast.
+
+| Quantity | Real-boat model (`master_control`) | Gazebo plant (`hydrodynamics.xacro`) |
 |---|---|---|
-| Surge drag coefficient | 29.34 N per m/s | `d_u` |
-| Sway drag coefficient | 51.54 N per m/s | `d_v` |
-| Yaw drag coefficient | 44.65 N·m per rad/s | `d_r` |
-| Effective surge mass | 42.78 kg | `16.01 + 26.77` (rigid + added) |
-| Effective yaw inertia | 27.41 kg·m² | `5.64 + 21.77` |
-| Thruster limit | ±20 N each, ±40 N total | `thruster_limits` |
-| Thruster half-spacing | 0.295 m | `0.59/2` |
-| **Max surge speed** | **1.36 m/s** | 40 N ÷ 29.34 |
-| **Max yaw moment** | **11.8 N·m** | 0.295 × 40 N |
-| **Max yaw rate** | **0.264 rad/s (15 °/s)** | 11.8 ÷ 44.65 — i.e. **23.8 s for a full 360°** |
-| **Min turning radius at 0.5 m/s** | **1.89 m** | 0.5 ÷ 0.264 |
+| Surge drag | 29.34·u | 25.15·u + 33.80·u\|u\| |
+| Sway drag | 51.54·v | 7.364·v + 54.269·v\|v\| |
+| Yaw drag | 44.65·r | 3.744·r + 40.00·r\|r\| |
+| Effective surge mass | 42.78 kg (16.01 + 26.77) | **21.51 kg** (16.01 + 5.5) |
+| Effective yaw inertia | 27.41 kg·m² (5.64 + 21.77) | **5.76 kg·m²** (5.64 + 0.12) |
+| Thruster limit | ±20 N each, ±40 N total | same |
+| Thruster half-spacing | 0.295 m | same |
+| **Max surge speed** | 1.36 m/s (40 ÷ 29.34) | **0.78 m/s** |
+| **Max yaw moment** | 11.8 N·m (0.295 × 40) | same |
+| **Max yaw rate** | 0.264 rad/s (15 °/s) | **~0.50 rad/s (29 °/s)** |
+
+The provenance of the left column is unknown (§6.4); the right column is read straight out of
+the xacro, which is the BlueROV2 table applied to a BlueBoat hull (`README.md`). **Neither is
+an identification of the real BlueBoat**, and none exists anywhere in the project.
+
+### Thrust required to cruise, in simulation
+
+The single most useful table for choosing a mission speed. Straight and level, no turning, no
+error correction — this is the floor, not the budget:
+
+| speed | N total | **per thruster** | fraction of the ±20 N limit |
+|---|---|---|---|
+| 0.30 m/s | 10.6 | 5.3 | 26 % |
+| 0.45 m/s | 18.2 | 9.1 | 45 % |
+| 0.62 m/s | 28.6 | 14.3 | 71 % |
+| 0.70 m/s | 34.2 | 17.1 | 85 % |
+| 0.78 m/s | 40.2 | 20.1 | **100 % — the ceiling** |
+| 1.00 m/s | 58.9 | 29.5 | unreachable |
+
+⚠ **Author simulated missions at ≤ 0.45 m/s where there is margin to manoeuvre**, and treat
+0.70 m/s as the practical maximum: at 0.70 the straight legs alone consume 85 % of the limit,
+so every turn saturates, and measured MPC saturation is 24 % of ticks even with everything
+tuned. Above 0.78 m/s no controller can follow at all — PID logs 100 % saturation and a
+growing error at an authored 0.84 m/s. This ceiling is a property of the *simulator's*
+drag table, not of the real boat.
 
 Two consequences that shape everything below:
 
@@ -128,16 +161,58 @@ It is the only controller here that **knows what the boat is made of** — and t
 entire source of its advantage. Because drag is in the model, it works out the exact thrust
 needed to hold 0.5 m/s without anyone tuning a gain.
 
-**Parameters** — [master_control.py:153-179](master_control.py#L153-L179):
+**Parameters** — declared in `master_control._declare_tuning_parameters`. Since 2026-08-31
+the MPC is **split simulation vs real boat**, the same way the PID gains and the
+point-following gains are, and the split covers the plant *model* as well as the weights:
 
-| Parameter | Default | Meaning |
+| Parameter | Real boat | **Simulation** | Meaning |
+|---|---|---|---|
+| `mpc_horizon` | 15 | **30** | Number of prediction steps |
+| `mpc_time` | 2.5 s | **6.0 s** | How far ahead it plans |
+| `mpc_Q_diag` | diag(50, 50, 30, 1, 1, 1) | same | Cost on x, y, ψ, u, v, r error |
+| `mpc_R_diag` | diag(0.015, 0.015) | **diag(0.10, 0.10)** | Cost on thruster effort |
+| `thrust_limit` | ±20 N | same | Hard constraint inside the solver |
+| model `a_u, a_v, a_r` | −26.77, −7.55, −21.77 | **−5.50, −12.70, −0.12** | added mass |
+| model `d_u, d_v, d_r` | −29.34, −51.54, −44.65 | **−40.36, −12.79, −9.74** | linear drag |
+
+The real column is unchanged and remains the configuration all earlier field and harness
+results were taken at. The simulation column is fitted to the Gazebo plant (§3): the added
+mass entries are the xacro's `xDotU`/`yDotV`/`nDotR` verbatim, and each `d_*` is a **secant
+linearisation** of that axis's linear+quadratic drag at a representative operating point
+(0.45 m/s surge, 0.10 m/s sway, 0.15 rad/s yaw — the last being the p75 of |r| measured
+across every recorded sim run). Refit them if `hydrodynamics.xacro` changes.
+
+`mpc_time`/`mpc_horizon` stay at 2.5 s/15 on the real boat because the acados solve has
+never been timed on the companion computer (`TODO.md` §2); doubling the horizon is exactly
+the change that would break the 50 ms budget. At N = 30 in simulation the loop holds a
+measured 20.0 Hz with no watchdog trips.
+
+**Why `R` had to move.** The stage cost is `(x−x_ref)ᵀQ(x−x_ref) + uᵀRu` with `u_ref ≡ 0`
+and no rate term, so `R` is an absolute effort penalty in N². The break-even — the position
+error whose cost equals saturating *both* thrusters — is `sqrt(2·R·400/50)`:
+
+| `R` | 0.015 | 0.05 | **0.10** | 0.15 | 0.25 |
+|---|---|---|---|---|---|
+| break-even | 0.49 m | 0.89 m | **1.26 m** | 1.55 m | 2.00 m |
+
+At the shipped 0.015, anything beyond half a metre of error makes full throttle literally the
+cheaper option. That is why the MPC saturated where PID — whose demand its own P-gain bounds
+— did not.
+
+**Measured effect of the whole change** (4-lane lawnmower survey, 4 m corner radius,
+`docs/controllers/mpc_tuning_report.py`):
+
+| | before | after |
 |---|---|---|
-| `mpc_horizon` | 15 | Number of prediction steps |
-| `mpc_time` | 2.5 s | How far ahead it plans |
-| `Q_weight` | diag(50, 50, 30, 1, 1, 1) | Cost on x, y, ψ, u, v, r error |
-| `R_weight` | diag(0.015, 0.015) | Cost on thruster effort |
-| `input_bounds` | ±20 N | Hard constraint inside the solver |
-| model | mass 16.01, iz 5.64, added mass/drag | The boat model it plans with |
+| 0.70 m/s — saturated ticks | 77.5 % | **24.3 %** |
+| 0.70 m/s — mean radial error | 1.61 m | **0.30 m** |
+| 0.70 m/s — differential sign flips /100 | 13.8 | **2.2** |
+| 0.45 m/s — saturated ticks | 64.8 % | **1.4 %** |
+| 0.45 m/s — mean radial error | 11.57 m | **0.06 m** |
+| `kin_square` 0.30 m/s — saturated | 2.8 % | **0.0 %** |
+
+The residual 24 % at 0.70 m/s is physics, not tuning: the straight legs alone need 85 % of the
+thrust limit (§3), so every turn saturates.
 
 **Behaviour.** Best tracker by a wide margin — RMS cross-track error **0.015 m** in the
 acquisition test, versus 0.66 m (PID) and 1.18 m (LoS). It reaches the authored 0.50 m/s
@@ -713,7 +788,7 @@ In descending order of measured benefit — all five are one-line edits:
 | Overshoots every corner | Physics — min radius is 1.9 m. Round the corners in the designer |
 | MPC runs wide on every curve, and too fast | `mpc_time` — raise 2.5 s → 5–6 s (C9) |
 | Heading hunts / oscillates | Lower `los_kpsi`, or raise `los_kd` / the inner r gain |
-| Thrusters slam back and forth (MPC) | Raise `R_weight` to 0.05–0.1 |
+| Thrusters slam back and forth (MPC) | Raise `mpc_R_diag` — 0.10 is the simulation default since 2026-08-31; see §4.1 for the break-even table |
 | Boat drifts away while station-keeping | Not the old F2 — check `hold_speed` was not launched at 0 (that disables the hold in both controllers); on LoS, raise `los_hold_kx` to shrink the held radius |
 | Target runs away from the boat | It cannot — that is the governor's job. Check `e_along` |
 
@@ -756,6 +831,47 @@ never reconciled. When the reference heading crosses ±π — which happens on e
 loop, and any mission with a northward leg — the cost sees an error of up to 2π and commands a
 full turn the wrong way. **Fix:** unwrap the reference relative to the measured heading, i.e.
 `x_refs[:,2] = x_current[2] + wrap(x_refs[:,2] - x_current[2])` accumulated along the horizon.
+**Fixed 2026-08-31** — `ur_mpc.solve` now unwraps cumulatively over the whole horizon and
+rigid-shifts the sequence onto the branch nearest the measured heading
+([ur_mpc.py:333-355](MPC/ur_mpc.py#L333-L355)); `TODO.md` §3 carries the measurement.
+
+**C10 — 🟠 MPC on `fsin` locks into a self-orbit — the boat drives a perfect circle forever
+while the reference runs away.** Observed in Gazebo (2026-09-01, MCS map: closed blue circle
+near the start, robot↔target distance oscillating at the loop period and growing). The
+mechanism is argued from the model, the cost and the measured envelope, not from a dedicated
+harness run — `sim.py` carries no `fsin` (§How the numbers were produced). Four ingredients,
+each individually documented, compose it:
+
+1. **`fsin` is a chain of near-closed loops, not a weave.** Its total heading swing is
+   `_FSIN_AF/π = 6.366 rad = 364.75°` per half-cycle — 4.75° *more* than a full revolution,
+   independent of speed and radius (the no-loop threshold is `_FSIN_AF < 2π² ≈ 19.74`; the
+   constant is 20.0). Correct tracking therefore *is* driving ~2 m circles that drift
+   sideways. On top of that, at the working tree's `_FSIN_V = 0.5` m/s the 1.5 m loop radius
+   demands 0.333 rad/s while holding full surge — at or past the 1.89 m minimum turning
+   radius of §1 — so the demand saturates the envelope with no margin left for correction.
+2. **Once displaced, the heading term dominates and tracks the wrong thing.** The LINEAR_LS
+   cost weighs `Q_ψ = 30` against `Q_pos = 50`. At ≥ 2 m of position error a π heading error
+   costs `30·π² ≈ 296` versus `50·4 = 200` for position: the optimum aligns the boat with the
+   reference *tangent* — which rotates through 360° per loop — rather than closing position.
+   The boat matches the reference's rotation and flies its own circle, synchronised with the
+   loops. `LoS`/`PID` are immune by construction: their guidance law computes the desired
+   heading *toward* the target point, so displacement always steers them back.
+3. **The governor cannot see an orbiting boat.** `advance_governor`'s `e_along` is a
+   projection on the instantaneous path tangent; on a looping path that tangent makes full
+   revolutions, so the error averages ≈ 0 and `tau` runs at the full authored rate no matter
+   how far off the boat is. The cross-track brake that would catch it is disabled
+   (`gov_Emax = 0.0`). This is exactly finding **F5** (TRAJECTORY_SYSTEM.md §5), and `fsin`
+   is the library shape most likely to trigger it. With the reference gone, the C-series
+   break-even applies: beyond ~1.26 m of error at the sim `R = 0.10` (0.49 m at the real-boat
+   0.015), saturating both thrusters is cheaper than the position cost — a steady, asymmetric
+   ±20 N pair, i.e. a constant-radius circle.
+4. **SQP_RTI never escapes the basin.** One Newton step per 50 ms tick from the previous
+   iterate; `solve` seeds only stage 0 and the `yref`s, never re-seeds stages 1..N, and a
+   solver failure only prints (C6). A latched saturated iterate has no mechanism to recover.
+
+Real-boat aggravator: the 2.5 s horizon covers ~1.25 m of travel — less than one loop radius
+(C9's geometry, unchanged for the real configuration). **Sim-only remedies** (real-boat
+parameters untouched) are held in `TODO.md` §0.3; nothing is applied blind.
 
 **C3 — 🟠 `Point-LoS` never stops.** `safety_distance = -1.0`
 ([master_control.py:318](master_control.py#L318)) disables the arrival check, so the stopping

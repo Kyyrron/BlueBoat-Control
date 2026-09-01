@@ -110,7 +110,7 @@ formula** — there is no separate speed setting. `x = 0.5*t` *means* 0.5 m/s.
 | `straight_line` | Line along +x | 0.5 m/s | (0, **1**), yaw 0 |
 | `circle` | 4 m radius circle, centre (−4, 0) | 0.32 m/s | (0, 0), yaw **π/2** |
 | `sin` | Sine weave along +x, amplitude 3.5 m | 0.28–0.56 m/s | (0.5, 0), yaw 0 |
-| `fsin` | Oscillating heading, constant surge | 0.1 m/s | (0, 0), yaw 0 |
+| `fsin` | Oscillating heading, constant surge — weave of **1.5 m turn radius**, 300 s per cycle | 0.1 m/s | (0, 0), yaw 0 |
 | `square` | Square *wave* — instantaneous ±4 m jumps | 0.5 m/s + ∞ spikes | (0, **2**), yaw 0 |
 | `kin_square` | Zig-zag: +x, +y, +x, −y, 5 m legs | 0.3 m/s | (0, 0), yaw 0 |
 | `seabed_scanning` | Scripted survey with arcs and a helix | 0.5 m/s | (0, 0), yaw 0 |
@@ -136,6 +136,7 @@ formula** — there is no separate speed setting. `x = 0.5*t` *means* 0.5 m/s.
 > | 2026-08-28 | — | Baseline: every shape is at its original formula. | — |
 > | 2026-08-30 | `sin`, `kin_square` | **F7.** `t > 500` holds the last pose instead of teleporting back to the pose at t = 50. Below t = 500, bit-identical. | **Yes.** The path parameter advances at most 1.0 per second, and no run has come near τ = 500 (the longest harness scenario reaches τ ≈ 160), so the changed region was never exercised. |
 > | 2026-08-30 | `fsin` | **F1.** Per-pose re-integration replaced by a cumulative table on the same 0.01 s grid. | **Yes.** Bit-identical to the original loop at every sampled t; `check_trajectory_library.py` asserts it against an embedded copy of that loop. |
+> | 2026-09-01 | `fsin` | **Turn radius 0.1 m → 1.5 m**, now a named `radius` in the `fsin` branch of `single_pose`. Surge stays 0.1 m/s, so the radius sets the yaw-rate amplitude (`A = V/radius`) and the frequency follows it (`f = A/20`) to hold the total yaw swing fixed: the same curve, scaled 15×, one cycle every 300 s instead of 20 s. | **No.** Every pose moves. The old weave was ±0.23 m wide — the boat could not resolve it — so no earlier run on `fsin` is worth comparing against; `check_trajectory_library.py`'s reference poses were re-captured at the new radius, and it still asserts bit-identity against the Euler loop at both radii. |
 
 ---
 

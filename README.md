@@ -25,7 +25,46 @@ The current recommended ROS2 version is Jazzy. All the related info can be found
 - [slider_publisher](https://github.com/oKermorgant/slider_publisher), installable through `apt install ros-${ROS_DISTRO}-slider-publisher`
 - [auv_control](https://github.com/CentraleNantesROV/auv_control) for basic control laws
 - [urdf_parser](https://github.com/ros/urdf_parser_py) intended to have the controller work with any robot description
-- [acados solver](https://docs.acados.org/index.html) used for MPC computation 
+- [acados solver](https://docs.acados.org/index.html) used for MPC computation -- see the
+  prerequisites below, `pip install` alone is **not** enough
+
+### acados prerequisites (only needed for `controller_type:='MPC'`)
+
+`requirements.txt` installs the `acados_template` Python package from git, but that package
+is only the interface. Two further pieces have to exist before an MPC solver can be built,
+and neither is installed by pip:
+
+1. **The acados C library.** Build acados itself (`libacados.so` and friends under
+   `<acados>/lib`) following the [installation guide](https://docs.acados.org/installation/).
+2. **The Tera template renderer.** acados generates its solver C code by rendering
+   templates, and the renderer is a separate binary that must sit in `<acados>/bin`:
+
+   ```bash
+   ACADOS_DIR=~/ros2_ws/.venv/src/acados-template   # wherever acados_template resolves to
+   mkdir -p "$ACADOS_DIR/bin"
+   curl -fL -o "$ACADOS_DIR/bin/t_renderer" \
+     https://github.com/acados/tera_renderer/releases/download/v0.2.0/t_renderer-v0.2.0-linux-amd64
+   chmod +x "$ACADOS_DIR/bin/t_renderer"
+   ```
+
+Then point acados at that tree, in `~/.bashrc`:
+
+```bash
+export ACADOS_SOURCE_DIR=$HOME/ros2_ws/.venv/src/acados-template
+export LD_LIBRARY_PATH=$ACADOS_SOURCE_DIR/lib:$LD_LIBRARY_PATH
+```
+
+Without `ACADOS_SOURCE_DIR` acados *guesses* the path (printing a warning) and can pick a
+different acados checkout than the one the Python package came from. `LD_LIBRARY_PATH`
+matters because `libacados.so` carries no rpath to `libblasfeo` / `libhpipm` /
+`libqpOASES_e`; `master_control` preloads those by absolute path so a missing export is
+survivable, but exporting it is still the right setup.
+
+If `t_renderer` is missing, `master_control` refuses to start with a FATAL naming the exact
+commands above. The generated and compiled solver is cached in
+`$ROS_HOME/blueboat_control/mpc` (default `~/.ros/blueboat_control/mpc`), so only the first
+MPC launch pays the compile; delete that directory to force a rebuild.
+
 - [mavros](https://github.com/mavlink/mavros) 
 
 ## Real robot

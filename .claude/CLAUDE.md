@@ -480,12 +480,42 @@ required by `blueboat_description`'s spawn launch, not by any control node.
 scope, so the `PID` and `LoS` paths import both even though neither uses them. `TODO.md` holds
 it.
 
+**acados needs two things pip does not install** (`README.md` carries the commands): the
+built C library (`libacados.so`) and the Tera template renderer binary at `<acados>/bin/t_renderer`.
+Without the renderer, acados code generation stops on an interactive `input()` prompt — which,
+under `ros2 launch`, is an invisible permanent hang rather than an error. That was the
+2026-08-31 "MPC never starts" symptom; `TODO.md` §0.1 carries it. `master_control` now
+preflights the renderer and runs the construction with stdin closed, so the same environment
+produces a FATAL naming the fix and a non-zero exit instead of a freeze. `ACADOS_SOURCE_DIR`
+should be exported: unset, acados *guesses* the path and can pick a different checkout than
+the one `acados_template` was installed from (this machine has two).
+
 ---
 
 ## 4. Control architecture
 
 Three controllers share one control callback. Branch priority: **manual target** → **path
 following** → **pinger** → nothing. `MPC` is unsupported in pinger mode.
+
+**The controller object is built in `__init__`, not on the first tick.** `_build_controller()`
+runs at the end of construction, before `rclpy.spin`. This matters only for `MPC`, which runs
+acados code generation and a C compile there: done from `timer_callback` (as it was until
+2026-08-31) it froze the single-threaded executor for the whole build, taking odom,
+`/path_request` futures and `publish_thrust` down with it. `PID` and `LoS` build a plain
+Python object and are unaffected either way. One consequence to know: the log line
+`Controller node initiated` now marks *construction*, and no longer implies
+`/blueboat/controller_ready` has arrived — `Controller ready` is the line for that.
+
+**The generated acados solver is cached outside the working directory**, in
+`$ROS_HOME/blueboat_control/mpc` (default `~/.ros/blueboat_control/mpc`), resolved by
+`ur_mpc.acados_build_dir()`. acados defaults its json and `code_export_directory` to
+*relative* paths, so before 2026-08-31 the generated C landed wherever the launch was invoked
+from — including, when the Mission Control Station started the run, inside the station's own
+repository — and a new directory meant a full recompile. `ur_mpc.build_solver()` asks acados
+for `generate=False, build=False` so it compares the stored json against the current OCP and
+regenerates only on a real change: measured 1.0 s for a first build, 0.0 s to reuse. Delete
+that directory to force a rebuild. Deliberately **not** under `cf.data_root()` — that tree is
+write-once field record (§6 / CM-7).
 
 **Reference generation.** Path following advances a **path parameter `tau`** governed by the
 boat's own progress (N8):
@@ -572,9 +602,11 @@ inside which the boat counts as on station.
 both controllers is bit-identical to what it was — but the margin is not uniform. Authored
 speed over each shape's active range, measured off its own parameterisation at the 0.05 s
 window: `straight_line` and `square` 0.500, `sin` 0.280–0.564, `circle` 0.320,
-`seabed_scanning` 0.318–0.500, `kin_square` 0.300, and **`fsin` 0.080–0.100** — nominal surge
-0.1 m/s, so barely 1.6× the gate. Raising `hold_speed` above 0.08 would start altering `fsin`
-path following; above 0.28 it would reach `sin`.
+`seabed_scanning` 0.318–0.500, `kin_square` 0.300, and **`fsin` 0.100** — its nominal surge,
+2× the gate. (`fsin` used to measure 0.080–0.100, barely 1.6×: the 0.01 s integration step cut
+the corner of a 0.1 m-radius weave. At the 1.5 m radius it now carries, the chord over the
+0.05 s window is the arc to four figures.) Raising `hold_speed` above 0.1 would start altering
+`fsin` path following; above 0.28 it would reach `sin`.
 
 `check_los_hold.py` asserts the inertness rather than assuming it, but for **four shapes only**
 (`straight_line`, `circle`, `kin_square`, `sin`) — `sim.py`'s plant carries copies of five
@@ -597,8 +629,8 @@ launch argument rather than an edit and a rebuild. Values are read once, at cons
 | LoS guidance | `los_lookahead` (2.5), `los_ku` (**20.0**), `los_kpsi` (10.0), `los_kd` (1.0), `los_speed_scale` (1.0) |
 | Station-keeping hold | `hold_speed` (0.05, the gate) and `hold_radius` (0.5), both shared by `PID` and `LoS`; `los_hold_kx` (1.0) and `los_hold_umax` (0.8), the LoS surge law only |
 | PID | `pid_lookahead` (2.5), `outer_gains_x`, `outer_gains_psi` (both `[3.0, 0.01, 0.0]`), `inner_gains_u` (`[1.0, 0, 0]`), `inner_gains_r` (`[1.5, 0, 0]`) |
-| MPC | `mpc_horizon` (15), `mpc_time` (2.5), `mpc_Q_diag`, `mpc_R_diag` |
-| Point following | `point_k_v` / `point_k_psi` (2.0 / 16.0 in simulation, 0.15 / 10.0 on the real boat), `safety_distance` (−1.0, which disables the arrival check) |
+| MPC | **Split simulation/real, like the PID and point rows** — `mpc_horizon` (30 sim / 15 real), `mpc_time` (6.0 / 2.5), `mpc_R_diag` (0.10 / 0.015), `mpc_Q_diag` (50,50,30,1,1,1 both). The plant **model** is split too — `self.mpc_model`, not a declared parameter — with the simulation column fitted to `hydrodynamics.xacro` (added mass = the xacro values, damping = secant linearisations of its quadratic drag). `CONTROLLERS.md` §4.1 carries the measurements |
+| Point following | `point_k_v` / `point_k_psi` (2.0 / 60.0 in simulation, 0.15 / 10.0 on the real boat), `safety_distance` (−1.0, which disables the arrival check) |
 | Thrust | `thrust_limit` (20.0 N) — feeds the allocator clamp, the MPC input bounds **and, since 2026-08-31, `publish_thrust`'s own uniform saturation**. `robot_interface` and `simulation_interface` each declare a parameter of the same name and default (§5) |
 | Dead zone | `min_thrust` (2.0 N) — the propeller-breakaway floor on `solve_LoS`'s surge term. `0.0` disables it and restores the pre-2026-08-31 law exactly (§5) |
 
@@ -868,7 +900,10 @@ Not every shape ends. `straight_line`, `square` and `circle` are defined for all
 clamp. The ones that do end hold their last pose, the YAML loader's convention: `sin` and
 `kin_square` at `t = 500`, `seabed_scanning` at `t = 40 + 12π ≈ 77.7 s`, `fsin` at
 `_FSIN_MAX_STEPS` (1e7 steps = 100 000 s). Past those points the reference stops moving, so the
-station-keeping hold takes over. `fsin` has no closed form and is
+station-keeping hold takes over. `fsin` takes one knob, a `radius` local to its branch of
+`single_pose` (**1.5 m** since 2026-09-01, previously 0.1 m): surge is fixed, so the radius
+sets the yaw-rate amplitude and the frequency follows it, scaling the weave without changing
+its shape or its authored speed. `fsin` has no closed form and is
 integrated by Euler at a fixed 0.01 s step, read out of an append-only cumulative table built
 at module scope rather than re-integrated per pose. Each extension of that table continues the
 accumulation from its stored last value, so a given `t` yields the same pose whatever order

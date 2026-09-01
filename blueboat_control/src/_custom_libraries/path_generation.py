@@ -92,27 +92,37 @@ def is_valid_shape(path_shape: str) -> bool:
 # pass. single_pose therefore stays pure in t: the same t gives the same pose
 # regardless of what was asked for before it, which is what lets a trajectory be
 # swapped, replayed or hot-reloaded.
-_FSIN_V = 0.1           # surge [m/s] -- the authored speed
-_FSIN_A = 1             # yaw-rate amplitude
-_FSIN_F = 0.05          # yaw-rate frequency [Hz]
+#
+# The one knob is the turn radius, handed in from the 'fsin' branch of
+# single_pose. Surge is fixed, so the radius alone sets the yaw-rate amplitude
+# (A = V/radius); the yaw-rate frequency then follows it (f = A/_FSIN_AF) so
+# that the total yaw swing -- and with it the SHAPE of the weave -- is
+# unchanged. The path is therefore the same curve scaled up, travelled at the
+# same authored speed, so a larger radius simply takes proportionally longer per
+# cycle. Changing the radius invalidates the table, which is rebuilt from t=0.
+_FSIN_V = 0.5           # surge [m/s] -- the authored speed
+_FSIN_AF = 20.0         # yaw-rate amplitude / frequency [s] -- fixes the weave shape
 _FSIN_DT = 0.01         # integration step [s]
 _FSIN_MAX_STEPS = 10_000_000    # 100 000 s of path; beyond it, hold the last pose
 
+_fsin_radius = None     # turn radius the table below was integrated for
 _fsin_yaw = np.zeros(1)
 _fsin_x = np.zeros(1)
 _fsin_y = np.zeros(1)
 
 
-def _fsin_extend(steps: int) -> None:
+def _fsin_extend(steps: int, radius: float) -> None:
     """Grow the table so index `steps` exists, continuing the same recursion."""
     global _fsin_yaw, _fsin_x, _fsin_y
     have = _fsin_yaw.size - 1
     if steps <= have:
         return
     target = min(max(steps, 2 * have, 1024), _FSIN_MAX_STEPS)
+    amplitude = _FSIN_V / radius              # yaw-rate amplitude [rad/s]
+    frequency = amplitude / _FSIN_AF          # yaw-rate frequency [Hz]
     i = np.arange(have, target)                  # the steps still to take
     tau = i * _FSIN_DT
-    omega = _FSIN_A * np.sin(2 * np.pi * _FSIN_F * tau)
+    omega = amplitude * np.sin(2 * np.pi * frequency * tau)
     yaw = np.cumsum(np.concatenate(([_fsin_yaw[-1]], omega * _FSIN_DT)))
     x = np.cumsum(np.concatenate(([_fsin_x[-1]], _FSIN_V * np.cos(yaw[1:]) * _FSIN_DT)))
     y = np.cumsum(np.concatenate(([_fsin_y[-1]], _FSIN_V * np.sin(yaw[1:]) * _FSIN_DT)))
@@ -121,13 +131,23 @@ def _fsin_extend(steps: int) -> None:
     _fsin_y = np.concatenate((_fsin_y, y[1:]))
 
 
-def _fsin_state(t: float):
-    """(x, y, yaw) of the 'fsin' trajectory at time t. Pure in t."""
+def _fsin_state(t: float, radius: float):
+    """(x, y, yaw) of the 'fsin' trajectory of turn radius `radius` at time t.
+
+    Pure in t for a given radius. A different radius is a different shape, and
+    discards the table rather than reading it at the wrong scale.
+    """
+    global _fsin_radius, _fsin_yaw, _fsin_x, _fsin_y
+    if radius != _fsin_radius:
+        _fsin_radius = radius
+        _fsin_yaw = np.zeros(1)
+        _fsin_x = np.zeros(1)
+        _fsin_y = np.zeros(1)
     steps = int(t / _FSIN_DT)
     if steps <= 0:
         return 0.0, 0.0, 0.0
     steps = min(steps, _FSIN_MAX_STEPS)   # hold the last pose, as every shape does
-    _fsin_extend(steps)
+    _fsin_extend(steps, radius)
     return _fsin_x[steps], _fsin_y[steps], _fsin_yaw[steps]
 # -----------------------------------------------------------------------------
 
@@ -342,10 +362,15 @@ class PathGeneration(Node):
 
         # Surge sin
         elif path_shape == 'fsin':
+            # Turn radius of the weave [m] -- the one knob of this shape. Surge
+            # is fixed at 0.1 m/s, so the radius scales the whole path, and its
+            # cycle time with it; see _fsin_state.
+            radius = 1.5
+
             # Same Euler integration as ever, read out of a cumulative table
             # instead of re-run from t=0 on every pose (see _fsin_state).
             z = 0.0
-            x, y, yaw = _fsin_state(t)
+            x, y, yaw = _fsin_state(t, radius)
 
         # Square wave
         elif path_shape == 'square':

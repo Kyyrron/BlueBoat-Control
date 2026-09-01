@@ -30,6 +30,98 @@ guessed at.
 
 ---
 
+## 0.1 acados / MPC startup — fixed 2026-08-31, environment half not in the repo
+
+- [x] **MPC missions hung forever at launch.** `controller_type:='MPC'` left the boat
+      motionless while `PID` and `LoS` were fine. Cause: the acados Tera template renderer
+      (`t_renderer`) was **absent from the machine entirely**, so `AcadosOcpSolver`
+      construction reached `acados_template.utils.get_tera()` and blocked on its
+      `input("... download tera? y/N")` prompt. That construction ran inside
+      `timer_callback`, on the single-threaded executor, so the whole node froze: no odom,
+      no `/path_request` futures, no `publish_thrust`. stdout is block-buffered under
+      `ros2 launch`, so the prompt was never even flushed. Fixed in three places —
+      `t_renderer` installed; construction moved into `Controller.__init__` via
+      `_build_controller()`; a preflight (`_check_acados_ready`) plus an stdin guard
+      (`_no_stdin`) that turn any residual prompt into an immediate FATAL. Verified: the
+      negative test (renamed `t_renderer`) now exits 1 in under a second with the install
+      commands in the log, instead of hanging.
+- [ ] **The environment half is not carried by this repository.** `t_renderer`,
+      `ACADOS_SOURCE_DIR` and the built `libacados.so` live on the machine, not in the tree;
+      `requirements.txt` pins only the `acados_template` Python package. `README.md` now
+      documents the prerequisites, but a fresh clone on a fresh machine still has to do them
+      by hand, and nothing checks them until a launch. Consider a `check_acados.py` in the
+      untracked harness alongside the other five checks.
+- [ ] **`LD_LIBRARY_PATH` is load-bearing but worked around.** `libacados.so` carries no
+      rpath to `libblasfeo` / `libhpipm` / `libqpOASES_e`, so a launch without the acados
+      lib directory exported died with `libqpOASES_e.so: cannot open shared object file`.
+      `ur_mpc.preload_acados_libs()` now dlopens those three by absolute path with
+      RTLD_GLOBAL before acados loads, which makes the export optional. Confirm this is
+      still true against a differently built acados before relying on it on the boat.
+
+## 0.2 MPC simulation tuning — done 2026-08-31, with two open consequences
+
+- [x] **MPC saturated the thrusters in simulation.** Root causes, in order of size:
+      the C2 heading-wrap fault above; an MPC plant model that did not describe the Gazebo
+      boat (surge mass 2.0× heavy, **yaw inertia 4.8× heavy**, no quadratic drag at all, so
+      it under-predicted the thrust needed at 0.62 m/s by 36 %); and `mpc_R_diag = 0.015`,
+      at which any error beyond 0.49 m makes full saturation the cheaper option. Fixed by a
+      simulation/real split on the model, `mpc_R_diag` (0.10) and the horizon (6.0 s / 30),
+      in the same idiom as the PID and point-following gains. Real-boat configuration
+      unchanged. Measured: 0.70 m/s survey 77.5 % → 24.3 % saturated and 1.61 m → 0.30 m
+      error; 0.45 m/s survey 64.8 % → 1.4 % and 11.57 m → 0.06 m. `CONTROLLERS.md` §4.1.
+- [ ] **The simulator's speed ceiling is 0.78 m/s and nothing enforces it.** The Gazebo hull
+      uses the BlueROV2 drag table, whose quadratic term needs 20.1 N per thruster at
+      0.78 m/s. Straight-line cruise at 0.70 m/s already consumes 85 % of the limit, so every
+      turn saturates — the residual 24 % above is physics, not tuning. PID logs 100 %
+      saturation at an authored 0.84 m/s. The MCS Pattern Designer has no knowledge of this
+      ceiling; simulated missions should be authored at ≤ 0.45 m/s. Decide whether to teach
+      the designer the limit or to fit real BlueBoat hydrodynamics (below).
+- [ ] **The offline harness models a third system.** `docs/controllers/sim.py:31-32` uses the
+      MPC's *real-boat* constants as its **plant**, so every C-series number in
+      `CONTROLLERS.md` describes neither the Gazebo boat nor a measured BlueBoat. That is
+      still self-consistent as a real-boat harness — which is why it was left numerically
+      untouched — but it cannot be used to predict simulator behaviour. A `--plant gazebo`
+      mode would close the gap.
+- [ ] **No BlueBoat hydrodynamic identification exists anywhere in the project.** The xacro
+      is BlueROV2's (`README.md` says so outright) and the MPC's real-boat coefficients have
+      unknown provenance (`CONTROLLERS.md` §6.4). Every controller in the stack is tuned
+      against one or the other. A bollard-pull plus a straight-line decay test on the water
+      would settle it and is cheap compared with what rests on it.
+
+## 0.3 MPC on `fsin` — orbit limit cycle (analysed 2026-09-01, sim experiments open)
+
+Observed in Gazebo through the MCS map: under MPC on `fsin` the boat locks into a perfect
+circle near the start while the reference runs away (robot↔target distance oscillating at the
+loop period, growing). The full mechanism is `CONTROLLERS.md` C10 — briefly: `fsin`'s heading
+swing is 364.75° per half-cycle so the reference is a chain of near-closed loops; at
+`_FSIN_V = 0.5` m/s the 1.5 m loops sit at/past the 1.89 m minimum turning radius; once
+displaced, `Q_ψ = 30` against `Q_pos = 50` makes tracking the rotating tangent cheaper than
+closing position; governor F5 (`e_along` on a revolving tangent averages 0, `gov_Emax = 0`)
+lets `tau` run away; SQP_RTI with no stage-1..N re-seeding never escapes the basin.
+`LoS`/`PID` steer *toward* the target by construction and recover.
+
+Sim-only experiments to make MPC track `fsin` — none applied yet, real-boat values untouched:
+
+- [ ] **Rebalance the sim `mpc_Q_diag`** so position outweighs heading at loop scale
+      (`Q_ψ` 30 → ~5–10, simulation default only), and re-measure on `fsin` and on the
+      4 m circle so the C9/0.2 gains are not regressed.
+- [ ] **Enable the cross-track governor brake per run in sim** (`gov_Emax` is a declared,
+      launch-settable parameter) for looping shapes — this is F5's missing half. Keep the
+      committed default 0.0; it is off because it is unsafe at the current inner gains.
+- [ ] **Warm-start hygiene in `ur_mpc.solve`**: seed stages 1..N (shifted previous iterate,
+      or the reference on a large-error/stale-iterate detection), and give the C6 failure
+      path a fallback instead of a print.
+- [ ] **Decide the `_FSIN_V` divergence.** The working tree carries an uncommitted
+      `_FSIN_V` 0.1 → 0.5 in `path_generation.py` that contradicts the in-branch comment,
+      `TRAJECTORY_SYSTEM.md` (§shape table and revision record), `CLAUDE.md`'s speed list,
+      and the oracle: `docs/controllers/check_trajectory_library.py` currently **FAILS**
+      3 checks because of it (`fsin` reference poses wrong at every sampled t, both
+      Euler-loop comparisons; the 4th failure, `sin` at t = 500 only, is the known one-ULP
+      scipy quaternion sensitivity — x/y reproduce the oracle exactly, verified 2026-09-01).
+      Until the constant and the oracle/docs agree one way or the other, that gate is red
+      and `fsin` field-data comparability is broken. (Deliberately not resolved here — the
+      constant is the current experiment's setting.)
+
 ## 1. Needs a running ROS 2 / Gazebo workspace
 
 - [ ] **Gazebo generation mismatch — port the Fortress plugin names.** Every plugin in
@@ -81,7 +173,12 @@ a MAVLink link, or water.
       are reasoned starting values, not measured. Expect to retune for the real boat.
 - [ ] **MPC solve time at 20 Hz.** The loop rate requires acados to solve in under 50 ms;
       never timed on target hardware. If it overruns, raise `dt` — the governor rescales with
-      it automatically.
+      it automatically. **Now measurable in simulation** (the acados environment is fixed,
+      see §0.1): an isolated `Sim_launch.py controller_type:='MPC' trajectory:='kin_square'`
+      run held 1391 control ticks over ~70 s with zero `/thruster_input` watchdog trips, so
+      the loop is keeping its 20 Hz on this machine. Instrument the solve call itself and
+      report the distribution rather than the absence of trips, then repeat on the boat's
+      companion computer.
 - [ ] **Mid-mission MAVLink mission swap** corner cases are untested. Plan was exhaustive
       SITL testing; fallback is to replan only between missions.
 
@@ -139,14 +236,30 @@ Each verified against the tree. Ordered by value; identifiers are those of
       side-current +3 %). **Raise the inner gains (C1), then set `gov_Emax` — 5.0 is a
       reasonable starting point — and re-run the five scenarios.**
       `master_control.py:585-622`.
-- [ ] **F4 — MPC reads 16 poses from a 15-pose window** and pads by duplicating the last one,
+- [x] **F4 — MPC reads 16 poses from a 15-pose window** *(fixed 2026-08-31:
+      `path_steps = mpc_horizon + 1`, so the window spacing and the solver's `time/horizon`
+      are now identically equal and no pose is duplicated)* — it padded by duplicating the last one,
       giving a zero-velocity terminal reference; separately the window spacing is 2.5/14 =
       0.1786 s while the solver divides by 2.5/15 = 0.1667 s, inflating every reference speed
       by 7.1 %. `path_steps = mpc_horizon + 1` fixes both. Measured effect on tracking is
-      negligible — fix for correctness, not for accuracy. `ur_mpc.py:216-218, 156`.
-- [ ] **C2 — MPC heading wrap-around never reconciled.** Reference yaw is wrapped then
-      unwrapped forward across the horizon while the measured state is separately wrapped, so
-      a ±π crossing shows the cost an error of up to 2π. `ur_mpc.py:226-236`.
+      negligible — fix for correctness, not for accuracy. Line numbers moved with the
+      2026-08-31 build-location rework; the padding is in `MPCController.solve`.
+      *Explicitly ruled out* as the cause of the MPC startup hang (§0.1) — it is a
+      reference-quality defect, not a startup one, and stays open on its own merits.
+- [x] **C2 — MPC heading wrap-around never reconciled.** *Fixed 2026-08-31, and it was worse
+      than described.* Two distinct faults in `MPCController.solve`: (a) the forward unwrap
+      was **pairwise against a re-wrapped predecessor** (`psi_prev` was re-read from the pose
+      each iteration), so it never accumulated and a window straddling ±π came out as e.g.
+      `3.140, 3.143, −3.100` — a 2π cliff *inside* the horizon, which the equally-weighted
+      terminal cost then chased; and (b) the reference branch was never reconciled with the
+      independently-wrapped measured yaw. Now one `np.unwrap` over the whole pose list,
+      followed by a rigid 2π shift onto the branch nearest `x_current[2]` — rigid so every
+      difference along the horizon, and hence the `r` references, is preserved. Measured
+      before the fix on a lawnmower whose return legs sit on −π: clean to t = 35 s, then the
+      boat drove its yaw the **wrong way** at full differential ([−20, +20] N) on a −0.785 rad
+      error and never recovered — 64.8 % of ticks saturated, 11.57 m mean error. After:
+      1.4 % saturated, 0.06 m mean error. This, not the weights, was the dominant cause of
+      the "MPC just saturates" report.
 - [ ] **`master_control` cannot start without acados, whatever the controller.**
       `import ur_mpc` at `master_control.py:73` is unconditional and `ur_mpc.py:6` imports
       `acados_template` at module level, so `controller_type:='PID'` and `'LoS'` die with

@@ -61,9 +61,21 @@ def check(label, ok, detail=""):
 
 # ---------------------------------------------------------------- the oracles
 
-def fsin_original(t):
-    """The pre-F1 fsin: Euler integration from t=0, verbatim. The reference."""
-    v, A, f, dt = 0.1, 1, 0.05, 0.01
+# The turn radius the 'fsin' branch of single_pose passes in. Mirrored here, not
+# imported: the branch holds a literal, and the REFERENCE poses below pin the
+# pair together -- change one without the other and this check fails.
+FSIN_RADIUS = 1.5
+FSIN_RADIUS_ORIGINAL = 0.1      # V/A of the pre-radius constants (A = 1, f = 0.05)
+
+
+def fsin_original(t, radius=FSIN_RADIUS_ORIGINAL):
+    """The pre-F1 fsin: Euler integration from t=0, verbatim. The reference.
+
+    radius = FSIN_RADIUS_ORIGINAL reproduces the original constants exactly.
+    """
+    v, dt = 0.1, 0.01
+    A = v / radius
+    f = A / 20.0
     x = y = 0.0
     yaw = 0.0
     for i in range(int(t / dt)):
@@ -101,11 +113,14 @@ REFERENCE = {
         (123.456, 35.06768, 3.4822186580946846, -0.5019244140739987, 0.8649114882786985),
         (500.0, 140.5, 1.2833827891979652, 0.4505537080226237, 0.8927493243834265),
     ],
+    # 2026-09-01: turn radius 0.1 m -> 1.5 m (see TRAJECTORY_SYSTEM.md's shape
+    # revision record). The shape is unchanged, scaled 15x and 15x slower per
+    # cycle; the authored speed is still 0.1 m/s.
     'fsin': [
-        (1.0, 0.09975645675529524, 0.005200647389810843, 0.0770469346780953, 0.997027466951994),
-        (12.0, 0.5106903242390921, -0.010781157877308009, 0.2580328916928904, -0.9661361326462256),
-        (123.456, 4.038716568724223, 0.32096657351381214, 0.7477094714681917, 0.6640260132530634),
-        (500.0, 15.772116983196796, 0.6549755995372895, 7.595686639340002e-15, 1.0),
+        (1.0, 0.09999999512718812, 2.3268218476744032e-05, 0.0003455626793334877, 0.9999999402932156),
+        (12.0, 1.1987968682151866, 0.04005688193158172, 0.049939222745582094, 0.998752258586466),
+        (123.456, 2.111901093555705, 0.4017869497382728, 0.19706565415777444, -0.9803902936848),
+        (500.0, 18.184613698759534, -1.3685363371190256, 0.6846505699395324, -0.7288714544290189),
     ],
     'square': [
         (0.0, 0.0, 2.0, 0.0, 1.0),
@@ -164,9 +179,12 @@ for shape in CLAMPED_SHAPES:
 # --------------------------------------------- 3. F1, identity and purity
 print("F1: fsin matches the original integration and stays pure in t")
 ts = [0.0, 0.005, 0.5, 1.0, 7.3, 12.0, 49.99, 50.0, 123.456, 300.0, 500.0]
-bad = [t for t in ts if pg._fsin_state(t) != fsin_original(t)]
-check(f"bit-identical to the original Euler loop at {len(ts)} sampled t", not bad,
-      f"differs at t={bad}" if bad else "")
+for radius, label in ((FSIN_RADIUS_ORIGINAL, "original 0.1 m"),
+                      (FSIN_RADIUS, f"in-use {FSIN_RADIUS} m")):
+    bad = [t for t in ts
+           if pg._fsin_state(t, radius) != fsin_original(t, radius)]
+    check(f"radius {label}: bit-identical to the Euler loop at {len(ts)} sampled t",
+          not bad, f"differs at t={bad}" if bad else "")
 
 order_ts = list(np.linspace(0.0, 1000.0, 401))
 
@@ -175,7 +193,7 @@ def evaluated(sequence):
     pg._fsin_yaw = np.zeros(1)
     pg._fsin_x = np.zeros(1)
     pg._fsin_y = np.zeros(1)
-    return {t: pg._fsin_state(t) for t in sequence}
+    return {t: pg._fsin_state(t, FSIN_RADIUS) for t in sequence}
 
 
 forward = evaluated(order_ts)

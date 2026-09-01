@@ -55,7 +55,9 @@ from rclpy.qos import QoSDurabilityPolicy
 import rclpy
 
 # Common python libraries
+import contextlib
 import os
+import sys
 import time
 import math
 import numpy as np
@@ -141,7 +143,6 @@ class Controller(Node):
         self.current_twist = None
 
         self.ready = False
-        self.init = False
         self.pinger_target = None
         self.manual_target = [0.0,0.0]
 
@@ -167,8 +168,16 @@ class Controller(Node):
 
             # Derived from the horizon, never declared separately: the reference
             # window and the solver's horizon must not be able to disagree.
+            #
+            # N + 1, not N (TODO.md F4). MPCController.solve reads N+1 poses --
+            # N stages plus the terminal one -- so requesting N made it pad by
+            # duplicating the last pose, giving a zero-velocity terminal
+            # reference. It also desynchronised the two spacings: this window's
+            # dtau was path_time/(path_steps-1) while the solver divides by
+            # time/horizon, inflating every reference velocity by 7.1 %. With
+            # N+1 poses the two are identically time/horizon.
             self.path_time = self.mpc_time
-            self.path_steps = self.mpc_horizon
+            self.path_steps = self.mpc_horizon + 1
 
         # PID Parameters
         if self.controller_type == 'PID':
@@ -215,6 +224,110 @@ class Controller(Node):
         run_dir = cf.ensure_data_dir(self, self.data_root, 'data', f'{ctrl}_data')
         self.title = cf.reserve_run_file(run_dir, f'{date}-{ctrl}_{sim}_data', '.npy')
         self.get_logger().info(f"Controller log: {self.title}.npy")
+
+        # Build the controller HERE, not on the first tick. The MPC branch runs
+        # acados code generation and a C compile, which takes tens of seconds
+        # the first time; done from timer_callback it froze the whole node --
+        # the executor is single-threaded, so odom, /path_request futures and
+        # publish_thrust all stopped with it, and the interface-side watchdog
+        # then zeroed the thrust. Doing it before rclpy.spin means the cost is
+        # paid once, visibly, at launch, and a failure kills the node where the
+        # operator can see it instead of hanging the control loop.
+        self._build_controller()
+
+    # ------------------------------------------------------------------ #
+    #  Controller construction                                           #
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    @contextlib.contextmanager
+    def _no_stdin():
+        """Run a block with stdin closed, so a prompt raises instead of blocking.
+
+        acados_template's get_tera() asks `input("... download tera? y/N")` when
+        the Tera renderer binary is missing. Under `ros2 launch` stdout is block
+        buffered and stdin never delivers a line, so the question is invisible
+        and the read never returns -- the node just stops, forever. With stdin
+        pointed at /dev/null the same call raises EOFError immediately and we
+        get to report something useful.
+        """
+        saved = sys.stdin
+        try:
+            with open(os.devnull, 'r') as devnull:
+                sys.stdin = devnull
+                yield
+        finally:
+            sys.stdin = saved
+
+    def _check_acados_ready(self):
+        """FATAL + raise if the acados environment cannot build a solver."""
+        try:
+            from acados_template.utils import get_tera_exec_path, get_acados_path
+        except Exception as e:
+            self.get_logger().fatal(
+                f"controller_type 'MPC' needs acados_template, which failed to "
+                f"import: {e}. Source the venv that carries it "
+                f"(source ~/ros2_ws/.venv/bin/activate) before launching.")
+            raise
+
+        tera = get_tera_exec_path()
+        if not (os.path.exists(tera) and os.access(tera, os.X_OK)):
+            self.get_logger().fatal(
+                "acados cannot generate the MPC solver: the Tera template "
+                f"renderer is missing at\n    {tera}\n"
+                "Without it acados stops mid-generation on an interactive "
+                "prompt. Install it with:\n"
+                f"    mkdir -p {os.path.dirname(tera)}\n"
+                f"    curl -fL -o {tera} https://github.com/acados/tera_renderer"
+                "/releases/download/v0.2.0/t_renderer-v0.2.0-linux-amd64\n"
+                f"    chmod +x {tera}\n"
+                "and export ACADOS_SOURCE_DIR="
+                f"{get_acados_path()} so this path stops being a guess.")
+            raise RuntimeError(f"acados Tera renderer not found at {tera}")
+
+    def _build_controller(self):
+        """Construct the controller named by controller_type.
+
+        PID and LoS build a plain Python object in microseconds. MPC runs acados
+        code generation and a C compile, so it gets a preflight check and an
+        explicit progress line.
+        """
+        if self.controller_type == 'MPC':
+            self._check_acados_ready()
+            build_dir = ur_mpc.acados_build_dir()
+            self.get_logger().info(
+                f"Building the acados MPC solver in {build_dir} -- the first "
+                "run compiles C and can take about a minute; later runs reuse it.")
+            try:
+                with self._no_stdin():
+                    self.controller = ur_mpc.MPCController(**self.mpc_model,
+                                                horizon = self.mpc_horizon,
+                                                time = self.mpc_time,
+                                                Q_weight = self.Q_weight,
+                                                R_weight = self.R_weight,
+                                                input_bounds = self.input_bounds,
+                                                build_dir = build_dir
+                                                )
+            except Exception as e:
+                self.get_logger().fatal(
+                    f"acados failed to build the MPC solver in {build_dir}: "
+                    f"{type(e).__name__}: {e}. Delete that directory and retry; "
+                    "if it persists, check ACADOS_SOURCE_DIR and that the acados "
+                    "C library is built.")
+                raise
+            self.get_logger().info(
+                "acados MPC solver "
+                f"{'reused' if self.controller.reused_solver else 'generated and compiled'}.")
+
+        if self.controller_type == 'PID':
+            self.controller = PID.PIDLoS(dt = self.dt,
+                                         B = self.B_matrix,
+                                         outer_gains = self.outer_gains,
+                                         inner_gains = self.inner_gains,
+                                         lookahead = self.pid_lookahead,
+                                         thruster_limits = self.thruster_limits
+                                         )
+
+        self.get_logger().info('Controller node initiated')
 
     # ======================================================================
     #  2. TUNING KNOBS -- every gain, all in one place
@@ -281,18 +394,25 @@ class Controller(Node):
         self.gov_Emax = dbl('gov_Emax', 0.0)
 
         # -- PID ------------------------------------------------------------
-        self.outer_gains = {'x':   tuple(arr('outer_gains_x',   [3.0, 0.01, 0.0])),
-                            'psi': tuple(arr('outer_gains_psi', [3.0, 0.01, 0.0]))}
-        self.inner_gains = {'u': tuple(arr('inner_gains_u', [1.0, 0.0, 0.0])),
-                            'r': tuple(arr('inner_gains_r', [1.5, 0.0, 0.0]))}
-        self.pid_lookahead = dbl('pid_lookahead', 2.5)
-
+        if not self.isSimulation:
+            self.outer_gains = {'x':   tuple(arr('outer_gains_x',   [3.0, 0.01, 0.0])),
+                                'psi': tuple(arr('outer_gains_psi', [3.0, 0.01, 0.0]))}
+            self.inner_gains = {'u': tuple(arr('inner_gains_u', [1.0, 0.0, 0.0])),
+                                'r': tuple(arr('inner_gains_r', [1.5, 0.0, 0.0]))}
+            self.pid_lookahead = dbl('pid_lookahead', 2.5)
+        else:
+            self.outer_gains = {'x':   tuple(arr('outer_gains_x',   [6.0, 0.01, 0.0])),
+                                'psi': tuple(arr('outer_gains_psi', [4.0, 0.01, 0.0]))}
+            self.inner_gains = {'u': tuple(arr('inner_gains_u', [2.0, 0.0, 0.0])),
+                                'r': tuple(arr('inner_gains_r', [2.5, 0.0, 0.0]))}
+            self.pid_lookahead = dbl('pid_lookahead', 2.5)
+            
         # -- kinematic Fossen-LoS -------------------------------------------
         self.los_lookahead   = dbl('los_lookahead', 2.5)
         self.los_ku          = dbl('los_ku', 20.0)
         self.los_kpsi        = dbl('los_kpsi', 10.0)
         self.los_kd          = dbl('los_kd', 1.0)
-        self.los_speed_scale = dbl('los_speed_scale', 1.0)
+        self.los_speed_scale = dbl('los_speed_scale', 1.0 if not self.isSimulation else 2.0)
         # Zero-authored-speed hold. A stationary reference (station_keeping, a
         # clamped-out mission, the awaiting-YAML fallback) gives U_d = 0, and
         # neither controller can hold position on one: LoS commands zero surge,
@@ -314,21 +434,96 @@ class Controller(Node):
         # -- point following (manual target and pinger) ----------------------
         # Simulation and the real boat have always used different values here.
         self.k_v   = dbl('point_k_v',   2.0  if self.isSimulation else 0.15)
-        self.k_psi = dbl('point_k_psi', 16.0 if self.isSimulation else 10.0)
+        self.k_psi = dbl('point_k_psi', 60.0 if self.isSimulation else 10.0)
         # Negative disables the arrival check.
-        self.safety_distance = dbl('safety_distance', -1.0)
+        self.safety_distance = dbl('safety_distance', 1.0 if self.isSimulation else -1.0)
 
         # -- MPC -------------------------------------------------------------
-        self.mpc_horizon = integer('mpc_horizon', 15)
-        self.mpc_time    = dbl('mpc_time', 2.5)
+        # Simulation and the real boat get different values here, for the same
+        # reason the PID gains and the point-following gains above do -- except
+        # that for the MPC the split covers the plant MODEL as well as the
+        # weights, because an optimiser's behaviour is set by what it believes
+        # about the boat, not only by what it is told to care about.
+        #
+        # THE MODEL. The real-boat column is unchanged: those coefficients have
+        # been in the tree since the beginning and CONTROLLERS.md section 6.4 records
+        # that their provenance is unknown, so nothing here claims to improve
+        # them. The simulation column is FITTED TO THE GAZEBO PLANT, i.e. to
+        # blueboat_description/urdf/hydrodynamics.xacro, which is what the boat
+        # in simulation actually obeys. The two disagreed badly -- surge mass
+        # 2.0x heavy, yaw inertia 4.8x heavy (27.41 vs 5.76 kg m^2), yaw drag
+        # 2-4x over -- so the MPC planned trajectories the sim boat could not
+        # fly, discovered the deficit, and spent every newton it had. Measured
+        # symptom: 77.5 % of ticks on the +/-20 N bound at a 0.70 m/s mission,
+        # with the effort going into yaw (|differential| 8.54 N against 5.44 N
+        # of surge).
+        #
+        # Added mass maps one-for-one: acados builds M = M_rb - diag(a_*) and
+        # the xacro states xDotU / yDotV / nDotR with the same sign convention,
+        # so a_u/a_v/a_r ARE the xacro values.
+        #
+        # Damping does not map one-for-one. export_underwater_model carries a
+        # linear D only, while the plant is linear + quadratic, and the
+        # quadratic term dominates above ~0.4 m/s. Each d_* below is therefore a
+        # SECANT linearisation -- the linear coefficient whose steady-state drag
+        # equals the plant's at a representative operating point:
+        #
+        #   d_u = 25.15 + 33.800 * 0.45 m/s    -> exact at 0.45 m/s, and within
+        #                                         +14 % / -17 % over 0.30-0.70
+        #   d_v =  7.364 + 54.269 * 0.10 m/s   -> sway stays small in normal use
+        #   d_r =  3.744 + 40.000 * 0.15 rad/s -> 0.15 is the p75 of |yaw rate|
+        #                                         measured across every recorded
+        #                                         sim run (median 0.000, p90 0.407)
+        #
+        # These are FITTED NUMBERS, not physics: refit them if hydrodynamics.xacro
+        # changes, or if missions settle at a cruise speed far from 0.45 m/s.
+        # docs/controllers/mpc_tuning_report.py scores a run for the symptoms.
+        if not self.isSimulation:
+            self.mpc_model = {'robot_mass': 16.01,   # blueboat.xacro mass
+                              'iz':          5.64,   # blueboat.xacro izz
+                              'a_u': -26.77, 'a_v':  -7.55, 'a_r': -21.77,
+                              'd_u': -29.34, 'd_v': -51.54, 'd_r': -44.65}
+        else:
+            self.mpc_model = {'robot_mass': 16.01,   # blueboat.xacro mass
+                              'iz':          5.64,   # blueboat.xacro izz
+                              'a_u':  -5.50,         # = xDotU
+                              'a_v': -12.70,         # = yDotV
+                              'a_r':  -0.12,         # = nDotR
+                              'd_u': -40.36,         # secant of xU + xUabsU*|u|
+                              'd_v': -12.79,         # secant of yV + yVabsV*|v|
+                              'd_r':  -9.74}         # secant of nR + nRabsR*|r|
+
+        # THE HORIZON. 6.0 s / 30 steps in simulation is the one MPC change in
+        # this repository with a measurement behind it (CONTROLLERS.md section 5.2):
+        # the circle's steady radial offset goes -1.019 m -> -0.011 m and cruise
+        # speed 26 % fast -> exact. The real boat stays at 2.5 s / 15 until the
+        # solve time is measured on the companion computer -- doubling the
+        # horizon is precisely the change that would break the 50 ms budget, and
+        # TODO.md section 2 records that it has never been timed on target hardware.
+        # Both keep dt = time/horizon at 0.167-0.200 s.
+        self.mpc_horizon = integer('mpc_horizon', 30 if self.isSimulation else 15)
+        self.mpc_time    = dbl('mpc_time', 6.0 if self.isSimulation else 2.5)
+
         self.Q_weight = np.diag(arr('mpc_Q_diag', [50.0,   # x
                                                    50.0,   # y
                                                    30.0,   # psi
                                                     1.0,   # u
                                                     1.0,   # v
                                                     1.0])) # r
-        self.R_weight = np.diag(arr('mpc_R_diag', [0.015,  # u1
-                                                   0.015])) # u2
+        # THE EFFORT PENALTY. The stage cost is (x-x_ref)' Q (x-x_ref) + u' R u
+        # with u_ref identically zero, so R is an absolute penalty in N^2 -- there
+        # is no rate term anywhere. At Q_pos = 50 the break-even is where
+        # saturating BOTH thrusters costs what the position error costs:
+        #
+        #   R = 0.015 -> 0.49 m      R = 0.10 -> 1.26 m      R = 0.25 -> 2.00 m
+        #
+        # At the shipped 0.015 anything beyond half a metre of error makes full
+        # throttle literally the cheaper option, which is why the MPC saturates
+        # where PID -- whose demand its own P-gain bounds -- does not. 0.10 in
+        # simulation puts the break-even outside the governor's own 0.5 m
+        # dead-band; CONTROLLERS.md section 10 advises 0.05-0.1 on general grounds.
+        self.R_weight = np.diag(arr('mpc_R_diag', [0.10, 0.10] if self.isSimulation
+                                                  else [0.015, 0.015]))
 
         # -- thrust limits, shared by every branch ---------------------------
         # One symmetric scalar feeds both the allocator clamp and the MPC input
@@ -366,34 +561,9 @@ class Controller(Node):
             self.publish_thrust([0.0, 0.0])
             return
 
-        if not self.init:
-            if self.controller_type == 'MPC':
-                self.controller = ur_mpc.MPCController(robot_mass = 16.01,
-                                                iz = 5.64,    # Yaw inertia
-                                                a_u = -26.77, # added mass XdotU
-                                                a_v = -7.55,  # added mass YdotV
-                                                a_r = -21.77, # added mass NdotR
-                                                d_u = -29.34, # viscous drag Xu
-                                                d_v = -51.54, # viscous drag Yv
-                                                d_r = -44.65, # viscous drag Nr
-                                                horizon = self.mpc_horizon, 
-                                                time = self.mpc_time, 
-                                                Q_weight = self.Q_weight,
-                                                R_weight = self.R_weight,
-                                                input_bounds = self.input_bounds
-                                                )
-
-            if self.controller_type == 'PID':
-                self.controller = PID.PIDLoS(dt = self.dt,
-                                             B = self.B_matrix,
-                                             outer_gains = self.outer_gains,
-                                             inner_gains = self.inner_gains,
-                                             lookahead = self.pid_lookahead,
-                                             thruster_limits = self.thruster_limits
-                                             )
-
-            self.get_logger().info('Controller node initiated')
-            self.init = True
+        # The controller itself is built in __init__ (see _build_controller):
+        # acados code generation is a build step, and running it from here froze
+        # the single-threaded executor for the whole compile.
 
         if not self.time_set:
             self.initial_time = time.time()
@@ -719,7 +889,7 @@ class Controller(Node):
         v = 5*np.log(v+1)
 
         if list(self.manual_target) != [0.0,0.0]:
-            v = 10*np.log(v+1) # If manual target, go faster. Don't need to be that precise here.
+            v = 10*np.log(v+1) if not self.isSimulation else 7*np.log(v+1)  # If manual target, go faster. Don't need to be that precise here.
 
         # Propeller breakaway. v is the common-mode surge force this law puts on
         # BOTH thrusters, and 5*ln(k_v*d + 1) stays under min_thrust (2 N) out to
@@ -802,6 +972,7 @@ class Controller(Node):
 
     def manual_target_callback(self, msg: Float32MultiArray):
         self.manual_target = msg.data # [x,y] in world frame
+        self.stopping_sequence = False
 
     # inRobotFrame() moved to _custom_libraries/frame_math.py -- it used no
     # node state at all, so it is pure geometry and now unit-testable without
