@@ -65,19 +65,53 @@ body-frame: `master_control` reads `current_twist[0]` as surge for the inner spe
 
 Measured against mavros 2.14.0, not inferred: `TRAJECTORY_SYSTEM.md` F8 carries the numbers.
 
-**N4 — `enable_motors` gates thruster output.**
-The gate is the early return in `manualMove` (`robot_interface.py:363`): no thrust-bearing
-PWM reaches the motors unless `enable_motors:=True`. Exactly two paths write to
-`/mavros/rc/override` around it, both deliberately, and neither carries thrust:
-`full_stop()` calls `manualMove([0,0], force=True)`, and `mode_callback()` calls
-`send_rc_override()` with neutral PWM then release when leaving override mode. Any *new*
-bypass is a rule violation.
+**N4 — `enable_motors` gates thruster output; a closed gate HOLDS NEUTRAL.**
+The gate is in `manualMove` (`robot_interface.manualMove`, anchor on the symbol —
+the line moves): **no thrust-bearing PWM reaches the motors unless
+`enable_motors:=True`.** Every write to `/mavros/rc/override` outside the gate
+carries neutral 1500/1500 or channel release, never thrust: `full_stop()` calls
+`manualMove([0,0], force=True)`, `mode_callback()` sends neutral then release when
+leaving override, and — since 2026-09-04 — the closed gate itself streams neutral.
+Any *new* bypass that carries thrust is a rule violation.
+
+**The closed gate no longer goes silent, and that is the point.** It used to just
+`return`, which is not inert: `robot_interface` requests `override`
+unconditionally at init, so by then `SERVO1/3_FUNCTION` are on RCIN1/RCIN3
+passthrough and the ESCs follow RC channels 1 and 3 from *any* transmitter, with
+nothing feeding `RC_OVERRIDE_TIME` to keep those channels ours. Motors could spin
+with `enable_motors:=False`. Streaming neutral pins both channels and keeps the
+override watchdog fed; 0 N is an exact knot of the calibration table (→ 1500 µs,
+and `3000 − 1500 = 1500` for the reversed side), so it is true neutral, not a
+rounded one. Only done while `self.mode == 'override'` — outside it the autopilot
+is not listening to us and streaming would fight `mode_callback`'s release.
+The superproject's CM-16 is worded to match: *only neutral PWM may be written
+while disabled*.
+
+**N4b — `'stop'` latches.** `full_stop()` sets `self.estopped`, cleared only by
+the `'enable'` token (`release_estop`). While latched the timer publishes
+`controller_ready=False` at the readiness rate and re-zeroes through the
+**unforced** `manualMove([0,0])` every tick. Without the latch a stop is undone
+50 ms later by the next `manualMove(self.thruster_input)`, because
+`master_control` keeps publishing — and the station's E-STOP no longer works by
+dropping out of override, so the latch is what makes it an actual stop.
+`check_watchdog.py` asserts `timer_callback` contains no `force=True`; keep it
+that way.
 
 **N5 — Restore the default servo mapping before shutdown.**
 `override` remaps `SERVO1/3_FUNCTION` to RC passthrough; leaving the boat in that state
 disables the Xbox controller. Never set a SERVO function to `0` (Disabled) — that produces an
 ArduPilot PreArm "no motor" failure. `param_set` defines `SERVO_DISABLED = 0` but never
 applies it.
+Since 2026-09-04 **both nodes attempt this themselves** on the way out, in
+independent `try/finally` blocks (previously neither had one: a bare
+`rclpy.spin` meant `KeyboardInterrupt` skipped `destroy_node()` entirely, so the
+boat was left in passthrough and the position CSV was never closed).
+`param_set.restore_default_blocking` re-applies the mapping bounded to ~3 s;
+`robot_interface.shutdown` stops the motors, releases the RC channels, requests
+`default`, closes the CSV and writes the post-mission report. Both are
+**best-effort** — a launch teardown SIGINTs the whole process group, so mavros is
+usually dying at the same moment — and neither depends on the other. An operator
+`default` before shutdown is still the reliable route.
 
 **N6 — Thrust is streamed as RC override, never as per-tick acknowledged MAVLink commands.**
 `OverrideRCIn` on `/mavros/rc/override` at ~20 Hz is latest-wins, hides packet loss, and
@@ -135,7 +169,7 @@ which is why the sources import each other as bare modules (`import custom_funct
 | `master_control.py` | `src/` | `master_control` (ns `blueboat`) | The controller: MPC / PID / LoS |
 | `simulation_interface.py` | `src/` | `pid_sim` (ns `blueboat`) | Gazebo thrust bridge via `ROV`; sim-side readiness |
 | `robot_interface.py` | `src/robot_interaction/` | `blueboat_controller` | MAVROS bridge, thrust→PWM, odom republish, CSV logging |
-| `param_set.py` | `src/robot_interaction/` | `blueboat_parameter_control` | SERVO function + GCS sysid remapping |
+| `param_set.py` | `src/robot_interaction/` | `blueboat_parameter_control` | SERVO function + GCS sysid remapping; watchdogged so it can never latch busy |
 | `uwgps_log.py` | `src/robot_interaction/` | `underwater_gps_logger` | Water Linked UGPS HTTP poller |
 | `path_generation.py` | `src/_custom_libraries/` | `path_generation` | `/path_request` service; trajectory library |
 | `path_publisher.py` | `src/_custom_libraries/` | `path_publisher` | Whole-path preview for RViz; outside the control loop |
@@ -149,15 +183,44 @@ Non-node library modules, installed the same flat way and imported as bare modul
 | `custom_functions.py` | `src/_custom_libraries/` | yes (`rclpy`, msgs) | Shared helpers: `data_root`, `odometry`, `compute_target`, quaternion/frame maths |
 | `yaml_trajectory.py` | `src/_custom_libraries/` | no | `blueboat_trajectory/1` loader, evaluated at time `t` |
 | `frame_math.py` | `src/_custom_libraries/` | **no** | `inRobotFrame()` — world→body geometry, with its full input/output contract |
+| `path_stamp.py` | `src/_custom_libraries/` | **no** | The `/path_request` response tag: encodes a path parameter into a `builtin_interfaces/Time`, and the `matches` / `is_parameter` predicates both ends share |
 | `robot_log_schema.py` | `src/_custom_libraries/` | **no** | The position-CSV column layouts (`COLUMNS_PINGER`, `COLUMNS_NO_PINGER`, `columns_for`, `target_columns_for`, the `ACT_*` constants) |
 | `thrust_limits.py` | `src/_custom_libraries/` | **no** | `scale_to_limit()` — uniform per-thruster saturation, and the argument for why it is not two clips |
+| `poslog_report.py` | `src/_custom_libraries/` | **no** | Post-mission report: reads either poslog layout (detected from the header), renders one PNG, then files the run into `Robot_data/<csv stem>/`. Also the CLI. |
 | `PID/PID.py`, `MPC/ur_mpc.py`, `MPC/uvr_mpc.py` | `src/PID/`, `src/MPC/` | no | Controller implementations |
 
-`frame_math.py`, `robot_log_schema.py` and `thrust_limits.py` are **ROS-free by construction**
+`frame_math.py`, `robot_log_schema.py`, `thrust_limits.py`, `path_stamp.py` and
+`poslog_report.py` are **ROS-free by construction**
 — numpy only, or no imports at all. That is deliberate: both can be imported, diffed and checked from a plain
 Python prompt with no sourced workspace, which is what makes the geometry and the CSV format
 debuggable without a running graph. Keep them that way; anything needing `rclpy` belongs in
 `custom_functions.py` instead.
+
+`poslog_report.py` needs numpy, and imports **matplotlib lazily, inside the
+renderer only**. That is load-bearing, not fastidiousness: `robot_interface` calls
+it from its shutdown hook, `package.xml` declares neither library, and a flight
+node must never fail — at start or at teardown — because a plotting library is
+absent. `finalise_run` therefore always creates the folder and moves the files
+(stdlib only) and treats the picture as optional; the CLI can render it later
+from a machine that has matplotlib.
+
+**What it does with the files.** It creates `Robot_data/<csv stem>/` and **moves**
+the CSV, its `-origin.yaml` sidecar and the new PNG into it. Moving a primary
+field record is allowed; rewriting or regenerating one is not (CM-7 / N7), so an
+existing destination folder is never touched and re-running is a no-op that says
+so. The sidecar name is derived by pattern (`-poslog(-N)?.csv` → `-origin(-N).yaml`)
+rather than by a fixed-length slice, which is what the writer does too — the old
+slice mangled the name whenever a same-second collision produced
+`...-poslog-2.csv`.
+
+**Two reader notes.** Do **not** reuse `docs/controllers/replay.py::read_poslog_csv`
+— it looks for columns `x, y, psi, t, u1, u2`, which no revision of the schema has
+ever had. And there is no speed column: speed is central-differenced from
+`relative_x/y`, so samples implying more than `MAX_PLAUSIBLE_SPEED_MS` (5 m/s, well
+above a BlueBoat's ~2 m/s) are pose discontinuities rather than motion. They are
+**excluded from every statistic and counted in the summary**, never clipped: a run
+whose pose teleports is a finding, and one 300 m/s spike otherwise sets the mean
+and the y-scale for the whole mission.
 
 The last two nodes claim the same node name and are started by neither launch file. They are
 byte-identical to each other on the interface: both subscribe `/blueboat/odom`, publish
@@ -187,13 +250,19 @@ re-export: `docs/controllers/check_trajectory_library.py` resets the table by as
 would silently become a no-op — the F1 purity check would then pass *vacuously*, which is
 worse than failing.
 
-**Three offline checks locate code by file, not by symbol table**, and crash rather than fail
+**Four offline checks locate code by file, not by symbol table**, and crash rather than fail
 cleanly if it moves house: `check_pid_equivalence.py` needs `dbl('pid_lookahead', …)` inside
 `src/master_control.py`; `check_watchdog.py` needs `thruster_input_stale`, `timer_callback`,
 `'thruster_input_timeout', 0.5` and `self.last_thr_rx = time.time()` inside
 `robot_interface.py`, plus `timer_callback` inside `master_control.py`; `check_los_hold.py`
 needs `los_guidance`, `timer_callback` and the four `dbl('hold_*', …)` defaults inside
-`master_control.py`. All three are order-independent, so reordering within a file is safe.
+`master_control.py`; `check_mpc_solver.py` needs the `else:` branch of
+`if not self.isSimulation:` that assigns `self.mpc_model`, the `integer('mpc_horizon', …)` /
+`dbl('mpc_time', …)` / `arr('mpc_Q_diag', …)` / `arr('mpc_R_diag', …)` /
+`dbl('thrust_limit', …)` / `integer('mpc_qp_iter_max', …)` defaults, and the MPC branch of
+`timer_callback`, all inside `master_control.py` — it reads the shipped simulation
+configuration by AST rather than retyping it, precisely so the gate cannot drift from what
+ships. All four are order-independent, so reordering within a file is safe.
 
 ### 2.2 Internal topics
 
@@ -283,6 +352,33 @@ This contract is deliberately parameter-agnostic — the caller decides what the
 That property is what allows the reference-generation strategy to change without touching
 `path_generation`, and it must be preserved.
 
+**Exactly one server may run, and since 2026-09-03 that is enforced rather than assumed.**
+ROS 2 does not stop a second node offering the same service name, and when two do, every request
+is answered by whichever replies first. The response is a bare `nav_msgs/Path` with no echo of
+the request and no server identity, so the caller cannot tell. Measured on recorded logs with two
+missions up: `master_control`'s reference alternated **tick by tick** between two entirely
+different trajectories — the mission's `from_yaml` path and another launch's built-in `fsin` —
+both sampled at its own single `tau`, and the boat could follow neither. The still-running
+15:53 mission's log is 100 % corrupted across exactly the window in which further missions were
+launched beside it. Two guards, either of which is sufficient alone:
+
+* `path_generation` **refuses to be the second server**: at construction, before creating the
+  service, it enumerates the graph and exits non-zero with a FATAL naming the other node.
+  `allow_duplicate_server:=true` opts out; `server_discovery_wait` (2.0 s) is how long it gives
+  discovery before believing an empty graph. The enumeration deliberately does **not** exclude
+  itself by name — the duplicate is another node called `path_generation` in the same namespace,
+  so a name test skips precisely the node it must find.
+* Each returned pose is **stamped with the path parameter it was evaluated at**, not the clock
+  (`path_stamp.encode`), and `master_control.accept_path` rejects any response whose pose count
+  or whose `poses[0]` stamp does not match the request it actually issued. `RequestPath` is
+  untouched — the tag rides in the `PoseStamped` header the message already had, so N1/CM-1 is
+  not engaged. A server built before this stamps the wall clock; that is detected once, reported
+  as an error telling the operator to rebuild, and falls back to a geometric plausibility check
+  for the rest of the run rather than rejecting every response.
+
+`master_control` also logs an error at startup if it sees more than one server. It cannot refuse
+to run — it is the controller — but the operator is told. `check_path_contract.py` is the gate.
+
 ### 2.6 Operator CLI
 
 ```bash
@@ -340,7 +436,8 @@ launching a GPS-anchored mission in simulation, to rehearse anchoring at arbitra
 **Testing.** No lint or type-check tooling exists, and there is no ROS-side automated test
 (no `pytest`, no `ament_*` test target). Two gates exist in the working tree, and **neither is
 committed**: `.gitignore` excludes `.claude/tools/`, `.claude/settings.json` and
-`.claude/specs/`, and the six harness scripts below (`check_*.py`, `replay.py`) are untracked.
+`.claude/specs/`. The harness scripts below (`check_*.py`, `replay.py`) **are** tracked,
+contrary to what this section said before `git ls-files` was checked.
 `git ls-files .claude/` returns `CLAUDE.md` and `TODO.md` only. A fresh clone has neither gate,
 so anything that says "the diff in the commit is the record" is aspirational, not current.
 
@@ -402,8 +499,9 @@ progress column reads `n/a`.
 python3 replay.py <bag-dir|log.npy|poslog.csv> [--controller PID|LoS|MPC]
 ```
 
-*Five checks*, plain scripts with exit codes, no test framework. Untracked (see above), so
-they exist only in this working tree:
+*Eight checks*, plain scripts with exit codes, no test framework. **These are tracked** —
+`git ls-files blueboat_control/src/docs/controllers/` lists all of them, unlike
+`.claude/tools/`, so a fresh clone does get this gate:
 
 ```bash
 python3 check_pid_equivalence.py  # PIDLoS: Delta = 1/los_gain identity, the documented
@@ -422,6 +520,35 @@ python3 check_los_hold.py         # zero-speed hold, both controllers: bit-ident
                                   # with the hold on and disabled on every moving path, a
                                   # bounded error at rest, and that the harness copies and
                                   # master_control are still the same two laws.
+python3 check_manual_hold.py      # manual-target keep-location: the pinger path is
+                                  # bit-identical, the hold parks inside the re-acquire
+                                  # radius against currents that swept the old law tens of
+                                  # metres downstream, manual_hold_radius=0 restores the
+                                  # previous law bit-identically, and master_control's own
+                                  # manual_keep_location is EXECUTED against a stub rather
+                                  # than only text-matched.
+python3 check_path_contract.py    # the /path_request contract: the response tag round-trips
+                                  # through the float32 request field, master_control's own
+                                  # accept_path is EXECUTED against a stub and takes our
+                                  # answer while rejecting a foreign one, a wrong-length one
+                                  # and an empty one, a clock-stamping (pre-2026-09-03)
+                                  # server falls back to geometry instead of rejecting
+                                  # everything, and the server's singleton guard, the
+                                  # request timeout and the governor's freshness gate are
+                                  # all present. numpy only, no ROS.
+python3 check_mpc_solver.py       # the MPC solver-failure guard (C6): a non-zero acados
+                                  # status returns zeros rather than the stale iterate,
+                                  # master_control commands zero thrust and reports through
+                                  # the ROS logger, the qpOASES working-set budget clears the
+                                  # condensed QP size, and - in the closed-loop half - the
+                                  # real MPCController solves every tick in the regime that
+                                  # used to fail 396/400 while the acados default budget of
+                                  # 50 still does. THE ONLY CHECK HERE THAT NEEDS THE VENV:
+                                  # its closed-loop half wants acados_template + casadi and
+                                  # skips cleanly (exit 0) under /usr/bin/python3. Takes
+                                  # 2-3 min when it does run, and the reproduction half
+                                  # deliberately makes acados print hundreds of its own
+                                  # error lines to stderr.
 python3 check_trajectory_library.py  # every built-in shape against embedded reference poses
                                   # (the field-data comparability guard), the t>500 clamp,
                                   # fsin bit-identical to the original Euler loop and pure in
@@ -431,7 +558,14 @@ python3 check_trajectory_library.py  # every built-in shape against embedded ref
                                   # cleanly, exit 0, without one.
 ```
 
-**All five pass on this machine** (exit 0 each, verified with the system `python3`).
+**Seven of the eight pass on this machine** (exit 0, verified with the system `python3`;
+`check_mpc_solver.py` passes both halves under `~/ros2_ws/.venv/bin/python3`).
+`check_trajectory_library.py` exits 1 on three `fsin` assertions — the reference poses and both
+Euler-loop comparisons. Root cause found 2026-09-03 and recorded in `TODO.md`: module-scope
+`_FSIN_V = 0.5` against the 0.1 m/s that the comment beside it, `TRAJECTORY_SYSTEM.md` §3 and the
+check's own pinned table all state, so `fsin` runs at exactly 5× its authored speed. It predates
+the keep-location and path-contract work and is a regression from neither. See also the note
+below on that check's sensitivity to the scipy build.
 
 An earlier reading recorded `check_trajectory_library.py` as exiting 1 on
 `sin: 4 reference poses bit-identical -- moved at t=[500.0]` — a one-ULP
@@ -517,6 +651,49 @@ regenerates only on a real change: measured 1.0 s for a first build, 0.0 s to re
 that directory to force a rebuild. Deliberately **not** under `cf.data_root()` — that tree is
 write-once field record (§6 / CM-7).
 
+**What "a real change" covers, verified 2026-09-04 against `acados_template` 0.5.1.**
+`is_code_reuse_possible` compares an md5 of the whole `ocp.to_dict()`, and the serialized
+`model.f_expl_expr` inside `acados_ocp.json` carries the plant coefficients `a_u…d_r` as
+literals. So a *coefficient-only* retune of `mpc_model` does force a regeneration, and so does
+any change to `mpc_horizon`, `mpc_time`, `mpc_Q_diag`, `mpc_R_diag`, `thrust_limit` or
+`mpc_qp_iter_max` — all of them live in the compared dict. The practical consequence is that
+the first launch after such a change takes about a minute and logs `generated and compiled`
+rather than `reused`; that is expected, and nobody should be deleting the cache to "make it
+take". `check_mpc_solver.py` asserts the model-coefficient half of this, so it goes red if a
+future acados narrows what the hash covers.
+
+**A failed acados solve is not a command (C6).** acados leaves the primal iterate untouched
+on a non-zero status, so reading `solver.get(0, 'u')` after one returns the command from the
+last *successful* solve. `ur_mpc.solve` returned it, `master_control` published it, and a
+constant asymmetric thruster pair is — physically — a constant-radius circle. Measured
+2026-09-04: 654 of 656 ticks carrying one bit-identical command for 32.7 s while the state
+changed continuously underneath it, and the boat orbited for the whole run. The latch was
+self-sustaining, because a circling boat never regains the small heading error that would let
+the QP solve again.
+
+There were two causes, and the second is the bigger one. The condensed QP grew to
+`nv = 60` variables when the simulation horizon doubled, against acados' default working-set
+budget of 50 — so a saturating solve failed by construction (`mpc_qp_iter_max`, §4 table).
+And `SQP_RTI` takes one Newton step per call from the previous iterate while `solve` re-seeds
+only stage 0, so **one** bad step poisoned every later solve: measured in Gazebo, the boat was
+tracking the circle at 0.05 m and 0.10 rad of error when a single tick commanded `[-20, -20]`
+and the QP then failed 3291 consecutive times.
+
+Now: a non-zero status triggers `solver.reset(reset_qp_solver_mem=1)`, a cold re-seed of every
+stage at the measured state with zero input, and **one retry**; only if that also fails does
+`solve` return **zeros**. It records `last_status`, `fail_count`, `total_failures`,
+`recoveries` and `last_solve_time`; the MPC branch of `timer_callback` commands zero thrust
+and logs `MPC solve FAILED` through `self.get_logger().error` at a 1 s throttle. Measured
+after: 3 isolated failures in 149 s of Gazebo, each self-clearing on the retry, 0.03 % of
+ticks at zero thrust against 93.7 % before. The recovery is failure handling, not a control
+law — none of it runs on the success path. Two further details are load-bearing. It is **not** an early return — falling through keeps
+`publish_thrust` and the monitoring append on the path, so `/thruster_input` never goes silent
+(§5) and the `.npy` keeps recording, which is the only reason this was diagnosable. And it
+goes through the **ROS logger**: the old diagnostic was a bare `print()`, which never reaches
+`/rosout`, and neither `Sim_launch.py` nor the simulator's `full_mission_launch.py` captures
+this node's stdout — so the failure left no trace anywhere an operator would look.
+`docs/controllers/check_mpc_solver.py` is the gate.
+
 **Reference generation.** Path following advances a **path parameter `tau`** governed by the
 boat's own progress (N8):
 
@@ -568,6 +745,9 @@ equivalence to the pre-rework point controller holds only at the matching `Delta
 **Which law runs where:**
 
 * **Manual target** — `solve_LoS`, for every `controller_type`. `PIDLoS` is not involved.
+  Once the target is reached the branch switches to **keep location** rather than stopping:
+  `manual_keep_location` holds the point against drift instead of latching to zero thrust
+  (§4.1).
 * **Path following** — `MPC` → `ur_mpc.MPCController.solve`; `PID` → `PIDLoS.compute` with
   `u_ff` and `psi_path` supplied from the path; `LoS` → `los_guidance`.
 * **Pinger** — `PID` → `PIDLoS.compute(state, target)` with `psi_path=None`, `u_ff=0`, robot
@@ -625,14 +805,16 @@ launch argument rather than an edit and a rebuild. Values are read once, at cons
 | group | parameters |
 |---|---|
 | Control loop | `control_dt` (0.05) |
+| Path service health | `path_request_timeout` (1.0 s — re-issue a request whose answer never came; without it one lost response wedged the node for the whole run), `path_stale_timeout` (1.0 s — beyond this the governor stops advancing `tau` against the held window). `path_generation` adds `allow_duplicate_server` (False) and `server_discovery_wait` (2.0 s) |
 | Governor | `path_speed_scale`, `gov_Lmin`, `gov_Lmax`, `gov_Emin`, `gov_Emax` |
 | LoS guidance | `los_lookahead` (2.5), `los_ku` (**20.0**), `los_kpsi` (10.0), `los_kd` (1.0), `los_speed_scale` (1.0) |
 | Station-keeping hold | `hold_speed` (0.05, the gate) and `hold_radius` (0.5), both shared by `PID` and `LoS`; `los_hold_kx` (1.0) and `los_hold_umax` (0.8), the LoS surge law only |
 | PID | `pid_lookahead` (2.5), `outer_gains_x`, `outer_gains_psi` (both `[3.0, 0.01, 0.0]`), `inner_gains_u` (`[1.0, 0, 0]`), `inner_gains_r` (`[1.5, 0, 0]`) |
-| MPC | **Split simulation/real, like the PID and point rows** — `mpc_horizon` (30 sim / 15 real), `mpc_time` (6.0 / 2.5), `mpc_R_diag` (0.10 / 0.015), `mpc_Q_diag` (50,50,30,1,1,1 both). The plant **model** is split too — `self.mpc_model`, not a declared parameter — with the simulation column fitted to `hydrodynamics.xacro` (added mass = the xacro values, damping = secant linearisations of its quadratic drag). `CONTROLLERS.md` §4.1 carries the measurements |
-| Point following | `point_k_v` / `point_k_psi` (2.0 / 60.0 in simulation, 0.15 / 10.0 on the real boat), `safety_distance` (−1.0, which disables the arrival check) |
+| MPC | **Split simulation/real, like the PID and point rows** — `mpc_horizon` (30 sim / 15 real), `mpc_time` (6.0 / 2.5), `mpc_R_diag` (0.10 / 0.015), `mpc_Q_diag` (50,50,30,1,1,1 both). The plant **model** is split too — `self.mpc_model`, not a declared parameter — with the simulation column fitted to `hydrodynamics.xacro` (added mass = the xacro values, damping = secant linearisations of its quadratic drag). `CONTROLLERS.md` §4.1 carries the measurements. Plus `mpc_qp_iter_max` (**0**, meaning "derive as `max(50, 4·nu·N)`" = 240 at N = 30, 120 at N = 15) — the qpOASES **working-set budget**, and not optional: `FULL_CONDENSING_QPOASES` is a dense active-set solver, so `nv = mpc_horizon · 2`, and acados' own default of 50 sits *below* the 60 variables of the simulation horizon. That made a saturating solve fail by construction, which is finding **C6** |
+| Point following | `point_k_v` / `point_k_psi` (2.0 / 60.0 in simulation, 0.15 / 10.0 on the real boat), `safety_distance` (−1.0, which disables the arrival check — **pinger branch only** since the manual branch got its own hold) |
+| Manual keep-location | `manual_hold_radius` (1.0 m, `<= 0` disables the whole hold), `manual_reacquire_radius` (2.0 m), `manual_hold_kx` (15.0 simulation / 8.0 real, **Newtons per metre**, not the m/s that `los_hold_kx` is), `manual_hold_umax` (defaults to `kx × (reacquire − hold)`, so retuning a radius cannot silently break the handover), `manual_brake_time` (1.0 s) |
 | Thrust | `thrust_limit` (20.0 N) — feeds the allocator clamp, the MPC input bounds **and, since 2026-08-31, `publish_thrust`'s own uniform saturation**. `robot_interface` and `simulation_interface` each declare a parameter of the same name and default (§5) |
-| Dead zone | `min_thrust` (2.0 N) — the propeller-breakaway floor on `solve_LoS`'s surge term. `0.0` disables it and restores the pre-2026-08-31 law exactly (§5) |
+| Dead zone | `min_thrust` (2.0 N) — the propeller-breakaway floor on `solve_LoS`'s surge term **and on the manual keep-location surge**. `0.0` disables both and restores the pre-2026-08-31 law exactly (§5) |
 
 ROS 2 has no dict or tuple parameter type, so gain triples and the MPC weight diagonals are
 declared as double arrays and reassembled in the node. `path_time` and `path_steps` stay
@@ -727,8 +909,10 @@ so the reference window and the solver's horizon cannot disagree.
   (range, bearing) grid points, and the floor never *lowers* the surge at any of them. The
   modified region is **0.61–3.27 m at |bearing| ≤ 69.5°, 5.7 % of the `d ≤ 12 m` plane**;
   everywhere else the output is bit-identical, and `min_thrust = 0.0` reproduces the original
-  law exactly. The manual-target branch never engages it at all (its own radius is 0.30 m,
-  inside the fade-in).
+  law exactly. The manual-target *pursuit* law never engages it (its own radius is 0.30 m,
+  inside the fade-in) — but since 2026-09-03 the manual **keep-location** surge carries its
+  own copy of the floor, written out separately because that one must not be coupled to
+  `hold_radius`. See the keep-location entry below.
 
   **What it does change, stated plainly.** Inside that region the floor raises `X` while
   holding `N`, so the commanded surge/yaw ratio rises and the turn radius grows — at
@@ -742,6 +926,35 @@ so the reference window and the solver's horizon cannot disagree.
   It settles at **~0.81 m**, not at `hold_radius`: the fade-in itself dips back under the 2 N
   breakaway around 0.8 m, so the boat parks there. That is the price of continuity over a hard
   step, and it is well inside the 2 m bar this work was measured against.
+- **A reached manual target is held, not abandoned (2026-09-03).** `solve_LoS` used to latch on
+  arrival — one second astern, then zero thrust for the rest of the run, cleared only by a new
+  target. Any current then carried the boat out of the survey area with the controller
+  commanding nothing, and on the real boat the latch never armed at all (`safety_distance` is
+  −1.0 there), so the point law hunted instead of settling. `manual_keep_location` replaces the
+  latch with a state re-evaluated every tick: inside `manual_hold_radius` the boat is on
+  station, beyond `manual_reacquire_radius` the pursuit law takes back over, and in between the
+  surge is proportional to the gap, capped, `max(0, cos(bearing))`-shaped and floored to
+  `min_thrust`. **The yaw channel is untouched**, so the differential — which way the boat turns
+  and how hard — is the law it always was; only the common-mode surge is replaced. The gains
+  are chosen so the hold meets the pursuit law at the handover rather than stepping there:
+  8.38 N against 8.00 N on the real boat, 15.42 against 15.00 in simulation.
+
+  Measured on the harness plant with an explicit 2 N per-side deadband, starting on station,
+  real gains, final distance after 400 s:
+
+  | current | keep-location | old latch | old real-boat pursuit |
+  |---|---|---|---|
+  | 0 N | 0.00 m | 0.00 m | 0.00 m |
+  | 2 N | 1.00 m | 27.2 m | 0.30 m |
+  | 8 N | 1.50 m | 108.7 m | 0.69 m |
+  | 12 N | 1.75 m | 163.0 m | 1.19 m |
+
+  The pursuit column parks tighter but is not an alternative: approaching from 5 m in calm
+  water it overshoots and runs away to 472 m on this model, the C8 failure mode, while the hold
+  settles at 0.22 m. The floor is what makes 1.00 m reachable — unfloored the proportional term
+  does not clear 2 N until 1.25 m, so the boat cannot reach the station it was told to hold.
+  `manual_hold_radius <= 0` disables the hold and restores the previous law bit-identically.
+  `check_manual_hold.py` is the gate.
 
   Two limits worth keeping in mind. The floor applies to the **common-mode surge**, not per
   side, so the inner thruster can still sit under 2 N — flooring per-side would alter the
@@ -765,12 +978,39 @@ so the reference window and the solver's horizon cannot disagree.
   `SYSID_MYGCS` / `MAV_GCS_SYSID` to the MAVROS sysid (1); `default` restores 74/73 and
   sysid 255. Which of the two sysid parameter names exists is resolved once at runtime by
   querying both. Every write is read back and verified before `param_ready` goes true.
-- Readiness handshakes survive DDS discovery races, but by two different mechanisms.
-  `robot_interface` re-publishes `/blueboat/controller_ready` on a 1 s timer. `param_set`
-  does **not** run a timer: `publish_state()` fires only when a request arrives or a
-  set/verify sequence finishes — what repeats is `robot_interface` **re-requesting** the mode
-  every second, which `param_set` handles idempotently. Editing either side means keeping
-  that pairing intact.
+- Readiness handshakes survive DDS discovery races. `robot_interface` re-publishes
+  `/blueboat/controller_ready` on a 1 s timer, and `robot_interface` **re-requests** the
+  mode every second until `param_set` confirms it, which `param_set` handles
+  idempotently. Editing either side means keeping that pairing intact.
+- **`param_set` never blocks forever, and always reports (2026-09-04).** It used to
+  set `busy` before its first MAVROS call and clear it *only* in a `call_async`
+  done-callback, with no timeout on any of the four calls — so a hung
+  `/mavros/param/pull` latched it permanently and every later request was dropped
+  with "Parameter sequence in progress" while `robot_interface` re-requested
+  forever. Observed in the field as an override that never locks. Three rules now
+  hold, and none may be removed:
+  1. **No state is cleared only by a callback.** A 0.5 s watchdog abandons any
+     sequence held longer than `param_sequence_timeout_s` (declared parameter,
+     default 20 s — a cold `ParamPull` walks the whole ArduPilot table over
+     MAVLink and is genuinely slow). It is a give-up bound, not an expected
+     duration.
+  2. **Every abandoned sequence is fenced off by a generation counter** (`_seq`,
+     checked first in each done-callback), so a future that completes after its
+     sequence was abandoned cannot write state belonging to the one that
+     replaced it.
+  3. **The node always reports.** `publish_state()` publishes `param_mode` even
+     before the first successful apply (as `''` = "alive, no mode locked"), and a
+     1 Hz heartbeat repeats it so a late subscriber need not wait for a
+     transition. Previously the topic was silent until the first success, which
+     is why `robot_interface` logged `current: ''`.
+  Failures schedule a bounded internal retry (`param_retry_limit` /
+  `param_retry_delay_s`) rather than stopping; the limit bounds self-driven
+  retries only, since an external request resets it.
+  **Downstream consequence, do not break it:** the heartbeat means a repeated
+  `param_mode` value is *not* evidence that a new command was acted on. The
+  Mission Control Station's safe-shutdown therefore requires a **transition** into
+  `default` (`BlueBoat-MCS/.claude/CLAUDE.md` N1). `robot_interface.mode_callback`
+  and `param_callback` are both edge-triggered for the same reason.
 
 ---
 

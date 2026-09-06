@@ -331,6 +331,60 @@ def fig_point():
     save(fig, "fig8_point_los.png")
 
 
+# ══ Fig 10 — manual-target keep-location ══════════════════════════════════════
+def fig_manual_hold():
+    VIO, RED, GRN = C["Point-LoS"], "#e34948", "#2e8b57"
+    forces = (0., 2., 4., 8., 12., 16.)
+
+    fig, (a, b) = plt.subplots(1, 2, figsize=(11, 4.6),
+                               gridspec_kw={"width_ratios": [1.1, 1.0]})
+
+    # a. distance from the target over time, at one representative current
+    for key, color, name in (("hold", VIO, "keep-location (now)"),
+                             ("latch", RED, "abandon on arrival (before)"),
+                             ("pursuit", GRN, "no arrival check (real boat before)")):
+        d = load(f"manual_{key}_8N")
+        a.plot(d["t"], d["d"], color=color, lw=1.6, label=name)
+    a.axhline(sim_hold_radius(), color=MUTED, lw=0.9, ls=(0, (4, 3)))
+    a.annotate("manual_hold_radius", (170, sim_hold_radius() * 1.04), fontsize=8.5,
+               color=MUTED, ha="left", va="bottom")
+    a.set_yscale("symlog", linthresh=2.0)
+    a.set_ylim(0, None)
+    a.set_xlabel("time  (s)"); a.set_ylabel("distance from the target  (m)")
+    a.set_title("a.  Holding against an 8 N current")
+    a.legend(loc="upper left", fontsize=8.5)
+    style(a)
+
+    # b. where it parks, as a function of the current
+    held = [load(f"manual_hold_{int(f)}N")["d"][-1] for f in forces]
+    latched = [load(f"manual_latch_{int(f)}N")["d"][-1] for f in forces]
+    b.plot(forces, held, "o-", color=VIO, lw=1.8, ms=5, label="keep-location")
+    b.plot(forces, latched, "s--", color=RED, lw=1.6, ms=5, label="abandon on arrival")
+    b.axhline(sim_reacquire_radius(), color=MUTED, lw=0.9, ls=(0, (4, 3)))
+    b.annotate("manual_reacquire_radius", (0.2, sim_reacquire_radius() * 1.12),
+               fontsize=8.5, color=MUTED, ha="left", va="bottom")
+    # symlog, not log: in still water both end at exactly 0 m, which a log axis
+    # cannot show at all -- and "they agree when nothing pushes" is the baseline
+    # the rest of the panel is read against.
+    b.set_yscale("symlog", linthresh=1.0)
+    b.set_ylim(0, None)
+    b.set_xlabel("steady current  (N)"); b.set_ylabel("distance after 400 s  (m)")
+    b.set_title("b.  Where the boat ends up")
+    b.legend(loc="lower right", fontsize=8.5)
+    style(b)
+    save(fig, "fig10_manual_hold.png")
+
+
+def sim_hold_radius():
+    import sim
+    return sim.MANUAL_HOLD_RADIUS
+
+
+def sim_reacquire_radius():
+    import sim
+    return sim.MANUAL_REACQUIRE_RADIUS
+
+
 # ══ Fig 9 — the governor ══════════════════════════════════════════════════════
 def fig_governor():
     slow, ok = load("gov_slow"), load("gov_ok")
@@ -378,4 +432,5 @@ if __name__ == "__main__":
     fig_lookahead()
     fig_surge()
     fig_point()
+    fig_manual_hold()
     fig_governor()

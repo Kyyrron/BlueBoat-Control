@@ -90,7 +90,13 @@ Both layouts, columns 1-19:
                               These two were historically swapped.
   actuation_state        (1)  whether that command could reach the water:
                                 0  motors disabled (enable_motors False) --
-                                   no PWM left the boat at all
+                                   no commanded thrust reached the water. Since
+                                   2026-09-04 robot_interface holds the RC
+                                   channels at neutral 1500/1500 in this state
+                                   rather than going silent, so that nothing
+                                   else can drive them; neutral is not thrust,
+                                   so the meaning of this value is unchanged and
+                                   no earlier CSV is reinterpreted
                                 1  enabled AND param_mode == 'override' --
                                    live, thrust reaching the motors
                                 2  enabled but not in override -- ArduPilot
@@ -133,7 +139,7 @@ read a CSV this system produces, and that predates this revision.
 """
 
 # Actuation-state encoding, for readers that would rather not hard-code ints.
-ACT_MOTORS_DISABLED = 0   # enable_motors False -- no PWM left the boat
+ACT_MOTORS_DISABLED = 0   # enable_motors False -- no thrust; channels held neutral
 ACT_LIVE = 1              # enabled and in override -- thrust reaching motors
 ACT_NOT_OVERRIDE = 2      # enabled, but ArduPilot is ignoring the RC override
 ACT_WATCHDOG = 3          # loss-of-reference watchdog forcing thrust to zero

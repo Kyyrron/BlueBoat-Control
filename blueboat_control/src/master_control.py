@@ -40,10 +40,11 @@
 #   1. WIRING                     __init__
 #   2. TUNING KNOBS               _declare_tuning_parameters   <-- gains live here
 #   3. THE CONTROL LOOP           timer_callback               <-- start reading here
-#   4. GUIDANCE                   path_progress_errors, advance_governor,
-#                                 los_guidance, solve_LoS
+#   4. GUIDANCE                   warn_if_multiple_path_servers, accept_path,
+#                                 path_progress_errors, advance_governor,
+#                                 los_guidance, solve_LoS, manual_keep_location
 #   5. CALLBACKS / HELPERS        odom_, pinger_, ready_, manual_target_,
-#                                 publish_thrust, get_time
+#                                 publish_thrust, save_monitoring, get_time
 #
 # Moved out of this file:
 #   inRobotFrame()  ->  _custom_libraries/frame_math.py   (pure geometry, ROS-free)
@@ -78,6 +79,7 @@ from blueboat_control import ROV
 from blueboat_interfaces.srv import RequestPath
 import custom_functions as cf
 import frame_math as fm         # pure world<->body geometry (ROS-free)
+import path_stamp as ps         # /path_request response tag (ROS-free)
 import thrust_limits as tl     # uniform thrust saturation (ROS-free)
 
 
@@ -131,13 +133,18 @@ class Controller(Node):
 
             while not self.client.wait_for_service(timeout_sec=1.0):
                 self.get_logger().info("Waiting for service...")
-            
+
+            self.warn_if_multiple_path_servers()
+
         self.future = None # Used for client requests
 
         self.time_set = False
         self.initial_time = None
         # self.dt is set by _declare_tuning_parameters (20 Hz default, was 1.0 Hz)
         self.timer = self.create_timer(self.dt, self.timer_callback)
+        # The controller log is written here, off the control tick, and a
+        # final write happens on shutdown so nothing recorded is lost.
+        self.log_timer = self.create_timer(2.0, self.save_monitoring)
 
         self.current_pose = None
         self.current_twist = None
@@ -148,6 +155,15 @@ class Controller(Node):
 
         # Initialize controller 
         self.controller_path = Path()
+
+        # /path_request response validation. The response is a bare
+        # nav_msgs/Path with nothing saying which request it answers, so these
+        # carry the question the answer has to match.
+        self.tau_requested = None       # parameter the in-flight request asked for
+        self.request_sent = None        # when it went out, for the timeout
+        self.path_rx_time = None        # when the held window last arrived
+        self.path_stamps_are_parameters = None   # None = not yet established
+        self.foreign_path_count = 0
 
         # ---- Path-parameter governor state ----------------------------------
         # tau is the path parameter of the virtual target (same units as the
@@ -212,9 +228,26 @@ class Controller(Node):
         self.stopping_sequence = False # Used as a safety to stop LoS control when it gets close to target
         self.stopping_time = None
 
+        # Manual-target keep-location state. Deliberately SEPARATE from
+        # stopping_sequence: that flag stays the pinger branch's, so the two
+        # point-following modes can no longer mute one another.
+        #   manual_hold        - True while holding station on a reached target
+        #   manual_brake_t0    - when the arrival reverse pulse started
+        #   manual_hold_target - the target the state above refers to, so a
+        #                        repeat of the same target does not re-arm the
+        #                        pulse while a genuinely new one does
+        self.manual_hold = False
+        self.manual_brake_t0 = None
+        self.manual_hold_target = None
+
         # Initialize monitoring values
+        # Monitoring rows. The header goes in as strings, which is what makes
+        # np.save coerce the whole array to <U32 on write -- unchanged, because
+        # every existing log and replay.py read that schema (CM-7). What did
+        # change is WHEN: see save_monitoring().
         self.monitoring = []
         self.monitoring.append(['t','x','y','psi','x_d','y_d','psi_d','u1','u2'])
+        self.monitoring_saved_rows = 0
 
         self.t_record = self.get_time()
 
@@ -305,7 +338,9 @@ class Controller(Node):
                                                 Q_weight = self.Q_weight,
                                                 R_weight = self.R_weight,
                                                 input_bounds = self.input_bounds,
-                                                build_dir = build_dir
+                                                build_dir = build_dir,
+                                                qp_solver_iter_max = self.mpc_qp_iter_max,
+                                                logger = self.get_logger().warning
                                                 )
             except Exception as e:
                 self.get_logger().fatal(
@@ -435,8 +470,62 @@ class Controller(Node):
         # Simulation and the real boat have always used different values here.
         self.k_v   = dbl('point_k_v',   2.0  if self.isSimulation else 0.15)
         self.k_psi = dbl('point_k_psi', 60.0 if self.isSimulation else 10.0)
-        # Negative disables the arrival check.
+        # Negative disables the arrival check. Since the manual-target branch
+        # got its own keep-location hold below, this governs the PINGER branch
+        # only, which is why its defaults are untouched.
         self.safety_distance = dbl('safety_distance', 1.0 if self.isSimulation else -1.0)
+
+        # -- manual-target keep-location hold --------------------------------
+        # A reached manual target is a station to hold, not a place to stop.
+        # The old behaviour was a one-shot latch: arrive, reverse for a second,
+        # then command zero for the rest of the run. In any current that is a
+        # boat sitting at zero thrust being pushed out of the survey area, and
+        # on the real boat the latch never even armed (safety_distance = -1.0),
+        # so the point law hunted around the target instead of settling.
+        #
+        # This replaces the latch with a state that is re-evaluated every tick:
+        #
+        #   d <= manual_hold_radius      -> on station, hold
+        #   d >  manual_reacquire_radius -> blown off station, resume pursuit
+        #
+        # and inside the hold the surge is proportional to the range outside
+        # manual_hold_radius rather than zero, so the law never stops answering
+        # a disturbance. It is the same shape as los_guidance's zero-authored-
+        # speed hold (steer at the point, surge proportional to the gap, capped,
+        # never reverse, cos-shaped) - but the gains cannot be shared with it.
+        # los_hold_kx / los_hold_umax are VELOCITIES fed through los_ku and the
+        # allocator; solve_LoS writes its surge straight onto the wire as if it
+        # were Newtons, so the two live in different units.
+        #
+        # The gains are set so the hold meets the pursuit law at the handover
+        # rather than stepping there. At d = manual_reacquire_radius the pursuit
+        # surge is 8.38 (real) and 15.42 (simulation), so a gain of 8.0 / 15.0
+        # per metre of gap arrives within half a Newton:
+        #
+        #     d      pursuit real   hold real   pursuit sim   hold sim
+        #     1.00        5.30         0.00        13.10         0.00
+        #     1.25        6.20         2.00        13.88         3.75
+        #     1.50        7.00         4.00        14.50         7.50
+        #     2.00        8.38         8.00        15.42        15.00
+        #
+        # The 2.00 N row is also the ESC breakaway: below it the propellers do
+        # not turn, so the effective station-keeping box is manual_hold_radius
+        # plus about 0.25 m on the real boat. That is deliberate - flooring the
+        # hold surge the way the pursuit law is floored would push the boat
+        # around inside its own deadband instead of letting it sit.
+        # manual_hold_radius <= 0.0 disables the hold entirely and restores the
+        # pre-2026-09-03 behaviour of the manual branch exactly.
+        self.manual_hold_radius      = dbl('manual_hold_radius', 1.0)
+        self.manual_reacquire_radius = dbl('manual_reacquire_radius', 2.0)
+        self.manual_hold_kx   = dbl('manual_hold_kx', 15.0 if self.isSimulation else 8.0)
+        # Derived by default rather than declared independently, so retuning a
+        # radius cannot silently break the handover the gains were chosen for.
+        self.manual_hold_umax = dbl(
+            'manual_hold_umax',
+            self.manual_hold_kx * max(0.0, self.manual_reacquire_radius
+                                           - self.manual_hold_radius))
+        # Seconds of reverse on each fresh arrival, to kill the way on.
+        self.manual_brake_time = dbl('manual_brake_time', 1.0)
 
         # -- MPC -------------------------------------------------------------
         # Simulation and the real boat get different values here, for the same
@@ -525,6 +614,28 @@ class Controller(Node):
         self.R_weight = np.diag(arr('mpc_R_diag', [0.10, 0.10] if self.isSimulation
                                                   else [0.015, 0.015]))
 
+        # THE QP WORKING-SET BUDGET. FULL_CONDENSING_QPOASES is a dense
+        # ACTIVE-SET solver, so the condensed QP carries nv = mpc_horizon * 2
+        # variables -- 60 in simulation since the horizon doubled on
+        # 2026-09-01, 30 on the real boat -- and reaching a vertex where most
+        # of those bounds are active costs about one working-set change each.
+        # acados defaults the budget to 50, i.e. BELOW nv at horizon 30, so a
+        # saturating solve failed by construction and acados returned status 4
+        # with the primal iterate untouched. That stale iterate was then
+        # published as a command: a constant asymmetric thruster pair, which is
+        # a constant-radius circle. CONTROLLERS.md C6 carries the forensics.
+        #
+        # 0 (the default) means "derive it from the horizon" in
+        # ur_mpc.MPCController, so the arithmetic lives in exactly one place:
+        # max(50, 4 * nu * N) = 240 at N = 30, 120 at N = 15. Set a positive
+        # value to pin it.
+        #
+        # This is a solver option, so it is inside the hash acados compares for
+        # code reuse: the first launch after changing it regenerates and
+        # rebuilds once (about a minute) and says so in the log. No cache
+        # directory needs deleting.
+        self.mpc_qp_iter_max = integer('mpc_qp_iter_max', 0)
+
         # -- thrust limits, shared by every branch ---------------------------
         # One symmetric scalar feeds both the allocator clamp and the MPC input
         # bounds, so the two cannot drift apart.
@@ -546,6 +657,16 @@ class Controller(Node):
         # other law is inside 1.4 m and needs no floor; see CLAUDE.md section 5.
         # 0.0 disables the floor and restores the pre-2026-08-31 law exactly.
         self.min_thrust = dbl('min_thrust', 2.0)
+
+        # -- /path_request health --------------------------------------------
+        # path_request_timeout: give up on a pending request and re-issue.
+        #   Without it a single lost response wedges the node permanently.
+        # path_stale_timeout: beyond this the held window is not a reference any
+        #   more, so the governor stops advancing tau against it. Both are
+        #   generous multiples of the 20 Hz tick - this is a wedge detector, not
+        #   a jitter detector.
+        self.path_request_timeout = dbl('path_request_timeout', 1.0)
+        self.path_stale_timeout   = dbl('path_stale_timeout', 1.0)
 
     # ======================================================================
     #  3. THE CONTROL LOOP
@@ -593,20 +714,50 @@ class Controller(Node):
             if self.future is not None and self.future.done():
                 try:
                     result = self.future.result()
-                    if result is not None:
-                        self.controller_path = result.path
-                    else:
+                    if result is None:
                         self.get_logger().error("Service returned None.")
+                    elif self.accept_path(result.path):
+                        self.controller_path = result.path
+                        self.path_rx_time = current_time
                 except Exception as e:
                     self.get_logger().error(f"Service call raised exception: {e}")
                 finally:
                     self.future = None
+                    self.request_sent = None
+
+            elif (self.future is not None and self.request_sent is not None
+                    and current_time - self.request_sent > self.path_request_timeout):
+                # A response that never arrives must not wedge the node. Without
+                # this the future stays pending forever, no further request is
+                # ever issued, and the reference window is frozen for the rest
+                # of the run with nothing reported. path_publisher has always
+                # had this guard; this node did not.
+                self.get_logger().warning(
+                    f"No answer to /path_request within {self.path_request_timeout:.1f} s "
+                    "- retrying.", throttle_duration_sec=5.0)
+                self.future = None
+                self.request_sent = None
 
             # Advance the governor using the boat's progress along the current
             # window (frozen while a manual target overrides path following).
+            #
+            # Gated on the window being FRESH. Advancing against a stale window
+            # is open loop: once the boat reaches that frozen target e_along
+            # falls below gov_Lmin, the along-track factor unclips to 1.0, and
+            # tau integrates at full rate with no feedback at all -- exactly the
+            # wall-clock reference N8 says was removed, re-entered through the
+            # back door. Holding tau instead means the boat keeps station on the
+            # last good target until the path server answers again.
+            window_age = current_time - self.path_rx_time if self.path_rx_time is not None else None
+            window_fresh = window_age is not None and window_age <= self.path_stale_timeout
             if self.controller_path.poses and not manual_active:
-                e_along, e_y, _, _ = self.path_progress_errors(self.controller_path, current_state)
-                self.advance_governor(e_along, e_y)
+                if window_fresh:
+                    e_along, e_y, _, _ = self.path_progress_errors(self.controller_path, current_state)
+                    self.advance_governor(e_along, e_y)
+                else:
+                    self.get_logger().warning(
+                        f"Path window stale ({window_age:.2f} s) - holding tau at "
+                        f"{self.tau:.2f}.", throttle_duration_sec=5.0)
 
             # Issue the next request at the (governed) parameter tau
             if self.future is None:
@@ -614,6 +765,11 @@ class Controller(Node):
                 request.path_request.data = np.linspace(self.tau,
                                                          self.tau + self.path_time,
                                                          int(self.path_steps), dtype=float)
+                # Remember what we asked for: the response is a bare Path and
+                # says nothing about which request it answers, so this is the
+                # only thing accept_path() can check it against.
+                self.tau_requested = float(np.float32(self.tau))
+                self.request_sent = current_time
                 self.future = self.client.call_async(request)
             # else: previous request still pending - keep controlling on the last path
 
@@ -634,6 +790,39 @@ class Controller(Node):
 
             if self.controller_type == 'MPC':
                 u = self.controller.solve(path=self.controller_path, x_current=current_state)
+
+                # A FAILED SOLVE IS NOT A COMMAND (C6). ur_mpc.solve already
+                # returns zeros rather than the stale acados iterate; this is
+                # where it is REPORTED, and it has to be reported through the
+                # ROS logger. The old diagnostic was a bare print(), which never
+                # reaches /rosout -- and neither Sim_launch.py nor the
+                # simulator's full_mission_launch.py captures this node's
+                # stdout, so the failure that drove the boat in circles for
+                # 33 s left no trace anywhere an operator would look.
+                #
+                # Deliberately NOT an early return: falling through keeps
+                # publish_thrust and the monitoring append on the path, so
+                # /thruster_input stays alive (CLAUDE.md section 5) and the .npy
+                # keeps recording -- which is what made this diagnosable at all.
+                if self.controller.last_status != 0:
+                    u = [0.0, 0.0]
+                    self.get_logger().error(
+                        f"MPC solve FAILED (acados status "
+                        f"{self.controller.last_status}, "
+                        f"{self.controller.fail_count} consecutive, "
+                        f"{self.controller.total_failures} total) - commanding "
+                        "ZERO thrust. The boat will drift. See CONTROLLERS.md C6.",
+                        throttle_duration_sec=1.0)
+                elif self.controller.last_solve_time > 0.5 * self.dt:
+                    # The 20 Hz budget has never been measured on the boat's
+                    # companion computer (TODO.md section 2), and doubling the
+                    # horizon is precisely the change that would break it. This
+                    # makes it visible from /rosout without a field harness (N7).
+                    self.get_logger().warning(
+                        f"MPC solve took "
+                        f"{self.controller.last_solve_time * 1e3:.1f} ms of the "
+                        f"{self.dt * 1e3:.0f} ms tick.", throttle_duration_sec=5.0)
+
                 # Desired state for monitoring (first pose of the reference path)
                 desired_pose = self.controller_path.poses[0].pose
                 q = desired_pose.orientation
@@ -752,9 +941,9 @@ class Controller(Node):
             publisher_msg.data = [float(v) for v in data_array]
             self.data_publisher.publish(publisher_msg)
 
-            if (current_time - self.t_record) > 0.1: # Update the saved file at set interval
-                self.t_record = current_time
-                np.save(self.title, self.monitoring)
+            # NOT saved from here any more -- see save_monitoring(), on its own
+            # timer. Writing the whole log from the control tick cost the loop
+            # its rate: measured on a 3 h mission, 20 Hz had decayed to 5-8 Hz.
 
     # ======================================================================
     #  4. GUIDANCE
@@ -764,6 +953,131 @@ class Controller(Node):
     # ------------------------------------------------------------------ #
     #  Path parameter governor                                           #
     # ------------------------------------------------------------------ #
+    def warn_if_multiple_path_servers(self):
+        """
+        Say so, loudly, if more than one node offers /path_request.
+
+        This node cannot refuse to run -- it is the controller -- but the
+        operator needs to know, because with two servers every request is
+        answered by whichever replies first and the reference alternates
+        between two unrelated trajectories. path_generation refuses to be the
+        second server; this covers the case where one was already up before
+        that guard existed, or was started with allow_duplicate_server.
+        """
+        try:
+            servers = []
+            for name, namespace in self.get_node_names_and_namespaces():
+                try:
+                    services = self.get_service_names_and_types_by_node(name, namespace)
+                except Exception:
+                    continue
+                if any(service == '/path_request' for service, _ in services):
+                    servers.append(f"{namespace.rstrip('/')}/{name}")
+        except Exception:
+            return                      # graph query is a diagnostic, never fatal
+
+        if len(servers) > 1:
+            self.get_logger().error(
+                "MORE THAN ONE /path_request SERVER: " + ", ".join(servers) + ". "
+                "Requests will be answered by whichever replies first, so the "
+                "reference will alternate between different trajectories and "
+                "the boat will not follow any of them. Shut the other mission "
+                "down. Responses that do not answer this node's own request "
+                "are rejected, but the path will still stall while they are.")
+
+    def accept_path(self, path):
+        """
+        Is this response an answer to OUR request?
+
+        ROS 2 does not stop a second node offering /path_request, and when two
+        do, every request is answered by whichever server replies first. The
+        response is a bare nav_msgs/Path -- no echo of the request, no server
+        identity -- so without a check the controller simply believes whatever
+        arrives. Measured on this system with two missions up: the reference
+        alternated tick by tick between two entirely different trajectories,
+        both sampled at this node's own single tau, and the boat could follow
+        neither. path_generation now refuses to be the second server; this is
+        the other half, so a controller is never at the mercy of that.
+
+        Two tests, cheapest first:
+
+          length   the window must have as many poses as we asked for.
+          tag      poses[0] must be stamped with the parameter we requested.
+                   path_generation stamps each pose with the parameter it was
+                   evaluated at (path_stamp.encode) precisely so this works
+                   without changing RequestPath (N1/CM-1).
+
+        A boat running a path_generation built before 2026-09-03 stamps the wall
+        clock instead. Failing every response there would leave the controller
+        with no path at all, which is worse than the fault being guarded, so
+        that case is detected once, reported loudly, and falls back to geometry:
+        reject a window whose first pose is further from the last accepted one
+        than tau could possibly have moved in the meantime.
+
+        Rejection keeps the last good window. The staleness gate in
+        timer_callback is what stops the boat driving on it indefinitely.
+        """
+        poses = path.poses
+        if not poses:
+            self.get_logger().warning("Empty path from /path_request - ignored.",
+                                      throttle_duration_sec=5.0)
+            return False
+
+        if len(poses) != int(self.path_steps):
+            self.get_logger().warning(
+                f"/path_request answered with {len(poses)} poses, asked for "
+                f"{int(self.path_steps)} - ignored (another path server?).",
+                throttle_duration_sec=5.0)
+            self.foreign_path_count += 1
+            return False
+
+        stamp = poses[0].header.stamp
+
+        # Establish once whether this server tags its poses at all.
+        if self.path_stamps_are_parameters is None:
+            self.path_stamps_are_parameters = ps.is_parameter(stamp.sec, stamp.nanosec)
+            if not self.path_stamps_are_parameters:
+                self.get_logger().error(
+                    "The path server stamps poses with the clock, not the path "
+                    "parameter: it predates the /path_request response tag. "
+                    "Rebuild and reinstall blueboat_control on this machine. "
+                    "Falling back to a geometric plausibility check, which "
+                    "cannot reliably detect a second path server.")
+
+        if self.path_stamps_are_parameters:
+            if self.tau_requested is None:
+                return True          # nothing to compare against yet
+            if not ps.matches(stamp.sec, stamp.nanosec, self.tau_requested):
+                self.foreign_path_count += 1
+                self.get_logger().warning(
+                    f"/path_request answered for parameter "
+                    f"{ps.decode(stamp.sec, stamp.nanosec):.3f}, asked for "
+                    f"{self.tau_requested:.3f} - ignored. Another path server "
+                    f"is running ({self.foreign_path_count} so far); shut the "
+                    "other mission down.", throttle_duration_sec=5.0)
+                return False
+            return True
+
+        # --- fallback: geometry -------------------------------------------
+        if not self.controller_path.poses or self.path_rx_time is None:
+            return True              # nothing to compare against yet
+        previous = self.controller_path.poses[0].pose.position
+        current = poses[0].pose.position
+        moved = math.hypot(current.x - previous.x, current.y - previous.y)
+        # tau advances at most path_speed_scale per second, and the path itself
+        # runs at some authored speed; allow a generous multiple of the window
+        # before calling a jump impossible.
+        allowed = max(2.0, 4.0 * self.path_time * max(1.0, self.path_speed_scale)
+                      + self.los_hold_umax)
+        if moved > allowed:
+            self.foreign_path_count += 1
+            self.get_logger().warning(
+                f"/path_request window jumped {moved:.1f} m in one step (limit "
+                f"{allowed:.1f} m) - ignored. Another path server is running "
+                f"({self.foreign_path_count} so far).", throttle_duration_sec=5.0)
+            return False
+        return True
+
     def path_progress_errors(self, path, state):
         """
         From the current path window (poses[0] = virtual target at tau,
@@ -883,12 +1197,14 @@ class Controller(Node):
         # Unchanged from the working version.
         x,y,z = target
 
-        yaw_rate = self.k_psi * np.arctan2(y,x)
+        bearing = np.arctan2(y, x)
+        yaw_rate = self.k_psi * bearing
         d = np.sqrt(x**2+y**2)
         v = self.k_v * d
         v = 5*np.log(v+1)
 
-        if list(self.manual_target) != [0.0,0.0]:
+        manual = list(self.manual_target) != [0.0,0.0]
+        if manual:
             v = 10*np.log(v+1) if not self.isSimulation else 7*np.log(v+1)  # If manual target, go faster. Don't need to be that precise here.
 
         # Propeller breakaway. v is the common-mode surge force this law puts on
@@ -924,9 +1240,21 @@ class Controller(Node):
         # whole block and restores the original law exactly.
         if self.min_thrust > 0.0 and self.hold_radius > 0.0:
             g = min(1.0, max(0.0, (d - self.hold_radius) / self.hold_radius))
-            breakaway = self.min_thrust * g * max(0.0, np.cos(np.arctan2(y, x)))
+            breakaway = self.min_thrust * g * max(0.0, np.cos(bearing))
             if 0.0 < v < breakaway:
                 v = breakaway
+
+        # A MANUAL target is a station to hold, not a place to stop: once
+        # reached it is held against drift rather than abandoned at zero thrust.
+        # Everything below this block therefore belongs to the PINGER branch
+        # alone and is bit-identical to what it was -- safety_distance and
+        # stopping_sequence are not consulted for a manual target at all.
+        if manual:
+            held = self.manual_keep_location(d, bearing, yaw_rate, current_time)
+            if held is not None:
+                return held
+            # Off station: the plain pursuit law, ungated.
+            return [v + 0.295 * yaw_rate, v - 0.295 * yaw_rate]
 
         thruster_input = [0,0]
 
@@ -948,6 +1276,108 @@ class Controller(Node):
                 thruster_input = [0.,0.]
 
         return thruster_input
+
+    def manual_keep_location(self, d, bearing, yaw_rate, current_time):
+        """
+        Hold station on a REACHED manual target.
+
+        Returns the thruster pair while holding, or None when the boat is off
+        station and the caller should run the plain pursuit law instead.
+
+        Why this exists. solve_LoS used to latch on arrival: one second astern,
+        then zero thrust for the rest of the run, cleared only by a new target.
+        With any current that is a boat commanding nothing while it is pushed
+        out of the survey area -- and on the real boat the latch never armed at
+        all (safety_distance = -1.0), so the point law hunted around the target
+        instead of settling. Neither is station keeping.
+
+        The state below is therefore re-evaluated every tick, never latched:
+
+            not holding, d <= manual_hold_radius       -> hold
+            holding,     d >  manual_reacquire_radius  -> resume pursuit
+
+        The two radii are deliberately different. A single threshold with
+        position noise sitting on it toggles the mode every few ticks; the gap
+        between them is the hysteresis that stops that.
+
+        The hold itself is CONTINUOUS, not an on/off deadband: surge is
+        proportional to the range outside manual_hold_radius and capped, so the
+        law always has an answer to a disturbance and never falls silent. It is
+        the same shape as los_guidance's zero-authored-speed hold -- steer at
+        the point, surge proportional to the gap, capped, never reverse, inside
+        the same max(0, cos) shaping -- but its gains are its own, because
+        los_hold_kx / los_hold_umax are velocities fed through los_ku and the
+        allocator while this law writes its surge straight onto the wire.
+
+        Two things it does NOT do, both on purpose:
+
+          * The yaw channel is untouched. The differential is the caller's
+            +/- 0.295*yaw_rate exactly as before, so which way the boat turns
+            and how hard is the same law it always was; only the common-mode
+            surge is replaced.
+          * The surge is not floored to min_thrust. The pursuit law is floored
+            because a command under 2 N sits in the ESC deadband and moves
+            nothing while the log shows thrust; here that band IS the wanted
+            behaviour -- it is what lets the boat sit still on station. The
+            price is an effective hold box of manual_hold_radius plus about
+            0.25 m on the real boat, where the proportional term first clears
+            breakaway.
+
+        max(0, cos(bearing)) matters for the same reason it matters in the
+        floor: forward surge closes the range by cos(bearing) only, so pushing
+        while the target is abeam or behind drives the boat away from the point
+        it is trying to hold. The yaw channel turns it round first.
+        """
+        if self.manual_hold_radius <= 0.0:
+            return None          # hold disabled: the pursuit law, as it was
+
+        # --- state, re-evaluated every tick ---------------------------------
+        if not self.manual_hold:
+            if d <= self.manual_hold_radius:
+                self.manual_hold = True
+                self.manual_brake_t0 = current_time
+                self.get_logger().info(
+                    f"Manual target reached at {d:.2f} m - holding location "
+                    f"(re-acquiring beyond {self.manual_reacquire_radius:.2f} m)")
+        elif d > self.manual_reacquire_radius:
+            self.manual_hold = False
+            self.manual_brake_t0 = None
+            self.get_logger().info(
+                f"Pushed {d:.2f} m off the manual target - re-acquiring it")
+
+        if not self.manual_hold:
+            return None
+
+        # --- arrival brake: the original one-second astern pulse ------------
+        if (self.manual_brake_t0 is not None
+                and current_time - self.manual_brake_t0 < self.manual_brake_time):
+            return [-1., -1.]
+
+        # --- continuous proportional hold -----------------------------------
+        gap = max(0.0, d - self.manual_hold_radius)
+        v_hold = min(self.manual_hold_umax, self.manual_hold_kx * gap)
+        v_hold *= max(0.0, np.cos(bearing))
+
+        # Same breakaway floor the pursuit law gets, and for the same reason:
+        # the proportional term does not clear 2 N until the boat is already
+        # 0.25 m outside the radius it was told to hold (0.13 m in simulation),
+        # so unfloored the commanded station is one the hardware cannot reach.
+        # Measured on the harness plant with an explicit 2 N per-side deadband:
+        # floored the boat parks at 1.00 m, unfloored at 1.25 m.
+        #
+        # The floor is written out here rather than reusing the block above,
+        # which is keyed to hold_radius -- a parameter shared with los_guidance
+        # and the PID branch that this must not couple to. It cannot lift a zero
+        # command (the guard is 0.0 < v_hold), so "no surge inside the radius"
+        # survives it, and it is exactly the step that makes the station
+        # attainable: the cost is that the thrusters pulse at a few hertz while
+        # holding against a current. That is deliberate and is documented.
+        if self.min_thrust > 0.0:
+            floor = self.min_thrust * max(0.0, np.cos(bearing))
+            if 0.0 < v_hold < floor:
+                v_hold = floor
+
+        return [v_hold + 0.295 * yaw_rate, v_hold - 0.295 * yaw_rate]
 
     # ======================================================================
     #  5. CALLBACKS AND SMALL HELPERS
@@ -973,6 +1403,17 @@ class Controller(Node):
     def manual_target_callback(self, msg: Float32MultiArray):
         self.manual_target = msg.data # [x,y] in world frame
         self.stopping_sequence = False
+
+        # Reset the keep-location state only when the target actually MOVES.
+        # Re-publishing the same coordinates must not re-arm the arrival brake
+        # on a boat that is already holding station on them; a genuinely new
+        # target must. The [0, 0] resume sentinel differs from any real target,
+        # so it clears the hold on its way past.
+        target = [round(float(value), 6) for value in list(self.manual_target)[:2]]
+        if target != self.manual_hold_target:
+            self.manual_hold_target = target
+            self.manual_hold = False
+            self.manual_brake_t0 = None
 
     # inRobotFrame() moved to _custom_libraries/frame_math.py -- it used no
     # node state at all, so it is pure geometry and now unit-testable without
@@ -1015,6 +1456,32 @@ class Controller(Node):
         # right_thr_in/left_thr_in, which is read straight off /thruster_input.
         return limited
 
+    def save_monitoring(self):
+        """
+        Write the controller log.
+
+        On its own timer, not in the control tick. np.save rewrites the whole
+        file every call -- there is no append for .npy -- and because row 0 is
+        a header of strings the entire array is re-coerced to <U32 each time.
+        Done at 10 Hz from timer_callback that is O(n) work per tick against a
+        list that grows every tick: measured on a 3 h run, the control loop had
+        decayed from its 0.05 s tick to 0.13-0.20 s, and the decay is unbounded.
+
+        Two changes, and neither touches the file's contents: the write happens
+        on a slower timer of its own, and it is skipped entirely when no new row
+        has arrived. The on-disk schema is byte-identical, so existing logs,
+        replay.py and every analysis script are unaffected (CM-7).
+        """
+        rows = len(self.monitoring)
+        if rows == self.monitoring_saved_rows:
+            return                      # nothing new since the last write
+        try:
+            np.save(self.title, self.monitoring)
+            self.monitoring_saved_rows = rows
+        except Exception as exc:
+            self.get_logger().error(f"Could not write {self.title}.npy: {exc}",
+                                    throttle_duration_sec=10.0)
+
     def get_time(self):
         s,ns = self.get_clock().now().seconds_nanoseconds()
         return s + ns*1e-9
@@ -1022,6 +1489,17 @@ class Controller(Node):
 
 rclpy.init()
 node = Controller()
-rclpy.spin(node)
-node.destroy_node()
-rclpy.shutdown()
+try:
+    rclpy.spin(node)
+except KeyboardInterrupt:
+    pass
+finally:
+    # The log is written on a timer now, so a run cut short here could otherwise
+    # lose its last couple of seconds. Flush before going away (CM-7).
+    try:
+        node.save_monitoring()
+    except Exception:
+        pass
+    node.destroy_node()
+    with contextlib.suppress(Exception):
+        rclpy.shutdown()

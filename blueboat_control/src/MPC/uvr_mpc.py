@@ -149,7 +149,9 @@ class MPCController:
         time=2.0,
         Q_weight=None, 
         R_weight=None, 
-        input_bounds=None):
+        input_bounds=None,
+        qp_solver_iter_max=None,
+        logger=None):
 
         self.mass = robot_mass
         self.iz = iz
@@ -161,10 +163,57 @@ class MPCController:
         self.R = R_weight
         self.input_bounds = input_bounds 
 
+        # Same working-set budget reasoning as ur_mpc.py -- see the block above
+        # ocp.solver_options in _build_ocp there. Three thrusters, so the
+        # condensed QP is 3*N variables rather than 2*N.
+        self.nu = 3
+        self.qp_solver_iter_max = self._resolve_qp_iter_max(qp_solver_iter_max)
+
+        # ROS-free by construction: a plain callable, defaulting to print.
+        self._log = logger if callable(logger) else print
+
+        self.last_status = 0
+        self.fail_count = 0
+        self.total_failures = 0
+        self.last_solve_time = 0.0
+        self.recoveries = 0
+
         self.model = export_underwater_model(self.mass, self.iz, a_u, a_v, a_r, d_u, d_v, d_r)
         self.ocp = self._build_ocp()
         self.solver = AcadosOcpSolver(self.ocp, json_file='acados_ocp.json')
     
+    def _resolve_qp_iter_max(self, requested):
+        """Working-set budget for the QP. None or <= 0 derives it from N."""
+        if requested is not None and int(requested) > 0:
+            return int(requested)
+        return max(50, 4 * self.nu * self.N)
+
+    def _apply_reference(self, x_refs, x_current):
+        """Pin stage 0 to the measured state and load the stage references."""
+        self.solver.set(0, 'x', x_current)
+        self.solver.set(0, 'lbx', x_current)
+        self.solver.set(0, 'ubx', x_current)
+
+        u_refs = np.zeros((self.N, self.nu))
+        for i in range(self.N):
+            self.solver.set(i, 'yref', np.concatenate((x_refs[i], u_refs[i])))
+        self.solver.set(self.N, 'yref', np.array(x_refs[-1]))
+
+    def _seed_all_stages(self, x_current):
+        """Cold, feasible seed after a reset: hold the state, command nothing."""
+        zero_u = np.zeros(self.nu)
+        for i in range(self.N + 1):
+            self.solver.set(i, 'x', x_current)
+        for i in range(self.N):
+            self.solver.set(i, 'u', zero_u)
+
+    def _stat(self, field):
+        """solver.get_stats(field), or None. Never raises."""
+        try:
+            return self.solver.get_stats(field)
+        except Exception:
+            return None
+
     def _build_ocp(self):
         model = self.model
         ocp = AcadosOcp()
@@ -200,6 +249,7 @@ class MPCController:
         ocp.solver_options.hessian_approx = 'GAUSS_NEWTON'
         ocp.solver_options.integrator_type = 'ERK'
         ocp.solver_options.nlp_solver_type = 'SQP_RTI'
+        ocp.solver_options.qp_solver_iter_max = self.qp_solver_iter_max
         ocp.solver_options.tf = self.T
 
         return ocp
@@ -235,6 +285,14 @@ class MPCController:
                 u = math.hypot(dx, dy) / self.dt
 
                 psi_prev = get_yaw_from_quaternion(prev_pose.orientation)
+                # C2 IS UNFIXED HERE. This is the pairwise unwrap that ur_mpc.py
+                # replaced on 2026-08-31: psi_prev is re-read from the pose and
+                # therefore freshly wrapped every iteration, so the unwrap never
+                # accumulates and a window straddling +/-pi carries a 2*pi cliff
+                # INSIDE the horizon. See ur_mpc.solve and CONTROLLERS.md C2 for
+                # the accumulating version. Deliberately not fixed in the same
+                # change as C6; this node is launched by nothing (CLAUDE.md 2.1)
+                # and TODO.md carries the item.
                 psi = np.unwrap([psi_prev,psi])[-1]
 
                 psi_mid = (psi + psi_prev) / 2.0
@@ -253,21 +311,40 @@ class MPCController:
             # if i < self.N:
             #     u_refs.append([0.0, 0.0])
 
-        self.solver.set(0, 'x', x_current)
-        self.solver.set(0, 'lbx', x_current)
-        self.solver.set(0, 'ubx', x_current)
-
         x_refs = np.array(x_refs)  # shape (N+1, nx)
-        u_refs = np.zeros((self.N, 3))  # N x nu
 
-        for i in range(self.N):
-            yref = np.concatenate((x_refs[i], u_refs[i]))
-            self.solver.set(i, 'yref', yref)
-        self.solver.set(self.N, 'yref', np.array(x_refs[-1]))
-
+        self._apply_reference(x_refs, x_current)
         status = self.solver.solve()
-        if status != 0:
-            print(f"ACADOS solver failed with status {status}")
+        self.last_solve_time = self._stat('time_tot') or 0.0
 
-        U = np.array([self.solver.get(i, 'u') for i in range(self.N)])
-        return U[0]
+        # RECOVERY -- see ur_mpc.solve for the measured account. SQP_RTI takes
+        # one step per call from the previous iterate and nothing re-seeds
+        # stages 1..N, so one bad step latches forever unless the solver is
+        # reset and re-seeded.
+        if status != 0:
+            self.recoveries += 1
+            self.solver.reset()
+            self._seed_all_stages(x_current)
+            self._apply_reference(x_refs, x_current)
+            status = self.solver.solve()
+            self.last_solve_time = self._stat('time_tot') or 0.0
+
+        self.last_status = status
+
+        # A FAILED SOLVE IS NOT A COMMAND (C6) -- see ur_mpc.solve for the
+        # measured account. acados leaves the primal iterate untouched on a
+        # non-zero status, so reading solver.get(0, 'u') here republishes the
+        # last SUCCESSFUL command forever.
+        if status != 0:
+            self.fail_count += 1
+            self.total_failures += 1
+            self._log(
+                f"acados solve failed (status {status}, "
+                f"qp_iter={self._stat('qp_iter')}, qp_stat={self._stat('qp_stat')}, "
+                f"{self.fail_count} consecutive, {self.total_failures} total, "
+                f"{self.recoveries} resets) "
+                f"- returning zero thrust, NOT the stale iterate")
+            return np.zeros(self.model.u.size()[0])
+
+        self.fail_count = 0
+        return np.array(self.solver.get(0, 'u'))

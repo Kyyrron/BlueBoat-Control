@@ -40,6 +40,7 @@
 
 # Common libraries import
 import os
+import re
 import time
 from datetime import datetime
 import numpy as np
@@ -183,6 +184,15 @@ class BlueBoatController(Node):
         self.last_thr_rx = None
         self.thr_watchdog_tripped = False
 
+        # E-STOP latch. Set by full_stop() (the 'stop' token), cleared ONLY by
+        # 'enable'. Without the latch a 'stop' is undone one tick (50 ms) later
+        # by the next manualMove(self.thruster_input): full_stop zeroes the
+        # thrust it holds, but master_control keeps publishing. The latch is
+        # what makes E-STOP an actual stop now that it no longer works by
+        # dropping out of override.
+        self.estopped = False
+        self.motors_disabled_logged = False
+
         self.timer = self.create_timer(0.05, self.timer_callback)
         self.log_timer = self.create_timer(0.33, self.log_timer_callback) # 3 times per seconds 
 
@@ -241,7 +251,11 @@ class BlueBoatController(Node):
         log_dir = cf.ensure_data_dir(self, self.data_root, 'data', 'Robot_data')
         stem = f'{self.date}-{self.note}-poslog' if self.note else f'{self.date}-poslog'
         self.path = cf.reserve_run_file(log_dir, stem, '.csv') + '.csv'
-        self.origin_path = self.path[:-len('-poslog.csv')] + '-origin.yaml'
+        # Sidecar name derived by pattern, not by a fixed-length slice: when
+        # reserve_run_file breaks a same-second collision the CSV is
+        # '...-poslog-2.csv', and stripping len('-poslog.csv') characters from
+        # that produced a mangled '...-pos-origin.yaml' that no reader finds.
+        self.origin_path = re.sub(r'-poslog(-\d+)?\.csv$', r'-origin\1.yaml', self.path)
 
         # Header once, then one appended-and-flushed row per tick. The previous
         # version accumulated every row in a DataFrame and rewrote the WHOLE file
@@ -295,6 +309,24 @@ class BlueBoatController(Node):
 
         # Wait for direct control to be enabled
         if self.mode != 'override':
+            return
+
+        ################## E-STOP latch ##################
+        # Held until an explicit 'enable'. Everything below is skipped, and the
+        # thrust command is re-zeroed every tick through the UNFORCED manualMove
+        # so the enable_motors gate still owns the actuator (N4). full_stop() has
+        # already set enable_motors False, so that call takes the neutral-hold
+        # path below and pins the passthrough channels at 1500/1500 rather than
+        # going silent.
+        if self.estopped:
+            self.thruster_input = [0, 0]
+            self.manualMove([0, 0])
+            # Re-assert the withdrawal of readiness at the normal republish rate
+            # (not at 20 Hz): master_control stops commanding, and the station
+            # reads this as its E-STOP acknowledgement.
+            if time.time() - self.last_ready_tx > self.ready_republish_period:
+                self.last_ready_tx = time.time()
+                self.publish(Bool(), False, self.set_controller_publisher)
             return
 
         ################## Control loop ##################
@@ -363,12 +395,37 @@ class BlueBoatController(Node):
 
     def full_stop(self):
         """
-        Cancels any thruster input and set control parameters to False
+        EMERGENCY STOP. Cancels any thruster input, latches the motor gate off
+        and disarms.
+
+        Deliberately does NOT change the parameter mode: dropping out of
+        override is a separate operator action ('default'), because leaving
+        override hands the RC channels back to whatever else is transmitting.
+        An E-STOP must remove authority from everyone, not transfer it.
+
+        The latch is what makes this stick - see self.estopped.
         """
+        self.estopped = True
         self.thruster_input = [0,0]
         self.manualMove([0,0], force=True)
         self.setArmedStatus(False) 
         self.set_motors(False)
+        # Immediate acknowledgement, published here rather than from the timer
+        # so it does not depend on the timer reaching its override branch: the
+        # station waits on this to confirm the E-STOP landed, and master_control
+        # zeroes its own output on it.
+        self.publish(Bool(), False, self.set_controller_publisher)
+        self.last_ready_tx = time.time()
+        self.get_logger().warn("E-STOP: thrust zeroed, motors disabled, disarmed. "
+                               "Send 'enable' to release the latch.")
+
+    def release_estop(self):
+        """Clear the E-STOP latch and re-enable the motor gate ('enable')."""
+        if self.estopped:
+            self.get_logger().warn("E-STOP latch released by operator 'enable'.")
+        self.estopped = False
+        self.motors_disabled_logged = False
+        self.set_motors(True)
 
     # ======================================================================
     #  3. THRUST -> PWM CALIBRATION
@@ -380,8 +437,35 @@ class BlueBoatController(Node):
         Convert a newton input to pwm and stream it to the motors through RC override
         """
 
-        # Safety
+        # Safety gate (N4 / superproject CM-16).
+        #
+        # With the gate closed this used to `return`, i.e. publish NOTHING. That
+        # is not inert: by then param_set has already mapped SERVO1/3_FUNCTION to
+        # RCIN1/RCIN3 passthrough, so the ESCs follow RC channels 1 and 3 from
+        # whatever else is transmitting - a hand transmitter, a QGC joystick, or
+        # ArduPilot's own RC failsafe values - and nothing is feeding
+        # RC_OVERRIDE_TIME to keep those channels ours. Motors could and did spin
+        # with enable_motors:=False.
+        #
+        # So the closed gate now HOLDS NEUTRAL instead of going silent: thrust 0
+        # is an exact knot of the calibration table (0 N -> 1500 us, and
+        # 3000 - 1500 = 1500 for the reversed side), so this pins both channels at
+        # true neutral at the loop rate and keeps the override watchdog fed. No
+        # commanded thrust ever reaches the water while the gate is closed, which
+        # is what the gate has always promised; the CSV's actuation_state still
+        # reports ACT_MOTORS_DISABLED for the whole run.
+        #
+        # Only meaningful while we own the channels. Outside override the
+        # autopilot is not listening to us at all, and streaming would fight the
+        # release in mode_callback.
         if not self.enable_motors and not force:
+            if self.mode == 'override':
+                if not self.motors_disabled_logged:
+                    self.motors_disabled_logged = True
+                    self.get_logger().warn(
+                        "enable_motors is False - holding RC channels at neutral "
+                        "1500/1500. Commanded thrust is logged but never applied.")
+                self.send_rc_override(right_pwm=PWM_NEUTRAL, left_pwm=PWM_NEUTRAL)
             return
 
         def thrust_to_pwm(T): # Thrust in Newton
@@ -439,9 +523,15 @@ class BlueBoatController(Node):
         allowing for manual control through the input_str topic without needing to set the command to 'move'
         """
         input_string = msg.data.split()
+        if not input_string:
+            # An empty String message used to raise IndexError inside this
+            # subscription callback.
+            self.get_logger().warn("Empty input_str message ignored.")
+            return
         command = input_string[0]
-        
-        dispatch = {'enable': lambda: self.set_motors(True),
+
+        dispatch = {'enable': self.release_estop,
+                    'disable': lambda: self.set_motors(False),
                     'stop': self.full_stop,
                     'override': lambda: self.request_param_mode('override'),
                     'default': lambda: self.request_param_mode('default'),
@@ -662,8 +752,15 @@ class BlueBoatController(Node):
 
     def param_callback(self, msg: String):
         """
-        Prints true if the parameter changes are successful (used with the 'default' and 'override' command)
+        Prints true if the parameter changes are successful (used with the 'default' and 'override' command).
+
+        Edge-triggered: param_set heartbeats this at 1 Hz so a late subscriber
+        can see the state without waiting for a transition, and logging every
+        message would bury the console.
         """
+        if getattr(self, '_last_param_ready', None) == msg.data:
+            return
+        self._last_param_ready = msg.data
         self.get_logger().info(f" Parameters ready: {msg.data}")
 
     def mode_callback(self, msg: String):
@@ -785,6 +882,12 @@ class BlueBoatController(Node):
         Output : int, see robot_log_schema for the encoding --
                  0 motors disabled, 1 live (enabled and in override),
                  2 enabled but not in override, 3 watchdog forcing zero.
+
+        State 0 means NO COMMANDED THRUST reached the water. It does not mean
+        the node was silent on /mavros/rc/override: with the gate closed and the
+        autopilot in override, manualMove holds both channels at neutral 1500
+        so nothing else can drive them. Neutral is not thrust, so the meaning of
+        the column is unchanged and no recorded CSV is reinterpreted.
 
         Without this the CSV cannot distinguish a controller that commanded zero
         from a boat that was never listening: enable_motors False produces a
@@ -961,8 +1064,79 @@ class BlueBoatController(Node):
 
         self.write_origin_sidecar()
 
-rclpy.init()
-node = BlueBoatController()
-rclpy.spin(node)
-node.destroy_node()
-rclpy.shutdown()
+    # ======================================================================
+    #  9. SHUTDOWN
+    #  Ordered teardown. Previously there was none: `rclpy.spin` raised
+    #  KeyboardInterrupt straight past destroy_node(), so the boat was left in
+    #  RC passthrough with nobody streaming and the CSV was never closed.
+    # ======================================================================
+
+    def shutdown(self):
+        """
+        Best-effort ordered teardown, safest-first.
+
+        Called from a finally block while the launch is being torn down, so
+        every step is independently guarded: a failure in one must not skip the
+        ones after it, and none of them may raise out of the finally.
+        """
+        # 1. Motors first, always.
+        try:
+            self.full_stop()
+        except Exception as exc:                       # noqa: BLE001 - teardown
+            self.get_logger().error(f"Shutdown: full_stop failed: {exc}")
+
+        # 2. Hand the RC channels back. Neutral before release, so the autopilot
+        #    never sees a stale non-neutral value on the way out.
+        try:
+            self.send_rc_override(right_pwm=PWM_NEUTRAL, left_pwm=PWM_NEUTRAL)
+            self.send_rc_override(release=True)
+        except Exception as exc:                       # noqa: BLE001 - teardown
+            self.get_logger().error(f"Shutdown: RC release failed: {exc}")
+
+        # 3. Ask for the default servo mapping. Best effort and usually a no-op:
+        #    param_set is in the same process group and is running its own
+        #    restore at this moment (CM-15 is served by both halves, neither
+        #    depending on the other).
+        try:
+            self.request_param_mode('default')
+        except Exception as exc:                       # noqa: BLE001 - teardown
+            self.get_logger().error(f"Shutdown: 'default' request failed: {exc}")
+
+        # 4. Close the CSV BEFORE anything moves it.
+        try:
+            if getattr(self, 'log_file', None) and not self.log_file.closed:
+                self.log_file.flush()
+                self.log_file.close()
+                self.get_logger().info(f"Position log closed: {self.path}")
+        except Exception as exc:                       # noqa: BLE001 - teardown
+            self.get_logger().error(f"Shutdown: closing the log failed: {exc}")
+
+        # 5. Mission report. Imported HERE, not at module scope: matplotlib is
+        #    not declared in package.xml and must never be able to stop this
+        #    flight node from starting.
+        try:
+            import poslog_report
+            folder = poslog_report.finalise_run(self.path)
+            self.get_logger().info(f"Mission report: {folder}")
+        except Exception as exc:                       # noqa: BLE001 - teardown
+            self.get_logger().error(
+                f"Shutdown: mission report failed ({exc}). The CSV is intact; "
+                f"run `ros2 run blueboat_control poslog_report.py {self.path}` "
+                "to produce it later.")
+
+
+def main():
+    rclpy.init()
+    node = BlueBoatController()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.shutdown()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+main()

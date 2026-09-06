@@ -40,6 +40,14 @@ install(PROGRAMS src/_custom_libraries/frame_math.py
         DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS src/_custom_libraries/robot_log_schema.py
         DESTINATION lib/${PROJECT_NAME})
+# Also the post-mission report CLI: the flat destination is what makes both
+# `import poslog_report` (from robot_interface's shutdown hook) and
+# `ros2 run blueboat_control poslog_report.py <csv>` resolve from one install.
+install(PROGRAMS src/_custom_libraries/poslog_report.py
+        DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS src/_custom_libraries/path_stamp.py
+  DESTINATION lib/${PROJECT_NAME})
+
 install(PROGRAMS src/_custom_libraries/thrust_limits.py
         DESTINATION lib/${PROJECT_NAME})
 

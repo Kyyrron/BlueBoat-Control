@@ -44,6 +44,16 @@ THR_LIM = 20.0
 # bit-identical to what they were before the hold existed.
 HOLD_SPEED = 0.05
 HOLD_KX, HOLD_UMAX, HOLD_RADIUS = 1.00, 0.80, 0.50
+# master_control's manual-target keep-location defaults. The kx/umax pair is
+# split simulation/real the same way point_k_v is, and is set so the hold surge
+# meets the pursuit law at the re-acquire radius instead of stepping there.
+MANUAL_HOLD_RADIUS, MANUAL_REACQUIRE_RADIUS = 1.00, 2.00
+MANUAL_HOLD_KX_SIM, MANUAL_HOLD_UMAX_SIM = 15.0, 15.0
+MANUAL_HOLD_KX_REAL, MANUAL_HOLD_UMAX_REAL = 8.0, 8.0
+MANUAL_BRAKE_TIME = 1.0
+# master_control.min_thrust: the T200 ESC neutral deadband in commanded Newtons.
+# Commands under this move nothing, which is why both point laws floor to it.
+MIN_THRUST = 2.0
 
 
 def wrap(a):
@@ -308,23 +318,128 @@ class MPCController:
 
 
 class PointLoS:
-    """master_control.solve_LoS -- body-frame point chase (pinger / manual)."""
+    """master_control.solve_LoS -- body-frame point chase (pinger / manual).
+
+    With manual=True this also carries master_control.manual_keep_location: a
+    reached manual target is HELD, not abandoned at zero thrust. State is
+    re-evaluated every call, never latched.
+
+    The pinger case (manual=False) is untouched and still has no arrival logic,
+    which is what the node does when safety_distance is at its shipped -1.0.
+
+    Two ways this copy is NOT verbatim, both tracked in TODO.md and both left
+    alone here because changing them re-measures fig 8 rather than editing it:
+    the pursuit surge carries no min_thrust floor (the node has floored it since
+    2026-08-31), and the k_psi default below is 16.0 where the node declares
+    60.0 in simulation and 10.0 on the real boat. Pass the gains explicitly.
+    """
     name = "Point-LoS"
 
-    def __init__(self, k_v=2.0, k_psi=16.0, manual=False):
+    def __init__(self, k_v=2.0, k_psi=16.0, manual=False,
+                 hold_radius=MANUAL_HOLD_RADIUS,
+                 reacquire_radius=MANUAL_REACQUIRE_RADIUS,
+                 hold_kx=None, hold_umax=None,
+                 brake_time=MANUAL_BRAKE_TIME, hold=True, real=None,
+                 min_thrust=MIN_THRUST):
         self.k_v, self.k_psi, self.manual = k_v, k_psi, manual
+        # The node splits the manual speed law and the hold gains by
+        # simulation/real exactly as it splits k_v, so default the column from
+        # the gains unless the caller names it.
+        real = (k_v == 0.15) if real is None else bool(real)
+        self.real = real
+        self.hold_radius = hold_radius
+        self.reacquire_radius = reacquire_radius
+        self.hold_kx = MANUAL_HOLD_KX_REAL if real else MANUAL_HOLD_KX_SIM
+        self.hold_umax = MANUAL_HOLD_UMAX_REAL if real else MANUAL_HOLD_UMAX_SIM
+        if hold_kx is not None:
+            self.hold_kx = hold_kx
+        if hold_umax is not None:
+            self.hold_umax = hold_umax
+        self.brake_time = brake_time
+        self.min_thrust = min_thrust
+        # Three modes, so the change can be measured against what it replaced
+        # rather than against a description of it -- the device check_los_hold.py
+        # uses for the path controllers.
+        #   True      the keep-location hold (what master_control does now)
+        #   "latch"   the pre-change stopping sequence: arrive, one second
+        #             astern, then zero thrust for the rest of the run. This is
+        #             what simulation did (safety_distance = 1.0).
+        #   False     no arrival logic at all, the ungated pursuit law. This is
+        #             what the real boat did (safety_distance = -1.0).
+        self.hold_enabled = hold
+        self.latched = False
+        self.holding = False
+        self.brake_t0 = None
+        self.t = 0.0
 
     def __call__(self, target_world, state, dt):
         xt, yt = target_world
         xr, yr, psir = state[0], state[1], state[2]
         x = (xt - xr) * math.cos(psir) + (yt - yr) * math.sin(psir)
         y = (yt - yr) * math.cos(psir) - (xt - xr) * math.sin(psir)
-        yaw_rate = self.k_psi * math.atan2(y, x)
+        bearing = math.atan2(y, x)
+        yaw_rate = self.k_psi * bearing
         d = math.hypot(x, y)
         v = 5 * math.log(self.k_v * d + 1)
         if self.manual:
-            v = 10 * math.log(v + 1)
+            # The node's own split: 10*log on the real boat, 7*log in
+            # simulation. This copy carried only the real-boat factor.
+            v = (10 if self.real else 7) * math.log(v + 1)
+
+        if self.manual and self.hold_enabled == "latch":
+            held = self._latched(d)
+            self.t += dt
+            if held is not None:
+                return held
+        elif self.manual and self.hold_enabled:
+            held = self._keep_location(d, bearing, yaw_rate)
+            self.t += dt
+            if held is not None:
+                return held
+        else:
+            self.t += dt
+
         return np.array([v + 0.295 * yaw_rate, v - 0.295 * yaw_rate])
+
+    def _latched(self, d):
+        """The pre-change stopping sequence, kept as the comparison baseline."""
+        if not self.latched:
+            if d <= MANUAL_HOLD_RADIUS:
+                self.latched = True
+                self.brake_t0 = self.t
+            else:
+                return None
+        if self.t - self.brake_t0 < self.brake_time:
+            return np.array([-1., -1.])
+        return np.array([0., 0.])
+
+    def _keep_location(self, d, bearing, yaw_rate):
+        """master_control.manual_keep_location, verbatim."""
+        if self.hold_radius <= 0.0:
+            return None
+
+        if not self.holding:
+            if d <= self.hold_radius:
+                self.holding = True
+                self.brake_t0 = self.t
+        elif d > self.reacquire_radius:
+            self.holding = False
+            self.brake_t0 = None
+
+        if not self.holding:
+            return None
+
+        if self.brake_t0 is not None and self.t - self.brake_t0 < self.brake_time:
+            return np.array([-1., -1.])
+
+        gap = max(0.0, d - self.hold_radius)
+        v_hold = min(self.hold_umax, self.hold_kx * gap)
+        v_hold *= max(0.0, math.cos(bearing))
+        if self.min_thrust > 0.0:
+            floor = self.min_thrust * max(0.0, math.cos(bearing))
+            if 0.0 < v_hold < floor:
+                v_hold = floor
+        return np.array([v_hold + 0.295 * yaw_rate, v_hold - 0.295 * yaw_rate])
 
 
 # ───────────────────────── simulation driver ───────────────────────────────────
@@ -362,20 +477,34 @@ def run(ctrl, shape="straight_line", start=(0., 0., 0.), T=80.0, dt=0.05,
     return {k: np.asarray(v) for k, v in log.items()}
 
 
-def run_point(ctrl, target, start=(0., 0., 0.), T=60.0, dt=0.05, plant_h=0.01):
+def run_point(ctrl, target, start=(0., 0., 0.), T=60.0, dt=0.05, plant_h=0.01,
+              force_world=(0., 0.), deadband=0.0):
+    """Point-following run.
+
+    force_world applies a constant world-frame force (a current), the way run()
+    already does; without it a station-keeping law cannot be tested at all.
+
+    deadband models the T200 ESC neutral band: a per-thruster command whose
+    magnitude is under it turns the propeller not at all, so the plant sees
+    zero while the log still records what was commanded. Default 0.0 keeps every
+    existing cached scenario bit-identical; the manual-hold cases set it to
+    master_control's own min_thrust, because the whole question there is which
+    commands can actually reach the water.
+    """
     s = np.array([start[0], start[1], start[2], 0., 0., 0.])
     log = {k: [] for k in ("t", "x", "y", "psi", "u", "d", "thr_r", "thr_l")}
     for k in range(int(T / dt)):
         meas = s.copy()
         meas[2] = wrap(meas[2])
         thr = np.clip(ctrl(target, meas, dt), -THR_LIM, THR_LIM)
+        applied = thr if deadband <= 0.0 else np.where(np.abs(thr) < deadband, 0.0, thr)
         for key, val in (("t", k * dt), ("x", s[0]), ("y", s[1]), ("psi", wrap(s[2])),
                          ("u", s[3]), ("d", math.hypot(target[0] - s[0], target[1] - s[1])),
                          ("thr_r", thr[0]), ("thr_l", thr[1])):
             log[key].append(val)
         sub = max(1, int(round(dt / plant_h)))
         for _ in range(sub):
-            s = rk4(s, thr, dt / sub)
+            s = rk4(s, applied, dt / sub, force_world)
     return {k: np.asarray(v) for k, v in log.items()}
 
 

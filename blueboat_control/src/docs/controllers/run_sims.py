@@ -123,6 +123,40 @@ def main():
         cached(f"hold_PID_{label}", lambda s=start, f=force: sim.run(
             sim.PIDController(dt=0.05), "station_keeping", start=s, T=150,
             force_world=f))
+
+    # J -- manual-target keep-location. A reached manual target used to be
+    # abandoned: one second astern, then zero thrust for the rest of the run.
+    # Any current then carried the boat away with nothing commanded. These runs
+    # are what that costs and what the hold recovers.
+    #
+    # The plant carries an explicit 2 N per-side deadband here, unlike every
+    # other scenario, because the whole question is which commands can actually
+    # reach the water -- an unfloored hold command of 1 N is a command the ESC
+    # ignores. Both baselines are run rather than described: "latch" is what
+    # simulation did (safety_distance = 1.0), "pursuit" is what the real boat
+    # did (safety_distance = -1.0, no arrival check at all).
+    #
+    # Real-boat point gains throughout. At the simulation gains this hull model
+    # diverges from any range (finding C8), so the boat never arrives and there
+    # is nothing to hold.
+    print("J: manual target keep-location")
+    MANUAL_FORCES = (0., 2., 4., 8., 12., 16.)
+    for force in MANUAL_FORCES:
+        tag = f"{int(force)}N"
+        for mode, name in ((True, "hold"), ("latch", "latch"), (False, "pursuit")):
+            cached(f"manual_{name}_{tag}",
+                   lambda m=mode, f=force: sim.run_point(
+                       sim.PointLoS(k_v=0.15, k_psi=10.0, manual=True, hold=m),
+                       (12., 6.), start=(12., 6., 0.), T=400,
+                       force_world=(-f, 0.), deadband=sim.MIN_THRUST))
+    # And the approach, which is where the pre-change real-boat law fails
+    # differently: it never stops, so it overshoots and runs away.
+    for mode, name in ((True, "hold"), ("latch", "latch"), (False, "pursuit")):
+        cached(f"manual_approach_{name}",
+               lambda m=mode: sim.run_point(
+                   sim.PointLoS(k_v=0.15, k_psi=10.0, manual=True, hold=m),
+                   (12., 6.), start=(7., 6., 0.), T=400,
+                   deadband=sim.MIN_THRUST))
     print("done")
 
 

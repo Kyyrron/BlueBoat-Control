@@ -172,6 +172,7 @@ point-following gains are, and the split covers the plant *model* as well as the
 | `mpc_Q_diag` | diag(50, 50, 30, 1, 1, 1) | same | Cost on x, y, ψ, u, v, r error |
 | `mpc_R_diag` | diag(0.015, 0.015) | **diag(0.10, 0.10)** | Cost on thruster effort |
 | `thrust_limit` | ±20 N | same | Hard constraint inside the solver |
+| `mpc_qp_iter_max` | 0 → 120 | 0 → **240** | qpOASES working-set budget. `0` derives it as `max(50, 4·nu·N)`; acados' own default of 50 is below the `nv = 60` of the simulation horizon, which is finding **C6** |
 | model `a_u, a_v, a_r` | −26.77, −7.55, −21.77 | **−5.50, −12.70, −0.12** | added mass |
 | model `d_u, d_v, d_r` | −29.34, −51.54, −44.65 | **−40.36, −12.79, −9.74** | linear drag |
 
@@ -186,6 +187,12 @@ across every recorded sim run). Refit them if `hydrodynamics.xacro` changes.
 never been timed on the companion computer (`TODO.md` §2); doubling the horizon is exactly
 the change that would break the 50 ms budget. At N = 30 in simulation the loop holds a
 measured 20.0 Hz with no watchdog trips.
+
+**Doubling the horizon also doubled the QP.** `FULL_CONDENSING_QPOASES` is a dense active-set
+solver, so `N = 30` means a condensed QP of `nv = 60` variables — more than acados' default
+working-set budget of 50, which made a saturating solve fail *by construction*. That is
+finding **C6**, and it is why `mpc_qp_iter_max` exists. Anyone raising `mpc_horizon` further
+must keep the budget above `nu·N`; leaving it at `0` does that automatically.
 
 **Why `R` had to move.** The stage cost is `(x−x_ref)ᵀQ(x−x_ref) + uᵀRu` with `u_ref ≡ 0`
 and no rate term, so `R` is an absolute effort penalty in N². The break-even — the position
@@ -399,7 +406,12 @@ function of distance, so it approaches gently instead of charging.
 |---|---|---|---|
 | `k_v` | 2.0 | 0.15 | Distance → speed |
 | `k_psi` | 16.0 | 10.0 | Bearing → yaw rate |
-| `safety_distance` | −1.0 (disabled) | | Stop-and-reverse radius |
+| `safety_distance` | −1.0 (disabled) | | Stop-and-reverse radius — **pinger branch only** since the manual branch got its own hold |
+| `manual_hold_radius` | 1.0 | 1.0 | Manual target: on-station radius; `<= 0` disables the hold |
+| `manual_reacquire_radius` | 2.0 | 2.0 | Beyond this the pursuit law takes back over |
+| `manual_hold_kx` | 15.0 | 8.0 | Hold surge per metre of gap, in Newtons |
+| `manual_hold_umax` | derived | derived | Cap, defaulting to `kx × (reacquire − hold)` |
+| `manual_brake_time` | 1.0 | 1.0 | Seconds astern on each fresh arrival |
 
 **Strengths**
 * Robust and simple; needs no path, no world frame, no odometry.
@@ -415,9 +427,44 @@ function of distance, so it approaches gently instead of charging.
   error — and the speed *grows with distance*. On a hull that needs 24 s to turn around, that
   is a positive feedback loop (see §5.5).
 * **The simulation gains diverge** on the model used here (finding **C8**).
-* `safety_distance = -1.0` **disables the stop condition**, so the arrival logic at
-  [master_control.py:585-590](master_control.py#L585-L590) is dead code.
+* `safety_distance = -1.0` **disables the stop condition** for the pinger branch, so its
+  arrival logic is dead code on the real boat. **The manual branch no longer uses it**: since
+  2026-09-03 a reached manual target is held rather than abandoned, by
+  `manual_keep_location` (below).
 * Thrust is a raw formula with no allocation or saturation logic — it is clipped downstream.
+
+**Keep location on a reached manual target** *(2026-09-03)*. The law used to latch on arrival:
+one second astern, then zero thrust for the rest of the run, cleared only by a new target. In
+any current that is a boat commanding nothing while it is carried out of the survey area — and
+on the real boat, where `safety_distance` is −1.0, the latch never armed at all, so the boat
+hunted around the target instead of settling. `manual_keep_location` replaces the latch with a
+state re-evaluated every tick:
+
+```python
+d <= manual_hold_radius       ->  on station, hold
+d >  manual_reacquire_radius  ->  blown off, resume pursuit
+v_hold = min(umax, kx * max(0, d - hold_radius)) * max(0, cos(bearing))   # floored to min_thrust
+```
+
+The yaw channel is untouched, so the differential and the turn are the law they always were.
+The two radii differ deliberately: one threshold with position noise on it toggles the mode
+every few ticks, and the gap between them is the hysteresis that prevents that. Measured on the
+plant with an explicit 2 N per-side deadband, starting on station, real gains, 400 s:
+
+| current | keep-location | old latch (simulation) | old pursuit (real boat) |
+|---|---|---|---|
+| 0 N | 0.00 m | 0.00 m | 0.00 m |
+| 2 N | 1.00 m | 27.2 m | 0.30 m |
+| 4 N | 1.20 m | 54.3 m | 0.30 m |
+| 8 N | 1.50 m | 108.7 m | 0.69 m |
+| 12 N | 1.75 m | 163.0 m | 1.19 m |
+
+![Manual-target keep-location](docs/controllers/fig10_manual_hold.png)
+
+The pursuit column parks tighter but is not a candidate: approaching from 5 m in calm water it
+overshoots and diverges to 472 m on this model — C8, at the *real* gains, because the manual
+double-log speed law is steeper than the pinger law C8 was measured on. The hold settles at
+0.22 m from the same start. Scenario J in `run_sims.py`; `check_manual_hold.py` is the gate.
 
 **Literature.** This is **pure pursuit** (Coulter, CMU 1992) in all but name — the classic
 waypoint-homing law across mobile robotics, and the standard "go to waypoint" behaviour on
@@ -775,7 +822,7 @@ In descending order of measured benefit — all five are one-line edits:
 | 1 | `inner_gains['u']` **and** `['r']` together | 1.0 / 1.5 → **5.0 / 30.0** | Acquisition 0.661 → 0.015 m, circle 0.097 → 0.011 m, cruise 0.235 → 0.460 m/s, mission 0.43× → 0.86× |
 | 3 | `mpc_time` (+ `mpc_horizon` 15 → 30) | 2.5 s → **6.0 s** | MPC circle error 1.019 → 0.011 m |
 | 4 | `los_ku` (+ drag feedforward) | 8.0 → **20** *(landed)* | LoS acquisition 1.184 → 0.033 m, cruise 0.107 → 0.202 m/s |
-| 5 | `safety_distance` | −1.0 → **1.5 m** | Point-LoS actually stops on arrival |
+| 5 | `safety_distance` | −1.0 → **1.5 m** | Pinger Point-LoS actually stops on arrival. **Manual targets no longer need it** — they hold station instead (§4.4) |
 
 ### Symptom → knob
 
@@ -787,6 +834,7 @@ In descending order of measured benefit — all five are one-line edits:
 | Boat approaches the path too lazily | Lower Δ to 1.5–2 m; check the yaw gain |
 | Overshoots every corner | Physics — min radius is 1.9 m. Round the corners in the designer |
 | MPC runs wide on every curve, and too fast | `mpc_time` — raise 2.5 s → 5–6 s (C9) |
+| MPC drives a constant circle and ignores the reference | The solver is failing, not steering — look for `MPC solve FAILED` in `/rosout`, then raise `mpc_qp_iter_max` above `2 × mpc_horizon` (C6) |
 | Heading hunts / oscillates | Lower `los_kpsi`, or raise `los_kd` / the inner r gain |
 | Thrusters slam back and forth (MPC) | Raise `mpc_R_diag` — 0.10 is the simulation default since 2026-08-31; see §4.1 for the break-even table |
 | Boat drifts away while station-keeping | Not the old F2 — check `hold_speed` was not launched at 0 (that disables the hold in both controllers); on LoS, raise `los_hold_kx` to shrink the held radius |
@@ -800,7 +848,8 @@ All of them, and more than this section originally asked for (finding **F16**, c
 `hold_radius`, `los_hold_kx`, `los_hold_umax`, `pid_lookahead`,
 `outer_gains_x`, `outer_gains_psi`, `inner_gains_u`, `inner_gains_r`, `mpc_horizon`,
 `mpc_time`, `mpc_Q_diag`, `mpc_R_diag`, `point_k_v`, `point_k_psi`, `safety_distance`,
-`thrust_limit`. Every sweep in this section can now be run from a launch argument, and every
+`manual_hold_radius`, `manual_reacquire_radius`, `manual_hold_kx`, `manual_hold_umax`,
+`manual_brake_time`, `thrust_limit`, `mpc_qp_iter_max`. Every sweep in this section can now be run from a launch argument, and every
 one of them still defaults to the value it had when these numbers were measured. The interface
 nodes add one of their own, `thruster_input_timeout` (0.5 s), on `robot_interface` and
 `simulation_interface`.
@@ -835,9 +884,24 @@ full turn the wrong way. **Fix:** unwrap the reference relative to the measured 
 rigid-shifts the sequence onto the branch nearest the measured heading
 ([ur_mpc.py:333-355](MPC/ur_mpc.py#L333-L355)); `TODO.md` §3 carries the measurement.
 
-**C10 — 🟠 MPC on `fsin` locks into a self-orbit — the boat drives a perfect circle forever
-while the reference runs away.** Observed in Gazebo (2026-09-01, MCS map: closed blue circle
-near the start, robot↔target distance oscillating at the loop period and growing). The
+**C10 — ⚪ MPC on `fsin` locks into a self-orbit — the boat drives a perfect circle forever
+while the reference runs away.** *(Re-opened 2026-09-04: the observation is now attributed to
+C6 and the analysis below is unmeasured.)*
+
+> **Re-opened 2026-09-04.** The 2026-09-01 Gazebo observation this entry was written to
+> explain has since been traced to **C6**. That run's controller log carries 181 distinct
+> commands over 705 ticks with a **517-tick bit-identical run**, and its `launch.log` carries
+> **518** `ACADOS solver failed with status 4` lines. A frozen asymmetric command *is* a
+> constant-radius circle, and the `.npy` shows the state changing continuously underneath it —
+> so what was seen on the map was the solver failing, not the cost function preferring the
+> reference's rotation. Ingredient 4 was the whole mechanism, not the fourth of four.
+>
+> Ingredients 1–3 are derived from the shape, the cost and the governor independently and
+> remain valid **as analysis**, but they are now **unsupported by any observation**. Re-fly
+> `fsin` under MPC with C6 fixed before acting on any of the `TODO.md` §0.3 remedies; a
+> harness run is still not available (`sim.py` carries no `fsin`).
+
+The
 mechanism is argued from the model, the cost and the measured envelope, not from a dedicated
 harness run — `sim.py` carries no `fsin` (§How the numbers were produced). Four ingredients,
 each individually documented, compose it:
@@ -867,16 +931,25 @@ each individually documented, compose it:
    ±20 N pair, i.e. a constant-radius circle.
 4. **SQP_RTI never escapes the basin.** One Newton step per 50 ms tick from the previous
    iterate; `solve` seeds only stage 0 and the `yref`s, never re-seeds stages 1..N, and a
-   solver failure only prints (C6). A latched saturated iterate has no mechanism to recover.
+   solver failure only printed (C6). A latched saturated iterate had no mechanism to recover.
+   *This ingredient was the whole story* — see the re-opening note above. The failure half is
+   fixed (zeros, never the stale iterate, plus the working-set budget); the warm-start half —
+   re-seeding stages 1..N — remains unimplemented and is deliberately out of scope of the C6
+   fix, which changed no control law.
 
 Real-boat aggravator: the 2.5 s horizon covers ~1.25 m of travel — less than one loop radius
 (C9's geometry, unchanged for the real configuration). **Sim-only remedies** (real-boat
 parameters untouched) are held in `TODO.md` §0.3; nothing is applied blind.
 
-**C3 — 🟠 `Point-LoS` never stops.** `safety_distance = -1.0`
-([master_control.py:318](master_control.py#L318)) disables the arrival check, so the stopping
-sequence at [master_control.py:585-590](master_control.py#L585-L590) is dead code and the boat
-never recognises arrival. Set it to ~1.5 m for real use.
+**C3 — 🟠 `Point-LoS` never stops.** *(closed for manual targets, 2026-09-03; open for the
+pinger.)* `safety_distance = -1.0` disables the arrival check, so the stopping sequence is dead
+code on the real boat and the boat never recognises arrival. For **manual** targets this is
+resolved differently and better than the original recommendation: they are not stopped at all,
+they are **held** — `manual_keep_location`, §4.4 — which also fixes the failure the original
+recommendation would have introduced, a boat latched to zero thrust and swept downstream. For
+the **pinger** the item stands: set `safety_distance` to ~1.5 m for real use, and note that its
+`stopping_sequence` latch is still cleared only by a manual-target message
+([TODO.md](../../.claude/TODO.md)).
 
 **C8 — 🟠 The `Point-LoS` simulation gains diverge** on the `ur_mpc.py` hull model — from every
 range and heading tested (§5.5). Root cause is structural: the speed command grows with
@@ -893,10 +966,126 @@ remove a steady cross-track offset in a current. Integral LoS is the standard re
 **C5 — 🟡 `los_kd` is inert.** At 1.0 it contributes 2 % of the yaw damping the hull already
 has. Either raise it to ~10 or delete it so it stops looking like a live knob.
 
-**C6 — 🟡 MPC solver failure is not handled.** `ur_mpc.solve` prints
-`"ACADOS solver failed with status {status}"` and returns whatever the solver left behind.
-There is no fallback and nothing downstream notices. At minimum, hold the previous command
-and publish a diagnostic.
+**C6 — 🔴 An MPC solver failure was published as a command — the boat drove a circle
+forever.** *(Fixed 2026-09-04.)*
+
+**Was.** `ur_mpc.solve` ended with `if status != 0: print(...)` and then returned
+`self.solver.get(0, 'u')` regardless. acados leaves the primal iterate **untouched** on a
+non-zero status, so that call handed back the command from the last *successful* solve, and
+`master_control` published it verbatim. A constant asymmetric thruster pair is, physically, a
+constant-radius circle — and the latch is self-sustaining: once the boat is circling, its
+heading error never gets small again, so the solve never recovers.
+
+Counting distinct `(u1, u2)` pairs and the longest run of **bit-identical** consecutive
+commands in the recorded `.npy` logs, against the `"ACADOS solver failed with status 4"` count
+in the matching `~/.ros/log/*/launch.log` (status 4 = `ACADOS_QP_FAILURE`):
+
+| run | ticks | distinct `u` | longest frozen | `status 4` lines |
+|---|---|---|---|---|
+| `2026_09_04-09_55_44` | 656 | **3** | 654 — 32.7 s of one command | *stdout not captured* |
+| `2026_09_03-18_50_36` | 340 | **4** | 337 | 339 |
+| `2026_09_01-10_50_57` | 705 | 181 | 517 | **518** |
+| `2026_08_31-22_40_02` | 2501 | 1042 | 1456 | 1402 |
+| healthy, pre-`e6dff70` | 1494 | 1494 | **1** | 0 |
+
+The failure count equals the frozen-tick count. In the 09:55 run the command was
+`(-20.0, -0.5)` N for 33 s while the state changed continuously underneath it.
+
+**Why it started failing — two causes, and the second is the bigger one.**
+
+*(a) The working-set budget.* `e6dff70` set `mpc_horizon = 30` for simulation, up from 15.
+`FULL_CONDENSING_QPOASES` is a dense **active-set** method, so the condensed QP has
+`nv = N·nu = 60` variables and `2·nv` bound constraints — the only constraints this OCP has
+besides the initial state. Reaching a vertex where most of those bounds are active costs on
+the order of one working-set change per active bound, and acados defaults
+`qp_solver_iter_max` to **50**. At `N = 30` the budget is *below* the number of variables, so
+a solve whose optimum saturates the horizon fails by construction. At `N = 15` it is 30
+against 50 and was never binding, which is why the real boat and every pre-2026-09-01
+simulation run were unaffected.
+
+What saturates the horizon is a **large heading error**. Across all 34 recorded MPC runs that
+is the discriminator, at an unchanged compiled solver:
+
+| run | trajectory | max \|ψ error\| | frozen |
+|---|---|---|---|
+| `22_54_37` | `survey_045` | **3.14 rad** | 60 % |
+| `23_00_45` | `survey_045` | 0.15 rad | **0 %** |
+| `22_46_50` | `survey_070_smooth` | **3.14 rad** | 60 % |
+| `23_05_23` | `survey_070_smooth` | 0.20 rad | **0 %** |
+| `09_04-09_55_44` | GPS-anchored mission | **3.14 rad** | **100 %** |
+
+Every run reaching `|ψ_err| ≥ 2.2 rad` froze; every run staying under 0.95 rad was clean —
+same trajectory, same solver. The trigger became routine when the MCS began passing a random
+`spawn_yaw` for GPS-anchored simulated missions (`f37d43a`), and those missions start with the
+reference ~28 m away, which freezes `tau` (`e_along ≫ gov_Lmax`) and hands the OCP a static,
+unreachable target.
+
+*(b) A failed solve poisons every later one.* `SQP_RTI` takes **one** Newton step per call
+from the previous iterate, and `solve` re-seeds only stage 0 and the `yref`s — never stages
+1..N. So a single bad step leaves the linearisation point corrupted and the controller never
+comes back, whatever the state does afterwards. This is the dominant effect, and the heading
+correlation above is a symptom of *when the first bad step happens*, not the whole mechanism:
+measured in Gazebo on `circle` at `spawn_yaw = π`, the boat was tracking at **0.05 m and
+0.10 rad of error** — as good as it ever gets — when one tick commanded `[-20, -20]` and the
+QP then failed **3291 consecutive times**, 93.7 % of the run. Raising the working-set budget
+does nothing for that: it is a poisoned linearisation point, not an iteration cap.
+
+The two compose: (a) supplies the first bad step more often, (b) makes it permanent.
+
+**Why nobody saw it.** The diagnostic was a bare `print()` — it never reaches `/rosout` — and
+neither `Sim_launch.py` nor the simulator's `full_mission_launch.py` captures this node's
+stdout. The Sep-4 launch logs contain only "process started" / "process has finished cleanly"
+for `master_control`.
+
+**Is.** Two changes, neither touching the control law, the model or the gains:
+
+* **The budget.** `qp_solver_iter_max` is set on the OCP from a new `mpc_qp_iter_max`
+  parameter, defaulting to `0` = derive it as `max(50, 4·nu·N)` — 240 at `N = 30`, 120 at
+  `N = 15`.
+* **The recovery.** A non-zero status triggers `solver.reset(reset_qp_solver_mem=1)`, a cold
+  re-seed of every stage at the measured state with zero input, a re-application of the
+  reference, and **one retry**. That is failure handling, not a control law — on the success
+  path none of it runs, and the OCP, model and gains are untouched.
+* **The fail-safe.** If the retry also fails, `ur_mpc.solve` (and `uvr_mpc.solve`) return
+  **zeros**, never the stale iterate, and record `last_status` / `fail_count` /
+  `total_failures` / `recoveries`. `master_control`'s MPC branch commands zero thrust and logs
+  through `get_logger().error` at 1 s throttle. It is deliberately **not** an early return, so
+  `/thruster_input` stays alive and the `.npy` keeps recording — which is what made this
+  diagnosable at all.
+
+**Gate.** [check_mpc_solver.py](docs/controllers/check_mpc_solver.py), measured on the real
+`MPCController` with the shipped simulation configuration:
+
+| configuration | scenario | non-zero statuses | longest frozen | final range |
+|---|---|---|---|---|
+| pre-fix, `qp_solver_iter_max = 50` | 28 m static ref, π heading error | **396 / 400** (code 4) | — | — |
+| shipped, budget 240 | same, 1200 ticks | **0 / 1200** | 6 ticks | 28 m → **0.26 m** |
+| shipped, budget 240 | straight line, 0.45 m/s | 0 / 600 | 1 tick | — |
+
+The 6-tick run is legitimate saturation at the ±20 N bound during the full-throttle transit,
+not a stale command; the failures ran 337–654.
+
+**The two changes separate cleanly**, measured on the same 28 m scenario:
+
+| | first-attempt QP failures | failures the caller sees |
+|---|---|---|
+| budget 50, no recovery | — | **396 / 400** |
+| budget 50, with recovery | 9 / 400 (2.25 %) | **0 / 400** |
+| budget 240, with recovery | 0 / 1800 | **0 / 1800** |
+
+The budget is why the first attempt fails; the recovery is why the boat no longer cares.
+`396 → 9` from the reset alone is the latch: without it, one bad step poisoned every later
+solve.
+
+**End-to-end in Gazebo**, `circle` at `spawn_yaw = π`, 149 s of control:
+
+| | before | after |
+|---|---|---|
+| consecutive failures | **3291** (latched for the rest of the run) | 3 isolated, each "1 consecutive" |
+| zero-thrust ticks | 93.7 % | **0.03 %** |
+| longest bit-identical command | (the whole run) | **1 tick** |
+| median track error | — | **0.054 m** |
+| net rotation / distance | spinning | +1.90 turns over **126 m travelled** — following the circle |
 
 **C7 — 🟡 No integrator anti-windup** anywhere in [PID.py](PID/PID.py). `self.integral +=
 error * self.dt` is unbounded, so a long saturated approach winds up the along-track and

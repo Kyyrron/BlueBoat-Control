@@ -11,6 +11,43 @@ guessed at.
 
 ---
 
+## 0.0 Bench verification of the 2026-09-04 safety rework
+
+Four changes landed together, in `param_set.py` and `robot_interface.py`. The
+desk-checkable half is green (`check_watchdog.py` and the other seven `check_*.py`
+pass, `interface_inventory.py --check` re-baselined for the three new declared
+parameters, and the Mission Control Station's `smoke_test.py` covers the station
+side). None of it is confirmed against a real autopilot.
+
+- [ ] **Neutral hold with the gate closed (N4).** `enable_motors:=False`,
+      transmitter on, **props clear**: `SERVO1/3_FUNCTION` reach 51/53, and
+      `ros2 topic echo /mavros/rc/override` shows a steady 1500/1500 instead of
+      silence. Moving the sticks must not move the thrusters. This is the
+      reported "motors spun with the box unchecked" symptom: passthrough was
+      mapped, and the old silent gate left the channels to the transmitter.
+- [ ] **`param_set` cannot latch (§ the three rules in `CLAUDE.md` §5).** Pull
+      the MAVROS link mid-sequence: the watchdog must abandon the attempt within
+      `param_sequence_timeout_s` (20 s), log it once, and accept the next
+      request. Then confirm the retry locks override when the link returns.
+      Measure a cold `ParamPull` on the real link while you are there — if it is
+      anywhere near 20 s, raise the parameter rather than removing the watchdog.
+- [ ] **The `stop` latch (N4b).** With a controller running and motors enabled,
+      publish `stop`: thrust must go to zero and *stay* zero while
+      `master_control` keeps publishing, with `param_mode` still `override`.
+      Then `enable` and confirm thrust resumes. Confirm
+      `/blueboat/controller_ready` carries the `False` the station waits on.
+- [ ] **Shutdown hooks (N5).** Ctrl-C the launch and confirm the servo mapping is
+      restored, the CSV is closed, and `Robot_data/<stem>/` appears with the
+      report PNG. Both restores are best-effort with mavros dying in the same
+      process group — record whether they actually complete on the real boat, or
+      whether the operator `default` remains the only reliable route.
+- [ ] **matplotlib on the boat.** `poslog_report` imports it lazily and degrades
+      to "folder and files, no picture". Confirm which behaviour the boat gets,
+      and either install it in `/blueboat_ws`'s venv or accept rendering the
+      reports ashore with `--all`.
+
+---
+
 ## 0. Field verification of the 2026-08-31 local-ENU frame fix
 
 - [ ] **Verify the odom frame fix on the water.** `robot_interface.odom_callback` no longer
@@ -69,6 +106,12 @@ guessed at.
       in the same idiom as the PID and point-following gains. Real-boat configuration
       unchanged. Measured: 0.70 m/s survey 77.5 % → 24.3 % saturated and 1.61 m → 0.30 m
       error; 0.45 m/s survey 64.8 % → 1.4 % and 11.57 m → 0.06 m. `CONTROLLERS.md` §4.1.
+- [ ] **Re-run the saturation measurements: they were taken with a failing solver.** The
+      "77.5 % → 24.3 %" and "64.8 % → 1.4 %" figures above were measured on the
+      `mpc_horizon = 30` configuration whose QP failed on 58-100 % of ticks (§0.4). A frozen
+      command sitting on the ±20 N bound counts as "saturated" in that statistic, so both the
+      before and after numbers are suspect in an unknown direction. Re-run
+      `docs/controllers/mpc_tuning_report.py` on a post-fix run before quoting them anywhere.
 - [ ] **The simulator's speed ceiling is 0.78 m/s and nothing enforces it.** The Gazebo hull
       uses the BlueROV2 drag table, whose quadratic term needs 20.1 N per thruster at
       0.78 m/s. Straight-line cruise at 0.70 m/s already consumes 85 % of the limit, so every
@@ -88,7 +131,17 @@ guessed at.
       against one or the other. A bollard-pull plus a straight-line decay test on the water
       would settle it and is cheap compared with what rests on it.
 
-## 0.3 MPC on `fsin` — orbit limit cycle (analysed 2026-09-01, sim experiments open)
+## 0.3 MPC on `fsin` — orbit limit cycle (analysis UNSUPPORTED since 2026-09-04)
+
+> **The observation behind this section was §0.4, not the cost function.** The 2026-09-01 run
+> that prompted it carries 181 distinct commands over 705 ticks with a **517-tick
+> bit-identical run**, and **518** `ACADOS solver failed with status 4` lines in its
+> `launch.log`. The boat was driving a circle because the solver had stopped solving and the
+> stale command was being republished — not because tracking the rotating tangent was cheaper
+> than closing position. The analysis below is still internally sound but has **no observation
+> supporting it**. Re-fly `fsin` under MPC now that §0.4 is fixed **before** applying any
+> experiment in this section; the first three may turn out to be solutions to a problem that
+> no longer exists.
 
 Observed in Gazebo through the MCS map: under MPC on `fsin` the boat locks into a perfect
 circle near the start while the reference runs away (robot↔target distance oscillating at the
@@ -108,11 +161,13 @@ Sim-only experiments to make MPC track `fsin` — none applied yet, real-boat va
 - [ ] **Enable the cross-track governor brake per run in sim** (`gov_Emax` is a declared,
       launch-settable parameter) for looping shapes — this is F5's missing half. Keep the
       committed default 0.0; it is off because it is unsafe at the current inner gains.
-- [ ] **Warm-start hygiene in `ur_mpc.solve`**: seed stages 1..N (shifted previous iterate,
-      or the reference on a large-error/stale-iterate detection), and give the C6 failure
-      path a fallback instead of a print.
-- [ ] **Decide the `_FSIN_V` divergence.** The working tree carries an uncommitted
-      `_FSIN_V` 0.1 → 0.5 in `path_generation.py` that contradicts the in-branch comment,
+- [~] **Warm-start hygiene in `ur_mpc.solve`.** *Half done (§0.4).* Stages 1..N are now
+      re-seeded, but **only on the failure path**: `reset()` + a cold seed at the measured
+      state + one retry, which is what stopped a bad step latching for 3291 ticks. The
+      *per-tick* RTI shift (seed stage `i` from the previous iterate's stage `i+1` on every
+      call, not just after a failure) is still not implemented, and is the remaining half.
+- [ ] **Decide the `_FSIN_V` divergence.** `_FSIN_V` 0.1 → 0.5 in `path_generation.py`
+      (committed in `e6dff70`, not uncommitted as this bullet used to say) contradicts the in-branch comment,
       `TRAJECTORY_SYSTEM.md` (§shape table and revision record), `CLAUDE.md`'s speed list,
       and the oracle: `docs/controllers/check_trajectory_library.py` currently **FAILS**
       3 checks because of it (`fsin` reference poses wrong at every sampled t, both
@@ -121,6 +176,102 @@ Sim-only experiments to make MPC track `fsin` — none applied yet, real-boat va
       Until the constant and the oracle/docs agree one way or the other, that gate is red
       and `fsin` field-data comparability is broken. (Deliberately not resolved here — the
       constant is the current experiment's setting.)
+
+## 0.4 MPC QP failure published as a command — fixed 2026-09-04
+
+**Symptom.** Under `controller_type:='MPC'` the simulated boat drove a constant-radius circle
+forever, "no matter what" the mission was.
+
+**Cause, in two halves.**
+
+1. *The solver was failing.* `e6dff70` set `mpc_horizon = 30` for simulation (from 15).
+   `FULL_CONDENSING_QPOASES` is a dense **active-set** solver, so the condensed QP carries
+   `nv = N·nu = 60` variables and `2·nv` bound constraints — the only constraints this OCP has
+   besides the initial state — while acados defaults `qp_solver_iter_max` to **50**. Reaching
+   a vertex where most of those bounds are active costs about one working-set change per
+   active bound, so at `N = 30` the budget is *below* the number of variables and a saturating
+   solve fails by construction. At `N = 15` (30 against 50) it was never binding, which is why
+   the real boat and every pre-2026-09-01 simulation run were unaffected.
+2. *One failure poisoned every later solve — the bigger of the two.* `SQP_RTI` takes **one**
+   Newton step per call from the previous iterate, and `solve` re-seeded only stage 0 and the
+   `yref`s, never stages 1..N. A single bad step left the linearisation point corrupted and
+   the controller never came back. Measured in Gazebo on `circle` at `spawn_yaw = π`: the
+   boat was tracking at **0.05 m and 0.10 rad** of error when one tick commanded `[-20, -20]`
+   and the QP then failed **3291 consecutive times** — 93.7 % of the run. The heading-error
+   correlation below describes *when the first bad step arrives*, not why it lasts; raising
+   the working-set budget does nothing for a poisoned iterate.
+3. *The failure was published as a command.* acados leaves the primal iterate untouched on a
+   non-zero status, so `ur_mpc.solve`'s `self.solver.get(0, 'u')` returned the last
+   **successful** solve's command and `master_control` published it verbatim. A constant
+   asymmetric thruster pair is a constant-radius circle.
+
+**Forensics.** Distinct `(u1, u2)` pairs and the longest run of bit-identical consecutive
+commands in `~/ros2_ws/data/MPC_data/*.npy`, against the `"ACADOS solver failed with status 4"`
+count in the matching `~/.ros/log/*/launch.log`:
+
+| run | ticks | distinct `u` | longest frozen | `status 4` lines |
+|---|---|---|---|---|
+| `2026_09_04-09_55_44` | 656 | **3** | 654 — 32.7 s of one command | *stdout not captured* |
+| `2026_09_03-18_50_36` | 340 | **4** | 337 | 339 |
+| `2026_09_01-10_50_57` | 705 | 181 | 517 | **518** |
+| `2026_08_31-22_40_02` | 2501 | 1042 | 1456 | 1402 |
+| healthy, pre-`e6dff70` | 1494 | 1494 | **1** | 0 |
+
+The discriminator across all 34 recorded MPC runs is the **heading error**: every run reaching
+`|ψ_err| ≥ 2.2 rad` froze on 58–100 % of ticks, every run under 0.95 rad was clean — same
+trajectory, same compiled solver. A large heading error drives full differential across the
+whole horizon, which is exactly the all-bounds-active vertex. It became routine when the MCS
+started passing a random `spawn_yaw` for GPS-anchored simulated missions (`f37d43a`), and
+those missions begin with the reference ~28 m away, which freezes `tau` and hands the OCP a
+static, unreachable target.
+
+**Why it went unseen.** The diagnostic was a bare `print()` — it never reaches `/rosout` — and
+neither `Sim_launch.py` nor the simulator's `full_mission_launch.py` captures this node's
+stdout. The Sep-4 launch logs carry only "process started"/"process has finished cleanly" for
+`master_control`.
+
+**Fixed.** No control law, model or gain changed.
+
+- [x] `qp_solver_iter_max` is set on the OCP from a new `mpc_qp_iter_max` parameter, default
+      `0` = derive as `max(50, 4·nu·N)` (240 at N = 30, 120 at N = 15).
+- [x] A non-zero status triggers `solver.reset(reset_qp_solver_mem=1)`, a cold re-seed of
+      every stage at the measured state with zero input, a re-application of the reference,
+      and **one retry**. Failure handling, not a control law: nothing of it runs on the
+      success path.
+- [x] `ur_mpc.solve` and `uvr_mpc.solve` return **zeros** if the retry also fails, never the
+      stale iterate, and record `last_status` / `fail_count` / `total_failures` /
+      `recoveries` / `last_solve_time`.
+- [x] `master_control`'s MPC branch commands zero thrust and logs `MPC solve FAILED` through
+      `get_logger().error` at 1 s throttle. Deliberately **not** an early return, so
+      `/thruster_input` stays alive and the `.npy` keeps recording.
+- [x] `docs/controllers/check_mpc_solver.py` is the gate. On a 28 m static reference at π
+      heading error: budget 50 with no recovery fails **396/400** ticks (status 4); budget 50
+      *with* the recovery hits the cap 9/400 times but the caller sees **0** failures; the
+      shipped budget of 240 hits it **0/1800** and closes 28 m → **0.26 m**. `396 → 9` from
+      the reset alone is the measure of the latch.
+- [x] Verified end to end in Gazebo (`circle`, `spawn_yaw = π`, 149 s of control): **3**
+      isolated failures, each "1 consecutive", **0.03 %** zero-thrust ticks (was 93.7 %),
+      longest bit-identical command **1 tick**, median track error **0.054 m**, +1.90 turns
+      over **126 m travelled** — following the circle, not spinning on it.
+
+**Open.**
+
+- [ ] **Re-fly `fsin` under MPC and settle C10** (§0.3). Its observation was this defect.
+- [ ] **Time the solve on the companion computer** before trusting `mpc_horizon = 30` anywhere
+      near the real boat (§2 — still never measured on target hardware). `master_control` now
+      warns through `/rosout` when a solve exceeds half the tick, so this is measurable
+      without a field harness.
+- [ ] **Decide whether the real boat should also move to `mpc_time = 6.0` / `mpc_horizon = 30`**
+      once timed. If it does, `mpc_qp_iter_max = 0` covers the budget automatically — but C9
+      (a horizon shorter than one turning radius) is the reason to want it.
+- [ ] **`uvr_mpc.py` still carries the pre-C2 pairwise `np.unwrap`.** Marked in the source; not
+      fixed alongside C6 because mixing an unrelated reference change into this diff would make
+      it unreviewable. That node is launched by nothing.
+- [ ] **The acados code-reuse hash was verified, not assumed.** `is_code_reuse_possible`
+      compares an md5 of the whole `ocp.to_dict()`, and the serialized `model.f_expl_expr` in
+      `acados_ocp.json` carries `a_*`/`d_*` as literals — so a coefficient-only retune does
+      force a rebuild, and `build_solver(generate=False, build=False)` is safe as written.
+      Verified 2026-09-04 against `acados_template` 0.5.1. Re-verify on an acados upgrade.
 
 ## 1. Needs a running ROS 2 / Gazebo workspace
 
@@ -199,17 +350,71 @@ Each verified against the tree. Ordered by value; identifiers are those of
       scenario without steady-state saturation, `u = 5 / r = 30` being the strongest
       (acquisition 0.661 → 0.015 m, circle 0.097 → 0.011 m, cruise 0.460 m/s, progress 0.86×).
       **This gates F5 below.** `master_control.py:279-280`.
-- [ ] **`stopping_sequence` latches and is never reset.** `solve_LoS` sets it on arrival
-      (`master_control.py:676`) and nothing clears it — not `manual_target_callback` (`:210`),
-      not `pinger_callback` (`:200`) — so once armed, every later point-LoS command (manual
-      target *and* pinger) returns zero thrust for the rest of the run. Inert at the shipped
-      default `safety_distance = -1.0` (`:291`), which no launch file overrides. But it is a
-      declared parameter, so a launch argument arms it, and both `CONTROLLERS.md` §7 ("If you
-      change only five things", row 5) and finding **C3** recommend setting it to 1.5 m — the
-      recommendation and the latch have never been recorded together. Reset the flag when a
-      new target arrives. Surfaces on the basestation as a boat that stops responding with no
-      indication why; the station must not compensate, see
+- [ ] **`stopping_sequence` latches — pinger branch only, since 2026-09-03.** `solve_LoS` sets
+      it on arrival and only `manual_target_callback` clears it, so a latch armed by the
+      **pinger** stays armed until someone publishes a manual target. Inert at the shipped
+      default `safety_distance = -1.0`, which no launch file overrides — but it is a declared
+      parameter, and both `CONTROLLERS.md` §7 (row 5) and finding **C3** recommend setting it
+      to 1.5 m, so the recommendation arms the latch. `pinger_callback` should clear it the way
+      the manual callback does. Surfaces on the basestation as a boat that stops responding
+      with no indication why; the station must not compensate, see
       `BlueBoat-MCS/.claude/specs/robot-side-limitations-watchlist.SPEC.md`.
+      **The manual half is closed:** a reached manual target is now held rather than abandoned
+      (`manual_keep_location`), and that path no longer consults `safety_distance` or
+      `stopping_sequence` at all.
+- [ ] **`_FSIN_V = 0.5` — `fsin` runs at 5× its authored speed.** Root cause of the three
+      `check_trajectory_library.py` failures measured 2026-09-03 (identical before and after
+      the keep-location work, so not a regression from it). `path_generation.py`'s module-scope
+      `_FSIN_V` is `0.5`, while the comment beside its own `radius = 1.5`, `TRAJECTORY_SYSTEM.md`
+      §3 and the check's pinned reference table all say **0.1 m/s**. Measured against the pinned
+      table the ratio is exactly 5.000 at `t = 1`. Consequences: the weave cycles every 60 s
+      rather than 300 s, the yaw-rate amplitude is 0.333 rad/s (19 °/s) instead of 0.067, and
+      `U_d = 0.5` reaches every controller's feedforward. The geometry is unchanged — the same
+      1.5 m turn radius, traversed 5× faster. Fixing it changes a reference that existing field
+      data was recorded against, so it is a deliberate re-measurement (and `CONTROLLERS.md`
+      §4.4's shipped-gain claims about `fsin` move with it), not an edit. `CLAUDE.md` §3
+      previously recorded all five checks as passing, which was stale.
+- [ ] **The harness's Point-LoS simulation column uses a `k_psi` the node does not ship.**
+      `run_sims.py` scenario G and `CONTROLLERS.md` §5.5 both label 16.0 as the "simulation"
+      point-following yaw gain; `master_control` declares `point_k_psi` at **60.0** in
+      simulation (10.0 real). `sim.PointLoS` carried the same 16.0 as its default. So fig 8
+      panel b, and the C8 divergence table under it, are measurements of a gain the boat does
+      not run. Re-running scenario G at 60.0 changes a published figure and the C8 numbers, so
+      it is a deliberate re-measurement, not an edit. The real column (10.0) is correct and is
+      the one `check_manual_hold.py` uses.
+- [ ] **`sim.PointLoS` has no `min_thrust` floor on its pursuit surge.** The node has floored
+      that term since 2026-08-31, so the harness models a boat whose sub-2 N commands reach the
+      water. Only the *hold* surge is floored in both (2026-09-03). Adding the floor to the
+      pursuit path changes scenario G and fig 8, so it is a re-measurement rather than an edit.
+      Until then, any Point-LoS figure understates how far out the real boat sits still.
+- [ ] **What bounds the manual keep-location hold is the pursuit law, not its own gains.**
+      The hold rejects a current up to `2 × manual_hold_umax` (16 N on the real column);
+      past that the boat crosses `manual_reacquire_radius` and recovery depends on the pursuit
+      law's turning authority, which is what the moment-arm item below is about. Measured: it
+      still parks (2.73 m at 20 N) rather than running away, but that margin is not something
+      the hold's own gains control.
+- [ ] **`from_yaml` reloads with no continuity guard, and the loader accepts a truncated file.**
+      `_maybe_reload_yaml` re-reads on any mtime change and nothing compares the new file's pose
+      at the current `tau` against the old one, so a mid-mission rewrite steps the reference by
+      the whole anchor delta on the next request. Worse, `YamlTrajectory` accepts any file whose
+      `format` matches and whose `points` is a non-empty (N,4) array: a partially-written file
+      parses, yields a short trajectory, clamps the reference to a false end — and `_yaml_mtime`
+      is updated, so it sticks until the next write. The station writes with a plain `open()`,
+      not an atomic rename. Either make the write atomic on the station side (cross-repo, CM-3)
+      or have the loader require the declared `duration_s`/`length_m` to match the samples.
+- [ ] **`compute_target` returns `poses[1]` while everything else uses `poses[0]`.**
+      `custom_functions.compute_target` takes `path.poses[:2]` and returns the SECOND pose as
+      the reference position, so on the `PID`/`LoS` branches `/monitoring_data[4:6]` is the pose
+      at `tau + path_time`, while the MPC branch, `path_progress_errors` and the RViz arrow all
+      use `poses[0]`. At the shipped 0.05 s window that is 2.5 cm and harmless, but it means
+      `x_d`/`y_d` means something slightly different per controller, and
+      `docs/controllers/replay.py:273-275` documents the opposite ("win[0]"). Pick one.
+- [ ] **`compute_target` is handed the control period, not the window spacing.**
+      `master_control` calls `cf.compute_target(self.controller_path, self.dt)` while the window's
+      own spacing is `path_time / (path_steps - 1)`. They are equal by construction today for
+      `PID`/`LoS` (both 0.05), so nothing is wrong now — but the coupling is unstated, and if a
+      window of different spacing ever arrives the reported `u`, `v`, `r` scale by the ratio.
+      `path_progress_errors` already derives `dtau` correctly; pass the same expression.
 - [ ] **`solve_LoS` uses the moment arm the wrong way round.** It builds
       `[v + 0.295*yaw_rate, v - 0.295*yaw_rate]` (`master_control.py:716-717`), *multiplying*
       by the arm `r = 0.295`, where `ThrustAllocator` *divides* by it

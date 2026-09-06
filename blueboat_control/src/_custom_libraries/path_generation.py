@@ -50,7 +50,9 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 from blueboat_interfaces.srv import RequestPath
 import math
+import time
 import custom_functions as cf
+import path_stamp as ps
 
 # --- YAML trajectory support ------------------------------------------------
 import yaml_trajectory as yt
@@ -201,8 +203,70 @@ class PathGeneration(Node):
                     "once the georeference is established).")
         # -----------------------------------------------------------------------
 
+        # --- exactly one server ----------------------------------------------
+        # ROS 2 does not stop a second node offering the same service name. When
+        # two do, every request is answered by whichever server replies first,
+        # and the response (a bare nav_msgs/Path) carries nothing identifying
+        # which request it answers -- so a controller cannot tell a foreign path
+        # from its own. Measured symptom: with two missions up, master_control's
+        # reference alternated tick by tick between two entirely different
+        # trajectories, both sampled at its own single path parameter, and the
+        # boat could not follow either. The invariant was already written down
+        # in .claude/specs/trajectory-library-and-path-preview.SPEC.md; nothing
+        # enforced it. This does.
+        self.declare_parameter('allow_duplicate_server', False)
+        self.declare_parameter('server_discovery_wait', 2.0)
+        if not self.get_parameter('allow_duplicate_server').get_parameter_value().bool_value:
+            self._refuse_if_server_running()
+
         # Service
         self.path_service = self.create_service(RequestPath, '/path_request', self.generate_path)
+
+    def _path_request_servers(self):
+        """Nodes currently offering /path_request, as 'ns/name' strings.
+
+        No self-exclusion, deliberately. This runs BEFORE create_service, so
+        this node offers no /path_request yet and anything found is somebody
+        else. Excluding by name would be actively wrong: the duplicate is
+        another `path_generation`, with the same name in the same namespace,
+        so a name test skips exactly the node it needs to find. (It did, on
+        the first attempt.)
+        """
+        found = []
+        for name, namespace in self.get_node_names_and_namespaces():
+            try:
+                services = self.get_service_names_and_types_by_node(name, namespace)
+            except Exception:
+                continue          # the node went away mid-enumeration
+            if any(service == '/path_request' for service, _ in services):
+                found.append(f"{namespace.rstrip('/')}/{name}")
+        # A duplicate is another `path_generation`, so the names collide and the
+        # per-node lookup resolves by name: the same node can be reported twice.
+        # Report distinct names -- the count is not meaningful, the fact is.
+        return sorted(set(found))
+
+    def _refuse_if_server_running(self):
+        """Exit rather than become the second /path_request server."""
+        # The graph is not populated the instant a node comes up, so give
+        # discovery a moment before believing an empty answer.
+        deadline = time.monotonic() + max(
+            0.0, self.get_parameter('server_discovery_wait').get_parameter_value().double_value)
+        others = []
+        while True:
+            others = self._path_request_servers()
+            if others or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+
+        if others:
+            msg = ("/path_request is already served by " + ", ".join(others) + ". "
+                   "Exactly one path server may run: with two, the controller's "
+                   "requests are answered by whichever replies first and it "
+                   "follows a mixture of two trajectories. Shut the other "
+                   "mission down first. Pass allow_duplicate_server:=true only "
+                   "if you deliberately want two.")
+            self.get_logger().fatal(msg)
+            raise SystemExit(1)
 
     # ======================================================================
     #  2. SERVICE ENTRY POINT
@@ -221,7 +285,16 @@ class PathGeneration(Node):
 
         for t in request.path_request.data:
             temp_pose = self.single_pose(t, self.trajectory)
-            temp_pose.header.stamp = self.get_clock().now().to_msg()
+            # Stamp the pose with the PATH PARAMETER it was evaluated at, not
+            # with the clock. The clock told a caller nothing; the parameter
+            # lets it verify that this response answers its own request rather
+            # than another server's (see _refuse_if_server_running). tau is
+            # non-negative and monotonic, so it encodes directly into the
+            # existing builtin_interfaces/Time field -- no .srv change, nothing
+            # added to the wire contract.
+            sec, nanosec = ps.encode(t)
+            temp_pose.header.stamp.sec = sec
+            temp_pose.header.stamp.nanosec = nanosec
             path_msg.poses.append(temp_pose)
 
         response.path = path_msg

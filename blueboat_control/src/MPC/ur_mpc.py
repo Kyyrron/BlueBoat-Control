@@ -250,7 +250,9 @@ class MPCController:
         Q_weight=None, 
         R_weight=None, 
         input_bounds=None,
-        build_dir=None):
+        build_dir=None,
+        qp_solver_iter_max=None,
+        logger=None):
 
         self.mass = robot_mass
         self.iz = iz
@@ -262,6 +264,30 @@ class MPCController:
         self.R = R_weight
         self.input_bounds = input_bounds 
 
+        # How many working-set changes qpOASES is allowed. See the block above
+        # ocp.solver_options in _build_ocp for why the acados default of 50 is
+        # not enough at horizon 30. None (or <= 0) derives it from the horizon,
+        # which is the only place the arithmetic should live.
+        self.nu = 2
+        self.qp_solver_iter_max = self._resolve_qp_iter_max(qp_solver_iter_max)
+
+        # Where a solver failure is reported. A plain callable, NOT a ROS
+        # logger: this module is ROS-free by construction (CLAUDE.md section 2.1)
+        # and must stay importable from a bare Python prompt. master_control
+        # hands in self.get_logger().warning; the two standalone MPC nodes hand
+        # in nothing and keep printing, as they always did.
+        self._log = logger if callable(logger) else print
+
+        # Solver health, read by master_control to decide what to publish.
+        #   last_status    - acados status of the most recent solve (0 = ok)
+        #   fail_count     - consecutive failures, reset by any success
+        #   total_failures - failures over the life of the node
+        self.last_status = 0
+        self.fail_count = 0
+        self.total_failures = 0
+        self.last_solve_time = 0.0
+        self.recoveries = 0          # reset-and-retry attempts
+
         # Where the generated C and the compiled solver live. None resolves to
         # $ROS_HOME/blueboat_control/mpc (see acados_build_dir); the argument is
         # a plain Python keyword, NOT a declared ROS parameter, so the node's
@@ -271,7 +297,48 @@ class MPCController:
         self.model = export_underwater_model(self.mass, self.iz, a_u, a_v, a_r, d_u, d_v, d_r)
         self.ocp = self._build_ocp()
         self.solver, self.reused_solver = build_solver(self.ocp, self.build_dir)
-    
+
+    def _resolve_qp_iter_max(self, requested):
+        """Working-set budget for the QP. None or <= 0 derives it from N."""
+        if requested is not None and int(requested) > 0:
+            return int(requested)
+        return max(50, 4 * self.nu * self.N)
+
+    def _apply_reference(self, x_refs, x_current):
+        """Pin stage 0 to the measured state and load the stage references."""
+        self.solver.set(0, 'x', x_current)
+        self.solver.set(0, 'lbx', x_current)
+        self.solver.set(0, 'ubx', x_current)
+
+        u_refs = np.zeros((self.N, self.nu))
+        for i in range(self.N):
+            self.solver.set(i, 'yref', np.concatenate((x_refs[i], u_refs[i])))
+        self.solver.set(self.N, 'yref', np.array(x_refs[-1]))
+
+    def _seed_all_stages(self, x_current):
+        """Cold, feasible seed: hold the measured state, command nothing.
+
+        Used only after a reset. It carries no memory of the basin the solver
+        was stuck in, which is the entire point.
+        """
+        zero_u = np.zeros(self.nu)
+        for i in range(self.N + 1):
+            self.solver.set(i, 'x', x_current)
+        for i in range(self.N):
+            self.solver.set(i, 'u', zero_u)
+
+    def _stat(self, field):
+        """solver.get_stats(field), or None. Never raises.
+
+        Diagnostics must not be able to kill the control loop: an acados
+        upgrade that renames a stats field would otherwise turn a log line
+        into an exception inside timer_callback.
+        """
+        try:
+            return self.solver.get_stats(field)
+        except Exception:
+            return None
+
     def _build_ocp(self):
         model = self.model
         ocp = AcadosOcp()
@@ -303,10 +370,31 @@ class MPCController:
         ocp.constraints.idxbu = self.input_bounds["idx"]
 
         # Solver setup
+        #
+        # qp_solver_iter_max is NOT decoration. FULL_CONDENSING_QPOASES is a
+        # dense ACTIVE-SET method, so the condensed QP has nv = N*nu variables
+        # (60 at the simulation horizon of 30, 30 at the real boat's 15) and
+        # 2*nv bound constraints -- the only constraints this OCP has besides
+        # the initial state. Reaching a vertex where most of those bounds are
+        # active costs on the order of one working-set change per active bound.
+        # acados defaults the budget to 50, so at N = 30 the cap is BELOW the
+        # number of variables and the solve fails by construction whenever the
+        # optimum saturates the horizon -- returning status 4 (QP_FAILURE), on
+        # which acados leaves the primal iterate untouched.
+        #
+        # Measured (CONTROLLERS.md C6): across 34 recorded Gazebo runs the
+        # discriminator is the heading error. Every run reaching |psi_err| >=
+        # 2.2 rad failed on 58-100 % of ticks; every run staying under 0.95 rad
+        # was clean -- same trajectory, same compiled solver. A large heading
+        # error drives full differential across the whole horizon, which is
+        # exactly the all-bounds-active vertex. At N = 15 (30 variables against
+        # 50) the cap was never binding, which is why the real boat and every
+        # pre-2026-09-01 simulation run were unaffected.
         ocp.solver_options.qp_solver = 'FULL_CONDENSING_QPOASES'
         ocp.solver_options.hessian_approx = 'GAUSS_NEWTON'
         ocp.solver_options.integrator_type = 'ERK'
         ocp.solver_options.nlp_solver_type = 'SQP_RTI'
+        ocp.solver_options.qp_solver_iter_max = self.qp_solver_iter_max
         ocp.solver_options.tf = self.T
 
         return ocp
@@ -377,22 +465,61 @@ class MPCController:
 
             x_refs.append([px[i], py[i], psi, u, v, r])
 
-        self.solver.set(0, 'x', x_current)
-        self.solver.set(0, 'lbx', x_current)
-        self.solver.set(0, 'ubx', x_current)
-
         x_refs = np.array(x_refs)  # shape (N+1, nx)
 
-        u_refs = np.zeros((self.N, 2))  # N x nu
-
-        for i in range(self.N):
-            yref = np.concatenate((x_refs[i], u_refs[i]))
-            self.solver.set(i, 'yref', yref)
-        self.solver.set(self.N, 'yref', np.array(x_refs[-1]))
-
+        self._apply_reference(x_refs, x_current)
         status = self.solver.solve()
-        if status != 0:
-            print(f"ACADOS solver failed with status {status}")
+        self.last_solve_time = self._stat('time_tot') or 0.0
 
-        U = np.array([self.solver.get(i, 'u') for i in range(self.N)])
-        return U[0]
+        # RECOVERY. SQP_RTI takes ONE Newton step per call from the previous
+        # iterate, and nothing here re-seeds stages 1..N -- so a single bad
+        # step poisons every later solve and the controller never comes back.
+        # Measured in Gazebo 2026-09-04: the boat was tracking the circle at
+        # 0.05 m and 0.10 rad of error, one tick commanded [-20, -20], and from
+        # the next tick on the QP failed for the remaining 93.7 % of the run.
+        # Raising the working-set budget does not touch this: it is a poisoned
+        # linearisation point, not an iteration cap.
+        #
+        # reset(reset_qp_solver_mem=1) zeroes the iterate AND the active-set
+        # memory; re-seeding every stage at the measured state with zero input
+        # is dynamically near-consistent (the boat coasts) and satisfies every
+        # bound by construction, so the retry starts from somewhere sane rather
+        # than from wherever the failure left it. This is failure handling, not
+        # a control law: on the success path nothing here runs.
+        if status != 0:
+            self.recoveries += 1
+            self.solver.reset()
+            self._seed_all_stages(x_current)
+            self._apply_reference(x_refs, x_current)
+            status = self.solver.solve()
+            self.last_solve_time = self._stat('time_tot') or 0.0
+
+        self.last_status = status
+
+        # A FAILED SOLVE IS NOT A COMMAND (C6).
+        #
+        # acados leaves the primal iterate untouched on a non-zero status, so
+        # self.solver.get(0, 'u') would hand back the command from the last
+        # SUCCESSFUL solve. Returning it published a constant asymmetric
+        # thruster pair -- which is, physically, a constant-radius circle -- and
+        # the latch was self-sustaining: once the boat is circling, its heading
+        # error never gets small again, so the solve never recovers. Measured
+        # 2026-09-04: 654 of 656 ticks carrying one bit-identical command for
+        # 32.7 s while the state changed continuously underneath it.
+        #
+        # Zero is the only value that is safe without knowing the caller's
+        # history. The caller decides what to do about it -- master_control
+        # publishes zero thrust and logs; see last_status / fail_count.
+        if status != 0:
+            self.fail_count += 1
+            self.total_failures += 1
+            self._log(
+                f"acados solve failed (status {status}, "
+                f"qp_iter={self._stat('qp_iter')}, qp_stat={self._stat('qp_stat')}, "
+                f"{self.fail_count} consecutive, {self.total_failures} total, "
+                f"{self.recoveries} resets) "
+                f"- returning zero thrust, NOT the stale iterate")
+            return np.zeros(self.model.u.size()[0])
+
+        self.fail_count = 0
+        return np.array(self.solver.get(0, 'u'))

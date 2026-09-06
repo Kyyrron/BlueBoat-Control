@@ -324,7 +324,9 @@ Path following is not always in charge. Priority order in
 1. **Manual target** (`/blueboat/manual_target`, from the visualisation app) — point LoS in
    the body frame. **τ is frozen while this is active** ([line 440](master_control.py#L682)),
    so when you release manual control the mission resumes exactly where it left off. Nice
-   detail.
+   detail. Once the target is reached the boat **holds** it rather than stopping on it
+   (`manual_keep_location`, `CONTROLLERS.md` §4.4), so a current cannot carry it away while
+   the operator decides what to do next.
 2. **Pinger** (`use_pinger:=True`) — chases acoustic coordinates; `path_generation` isn't
    even launched in that mode.
 3. **Path following** — the subject of this document.
@@ -425,6 +427,12 @@ the `psi_path` it hands `PIDLoS` toward the **bearing** to the hold point, fadin
 `hold_radius`, so the class's own along-track error becomes the range and its own steering
 points at the point; `slow_on_turn`, the class's own option, stops it driving away while it
 turns round. Neither is a new control law — both re-aim laws that already existed.
+
+A **manual target** gets the same treatment from a third place, `manual_keep_location`, with its
+own `manual_hold_radius` / `manual_reacquire_radius` / `manual_hold_kx` rather than these
+parameters. The gains cannot be shared: `los_hold_kx` and `los_hold_umax` are velocities fed
+through `los_ku` and the allocator, while the point law writes its surge straight onto the wire.
+`CONTROLLERS.md` §4.4 carries the measurements.
 
 The blend weight `w = 1 - U_d/hold_speed` is **exactly zero** for every trajectory in the
 library (all ≥ 0.28 m/s against the gate), so path following is unchanged to the last bit for
@@ -604,8 +612,8 @@ did. It and the then-unused `std_msgs` import are gone.
 **F16 — Tuning constants are ROS parameters.** *(closed)*
 `_declare_tuning_parameters` declares all of them — the governor pair and the new cross-track
 pair, both lookaheads, every LoS and PID gain, the MPC horizon and weights, the point-following
-gains, `safety_distance`, `thrust_limit` and `control_dt` — each with its previous value as the
-default, so nothing moved. These are exactly the knobs you want to change on a boat ramp
+gains, `safety_distance`, the five manual keep-location knobs, `thrust_limit` and `control_dt`
+— each with its previous value as the default, so nothing moved. These are exactly the knobs you want to change on a boat ramp
 without a rebuild, and now you can: `--params-file`, or `-p <name>:=<value>`.
 
 **F18 — No zero-thrust on loss of reference.** *(closed)*
@@ -690,6 +698,9 @@ declare. Override with `-p <name>:=<value>` or `--params-file`, no rebuild.
 | "Nothing to target yet." forever | `/path_request` service down. A bad `trajectory:=` name is no longer a cause — since **F9** it is refused at launch with a FATAL naming the valid set |
 | Boat sits still, mission never starts | τ frozen → `e_along` ≥ 3 m. Check the trajectory's start offset (§3) |
 | Boat drifts off during station-keeping | Not F2 — that is closed for both controllers. Check `hold_speed` was not launched at 0, which disables the hold in both |
+| Boat drifts off a reached **manual** target | Check `manual_hold_radius` was not launched at 0, which disables the keep-location hold and restores the old abandon-on-arrival behaviour |
+| Target jumps somewhere far away every few ticks, on every controller | **Two `/path_request` servers** — a second mission launch that was never shut down. Since 2026-09-03 the second `path_generation` refuses to start, and `master_control` rejects any response that does not answer its own request and logs an error naming both servers. On an older build, check `ros2 node list` for two `path_generation` entries. The station's LIVE DISTANCE plot renders the tick-by-tick alternation as a square wave because it decimates by stride |
+| `Path window stale (…) - holding tau` in the log | The path server stopped answering. `tau` is deliberately frozen rather than advanced against a window that is no longer a reference, so the boat holds the last good target instead of running open loop |
 | RViz shows nothing / one dot | Since **F3** the path is re-requested every `refresh_period`, so check `path_generation` is up and, for a `from_yaml` mission, that the file has been deployed |
 | Mission runs slower than authored | Working as designed — the governor is throttling. Check `e_along` |
 | Wild speed spikes in the log | `trajectory:=square` (**F6**). Not a τ wrap-around — **F7** is closed, the parameter range clamps |
