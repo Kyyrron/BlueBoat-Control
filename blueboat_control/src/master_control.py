@@ -469,7 +469,7 @@ class Controller(Node):
         # -- point following (manual target and pinger) ----------------------
         # Simulation and the real boat have always used different values here.
         self.k_v   = dbl('point_k_v',   2.0  if self.isSimulation else 0.15)
-        self.k_psi = dbl('point_k_psi', 60.0 if self.isSimulation else 10.0)
+        self.k_psi = dbl('point_k_psi', 60.0 if self.isSimulation else 100.0)
         # Negative disables the arrival check. Since the manual-target branch
         # got its own keep-location hold below, this governs the PINGER branch
         # only, which is why its defaults are untouched.
