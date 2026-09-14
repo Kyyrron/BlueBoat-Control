@@ -382,7 +382,7 @@ class MPCController:
         # optimum saturates the horizon -- returning status 4 (QP_FAILURE), on
         # which acados leaves the primal iterate untouched.
         #
-        # Measured (CONTROLLERS.md C6): across 34 recorded Gazebo runs the
+        # Measured: across 34 recorded Gazebo runs the
         # discriminator is the heading error. Every run reaching |psi_err| >=
         # 2.2 rad failed on 58-100 % of ticks; every run staying under 0.95 rad
         # was clean -- same trajectory, same compiled solver. A large heading

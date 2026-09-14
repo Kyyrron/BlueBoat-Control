@@ -285,14 +285,7 @@ class MPCController:
                 u = math.hypot(dx, dy) / self.dt
 
                 psi_prev = get_yaw_from_quaternion(prev_pose.orientation)
-                # C2 IS UNFIXED HERE. This is the pairwise unwrap that ur_mpc.py
-                # replaced on 2026-08-31: psi_prev is re-read from the pose and
-                # therefore freshly wrapped every iteration, so the unwrap never
-                # accumulates and a window straddling +/-pi carries a 2*pi cliff
-                # INSIDE the horizon. See ur_mpc.solve and CONTROLLERS.md C2 for
-                # the accumulating version. Deliberately not fixed in the same
-                # change as C6; this node is launched by nothing (CLAUDE.md 2.1)
-                # and TODO.md carries the item.
+                
                 psi = np.unwrap([psi_prev,psi])[-1]
 
                 psi_mid = (psi + psi_prev) / 2.0

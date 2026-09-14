@@ -40,9 +40,8 @@ import sys
 import numpy as np
 
 # ---------------------------------------------------------------------------
-# House style. Same validated light-mode palette as
-# blueboat_control/src/docs/controllers/gen_figures.py, so every figure this
-# project produces reads as one system.
+# House style. One validated light-mode palette, used project-wide, so every
+# figure this project produces reads as one system.
 # ---------------------------------------------------------------------------
 SURFACE = "#fcfcfb"
 INK, INK2, MUTED = "#0b0b0b", "#52514e", "#8a8983"
@@ -70,6 +69,9 @@ EARTH_R = 6371000.0
 # whose pose teleports is a finding, not a rendering nuisance, and one 300 m/s
 # spike otherwise sets the y-scale and the mean for the whole mission.
 MAX_PLAUSIBLE_SPEED_MS = 5.0
+
+# A row stamped before this year came off a simulation clock, not a calendar.
+SIM_YEAR_BEFORE = 2000
 
 # Column groups that differ between the two layouts. The no-pinger layout calls
 # the target `target_*`; the pinger layout calls the same slot
@@ -199,6 +201,102 @@ def _mission_time(data):
 # ---------------------------------------------------------------------------
 # Derived quantities
 # ---------------------------------------------------------------------------
+
+def is_simulation(run):
+    """Was this run recorded in Gazebo rather than on the water?
+
+    Read off the CLOCK, not off the GPS. `Sim_launch.py` sets
+    `use_sim_time=True`, so `simulation_interface` stamps every row from the
+    sim clock, which starts at zero -- a simulated log reads 1970. No real run
+    can, and no CSV column had to be added to carry the fact, which matters
+    because the poslog layout is frozen field-record schema (N7 / CM-7).
+
+    A sidecar may also say so outright (`frame: simulation`, or
+    `simulation: true`); that is honoured first so a future writer can be
+    explicit without this heuristic getting in the way.
+    """
+    origin = run.get("origin") or {}
+    declared = str(origin.get("frame", origin.get("simulation", ""))).lower()
+    if declared in ("simulation", "sim", "true", "1", "yes"):
+        return True
+    if declared in ("real", "field", "false", "0", "no"):
+        return False
+    years = run["data"].get("Year")
+    return bool(years is not None and len(years) and np.max(years) < SIM_YEAR_BEFORE)
+
+
+def track_series(run):
+    """The two tracks to draw, and which frame they are in.
+
+    ONE decision, shared by the archived PNG and the log reviewer app, so the
+    two can never draw a run in different frames.
+
+    WGS84 is used only when the run is real AND actually has fixes. A
+    simulation is drawn in LOCAL ENU METRES even when it does carry GPS: a
+    GPS-anchored Gazebo mission synthesises its fixes from sim odom about an
+    arbitrary anchor, so degrees there are a re-encoding of the world
+    coordinates rather than a measurement, and plotting them invites reading a
+    simulated track as a surveyed position. A real run that lost its fix falls
+    to the same world frame, which beats the empty panel it used to get.
+    """
+    d = run["data"]
+    tx_name, ty_name = run["spec"]["target_xy"]
+    lat, lon = d["gps_latitude"], d["gps_longitude"]
+    tlat_name, tlon_name = run["spec"]["target_gps"]
+
+    simulated = is_simulation(run)
+    has_fix = bool(np.any(_valid_gps(lat, lon)))
+
+    # A caller may PIN the frame (`run["frame_mode"]`). The log reviewer does,
+    # deciding once from the whole run: otherwise trimming the timeline into a
+    # stretch with no fix would silently flip the panel from degrees to metres
+    # mid-session, which reads as a bug rather than as a frame change.
+    forced = run.get("frame_mode")
+    if forced == "wgs84" or (forced is None and not simulated and has_fix):
+        return {
+            "mode": "wgs84",
+            "x": lon, "y": lat,
+            "tx": d[tlon_name], "ty": d[tlat_name],
+            "ok": _valid_gps(lat, lon),
+            "tok": _valid_gps(d[tlat_name], d[tlon_name]),
+            "xlabel": "longitude (\u00b0E)",
+            "ylabel": "latitude (\u00b0N)",
+            "title": "Track (WGS84) \u2014 robot and target",
+            "simulated": False,
+        }
+
+    # Local ENU metres. Every row has a pose, so the robot mask is all-true;
+    # the target is absent exactly where distance_series says it is.
+    x, y = d["relative_x"], d["relative_y"]
+    return {
+        "mode": "world",
+        "x": x, "y": y,
+        "tx": d[tx_name], "ty": d[ty_name],
+        "ok": np.isfinite(x) & np.isfinite(y),
+        "tok": ~((d[tx_name] == 0.0) & (d[ty_name] == 0.0)),
+        "xlabel": "east of origin (m)",
+        "ylabel": "north of origin (m)",
+        "title": "Track (local ENU) \u2014 robot and target",
+        "simulated": simulated,
+    }
+
+
+def origin_label(run):
+    """The summary's world-origin cell.
+
+    A simulated run's origin is the Gazebo world origin, and its sidecar
+    carries (0, 0) when nothing anchored it - printing that as a WGS84 fix
+    would read as a position off West Africa.
+    """
+    origin = run.get("origin") or {}
+    if not origin:
+        return "no -origin.yaml sidecar"
+    lat = origin.get("latitude", float("nan"))
+    lon = origin.get("longitude", float("nan"))
+    if is_simulation(run):
+        return "Gazebo world origin (simulation)"
+    return "%.7f, %.7f" % (lat, lon)
+
 
 def _valid_gps(lat, lon):
     """A fix of exactly (0, 0) means 'no fix' and is discarded - the same rule
@@ -389,7 +487,8 @@ def render_report(run, out_png):
     title = run["stem"]
     subtitle = (f"{run['n_rows']} rows · {_fmt_duration(m['duration_s'])} · "
                 f"{run['layout'].replace('_', '-')} layout · "
-                f"target: {spec['target_name']}")
+                f"target: {spec['target_name']}"
+                + (" · simulation" if is_simulation(run) else ""))
     fig.suptitle(title, x=0.055, y=0.975, ha="left", fontsize=15,
                  color=INK, fontweight="bold")
     fig.text(0.055, 0.949, subtitle, ha="left", fontsize=9.5, color=MUTED)
@@ -400,51 +499,51 @@ def render_report(run, out_png):
 
 
 def _plot_track(ax, run, spec):
-    d = run["data"]
-    lat, lon = d["gps_latitude"], d["gps_longitude"]
-    tlat_name, tlon_name = spec["target_gps"]
-    tlat, tlon = d[tlat_name], d[tlon_name]
-
-    fix = _valid_gps(lat, lon)
-    tfix = _valid_gps(tlat, tlon)
+    series = track_series(run)
+    x, y = series["x"], series["y"]
+    ok, tok = series["ok"], series["tok"]
 
     _style(ax)
-    ax.set_title("Track (WGS84) — robot and target, no-fix rows removed")
-    ax.set_xlabel("longitude (°E)")
-    ax.set_ylabel("latitude (°N)")
+    ax.set_title(series["title"] + ", no-fix rows removed"
+                 if series["mode"] == "wgs84" else series["title"])
+    ax.set_xlabel(series["xlabel"])
+    ax.set_ylabel(series["ylabel"])
 
-    if not np.any(fix):
-        ax.text(0.5, 0.5, "no GPS fix in this run", transform=ax.transAxes,
+    if not np.any(ok):
+        ax.text(0.5, 0.5, "no usable track in this run", transform=ax.transAxes,
                 ha="center", va="center", color=MUTED, fontsize=11)
         ax.set_xticks([]); ax.set_yticks([])
         return
 
-    if np.any(tfix):
-        ax.plot(tlon[tfix], tlat[tfix], "-", color=TARGET, linewidth=2.0,
-                label="target", zorder=2)
-    ax.plot(lon[fix], lat[fix], "-", color=ROBOT, linewidth=2.0,
-            label="robot", zorder=3)
+    if np.any(tok):
+        ax.plot(series["tx"][tok], series["ty"][tok], "-", color=TARGET,
+                linewidth=2.0, label="target", zorder=2)
+    ax.plot(x[ok], y[ok], "-", color=ROBOT, linewidth=2.0, label="robot", zorder=3)
 
     # Start / end, ringed in the surface colour so they stay legible over the line.
-    ax.plot(lon[fix][0], lat[fix][0], "o", markersize=9, color=ROBOT,
+    ax.plot(x[ok][0], y[ok][0], "o", markersize=9, color=ROBOT,
             markeredgecolor=SURFACE, markeredgewidth=2.0, zorder=4)
-    ax.plot(lon[fix][-1], lat[fix][-1], "s", markersize=9, color=ROBOT,
+    ax.plot(x[ok][-1], y[ok][-1], "s", markersize=9, color=ROBOT,
             markeredgecolor=SURFACE, markeredgewidth=2.0, zorder=4)
-    ax.annotate("start", (lon[fix][0], lat[fix][0]), textcoords="offset points",
+    ax.annotate("start", (x[ok][0], y[ok][0]), textcoords="offset points",
                 xytext=(9, 5), color=INK2, fontsize=8)
-    ax.annotate("end", (lon[fix][-1], lat[fix][-1]), textcoords="offset points",
+    ax.annotate("end", (x[ok][-1], y[ok][-1]), textcoords="offset points",
                 xytext=(9, 5), color=INK2, fontsize=8)
 
-    # True metric aspect: one metre east must be one metre north on the page, so
-    # the shape of the track is the shape it had on the water.
-    lat0 = float(np.mean(lat[fix]))
-    ax.set_aspect(1.0 / max(math.cos(math.radians(lat0)), 1e-6))
-
-    _scale_bar(ax, lat0)
+    if series["mode"] == "wgs84":
+        # True metric aspect: one metre east must be one metre north on the
+        # page, so the shape of the track is the shape it had on the water.
+        lat0 = float(np.mean(y[ok]))
+        ax.set_aspect(1.0 / max(math.cos(math.radians(lat0)), 1e-6))
+        _scale_bar(ax, lat0)
+        ax.ticklabel_format(useOffset=False, style="plain")
+        ax.tick_params(axis="x", labelrotation=20)
+    else:
+        # Already metres on both axes, so the aspect is simply 1 and the ticks
+        # are the scale - a scale bar would only repeat them.
+        ax.set_aspect(1.0)
     _north_arrow(ax)
     ax.legend(loc="best")
-    ax.ticklabel_format(useOffset=False, style="plain")
-    ax.tick_params(axis="x", labelrotation=20)
 
 
 def _scale_bar(ax, lat0):
@@ -582,7 +681,6 @@ def _plot_table(ax, run, m):
     ax.axis("off")
     act = m["act_fraction"]
     live_pct = 100.0 * act.get(1, 0.0)
-    origin = run["origin"] or {}
 
     rows = [
         ("Mission time", _fmt_duration(m["duration_s"])),
@@ -607,10 +705,7 @@ def _plot_table(ax, run, m):
         ("Right − left imbalance", _fmt(m["thr_imbalance"], " N")),
         ("Thrust live (state 1)", f"{live_pct:.1f} % of the run"),
         ("Mean speed while live", _fmt(m["speed_mean_live"], " m/s")),
-        ("World origin (lat, lon)",
-         (f"{origin.get('latitude', float('nan')):.7f}, "
-          f"{origin.get('longitude', float('nan')):.7f}")
-         if origin else "no -origin.yaml sidecar"),
+        ("World origin (lat, lon)", origin_label(run)),
     ]
 
     # Three column-pairs, filled down then across, so related metrics stay together.

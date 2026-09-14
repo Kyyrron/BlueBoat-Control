@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 r"""
-Column schema of the robot-side position CSV written by robot_interface.py.
+Column schema of the position CSV written by robot_interface.py on the boat
+and by simulation_interface.py in Gazebo.
 
 ROS-FREE BY CONSTRUCTION -- this module contains data and nothing else. It
 imports no numpy, no pandas, no rclpy. Read it to learn the CSV format
@@ -37,7 +38,7 @@ Which layout is used
 Selected once, at construction, by the `use_UWgps` launch parameter -- which
 is itself set from `use_pinger` by BlueBoat_launch.py:
 
-    use_UWgps = False  ->  COLUMNS_NO_PINGER  (27 columns)
+    use_UWgps = False  ->  COLUMNS_NO_PINGER  (27 columns)  <- always, in sim
     use_UWgps = True   ->  COLUMNS_PINGER     (39 columns)
 
 The two layouts are NOT a subset of one another, but as of this revision they
@@ -55,17 +56,44 @@ written from `uw_gps_callback`, i.e. driven by the Water Linked link at 2 Hz,
 so a UGPS dropout stopped logging the ROBOT as well. The UGPS callback now
 only caches its packet; the timer owns the file.
 
+The same file in simulation
+---------------------------
+`simulation_interface.log_timer_callback` writes this format too, at the same
+rate and in the COLUMNS_NO_PINGER layout only -- there is no Water Linked UGPS
+in Gazebo -- so a simulated run and a field run are read by one reader. Three
+columns mean slightly less there, and say so at the point they are written:
+
+  * the seven date columns carry the ROS clock, which is SIM time, so a
+    simulated log reads 1970-01-01. Every reader takes differences from the
+    first row; using sim time is what keeps derived speeds right when the
+    real-time factor is not 1.
+  * `lin_acc_*` is the odometry twist differentiated, not an IMU reading, so
+    it carries NO gravity component (Gazebo publishes no /mavros/imu/data
+    under Sim_launch).
+  * `actuation_state` only ever takes 1 and 3. States 0 and 2 are hardware
+    conditions -- an enable_motors gate and an autopilot mode -- and cannot
+    occur in simulation.
+
+The GPS pairs fill in only when something publishes
+/mavros/global_position/global (the Mission Control Station's bridge, or the
+simulator's mavros_shim_node); under a plain Sim_launch they stay at (0, 0),
+which is this project's "no fix" everywhere else.
+
 Column groups, in the order they appear
 ---------------------------------------
 Both layouts, columns 1-19:
-  Year..MicroSecond      (7)  wall-clock stamp of the row, local time.
+  Year..MicroSecond      (7)  wall-clock stamp of the row, local time (SIM
+                              time, hence 1970, in a simulated log).
                               MicroSecond is FULL microseconds (0-999999) in
                               BOTH layouts. It used to be milliseconds in the
                               no-pinger layout and microseconds in the other.
-  relative_x/y/psi       (3)  robot pose in the BOOT-RELATIVE world frame --
-                              origin and yaw are re-zeroed at robot_interface's
-                              first odom callback, so (0,0,0) is wherever the
-                              boat was at launch, NOT a fixed geographic frame.
+  relative_x/y/psi       (3)  robot pose in the local-ENU world frame -- origin
+                              latched at robot_interface's first odom callback,
+                              so (0,0) is wherever the boat was at launch and
+                              NOT a fixed geographic frame, while psi is
+                              ABSOLUTE ENU yaw (0 = East, CCW+) since
+                              2026-08-31. In simulation the frame is already
+                              that: the Gazebo world origin, nothing re-zeroed.
                               Metres and radians. The frame's own origin is
                               recorded once in the `-origin.yaml` sidecar
                               written beside the CSV; without it these columns
@@ -102,7 +130,7 @@ Both layouts, columns 1-19:
                                 2  enabled but not in override -- ArduPilot
                                    ignores the RC override stream
                                 3  loss-of-reference watchdog tripped --
-                                   thrust forced to zero by robot_interface
+                                   thrust forced to zero by the interface node
                               Without this column a run with the motor gate
                               off is byte-indistinguishable from a live one,
                               and a watchdog trip is indistinguishable from a
@@ -110,7 +138,8 @@ Both layouts, columns 1-19:
                               into the same field).
 
 Both layouts, trailing block:
-  roll, pitch            (2)  from /mavros/imu/data's quaternion. Yaw is not
+  roll, pitch            (2)  from /mavros/imu/data's quaternion, or from the
+                              odometry quaternion in simulation. Yaw is not
                               repeated here -- it is relative_psi above.
   ang_vel_x/y/z          (3)   > raw IMU, /mavros/imu/data, unprocessed.
   lin_acc_x/y/z          (3)  /
@@ -130,12 +159,8 @@ COLUMNS_PINGER only, between the two blocks:
 
 Consumers
 ---------
-* BlueBoat-Control/blueboat_control/src/docs/controllers/replay.py
 * offline analysis notebooks
-Both index by column NAME. Neither tolerates a renamed column. NOTE that
-replay.read_poslog_csv currently looks for columns named `x`, `y`, `psi`, `t`,
-`u1`, `u2`, which NO revision of this schema has ever contained -- it cannot
-read a CSV this system produces, and that predates this revision.
+Indexes by column NAME. Does not tolerate a renamed column.
 """
 
 # Actuation-state encoding, for readers that would rather not hard-code ints.

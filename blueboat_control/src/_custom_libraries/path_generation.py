@@ -29,10 +29,10 @@
 #
 #   module scope    SHAPES, is_valid_shape, the 'fsin' cumulative table
 #                   (_fsin_extend / _fsin_state and the _fsin_* globals).
-#                   The table MUST stay at this module's scope:
-#                   docs/controllers/check_trajectory_library.py resets it by
-#                   assigning path_generation._fsin_x/_y/_yaw, and moving it to
-#                   another module would make that reset a silent no-op.
+#                   The table MUST stay at this module's scope: _fsin_extend
+#                   and _fsin_state mutate the _fsin_* globals through the
+#                   `global` keyword, which only reaches names defined in this
+#                   module's own namespace.
 #
 #   class PathGeneration
 #     1. WIRING                   __init__
@@ -211,9 +211,8 @@ class PathGeneration(Node):
         # from its own. Measured symptom: with two missions up, master_control's
         # reference alternated tick by tick between two entirely different
         # trajectories, both sampled at its own single path parameter, and the
-        # boat could not follow either. The invariant was already written down
-        # in .claude/specs/trajectory-library-and-path-preview.SPEC.md; nothing
-        # enforced it. This does.
+        # boat could not follow either. The invariant was long documented but
+        # nothing enforced it. This does.
         self.declare_parameter('allow_duplicate_server', False)
         self.declare_parameter('server_discovery_wait', 2.0)
         if not self.get_parameter('allow_duplicate_server').get_parameter_value().bool_value:
@@ -436,8 +435,9 @@ class PathGeneration(Node):
         # Surge sin
         elif path_shape == 'fsin':
             # Turn radius of the weave [m] -- the one knob of this shape. Surge
-            # is fixed at 0.1 m/s, so the radius scales the whole path, and its
-            # cycle time with it; see _fsin_state.
+            # is fixed at _FSIN_V = 0.5 m/s, so the radius scales the whole path
+            # and its cycle time with it (1.5 m -> one cycle per 60 s); see
+            # _fsin_state.
             radius = 1.5
 
             # Same Euler integration as ever, read out of a cumulative table

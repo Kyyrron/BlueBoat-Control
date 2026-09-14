@@ -1,38 +1,22 @@
 #!/usr/bin/env python3
 
 # ============================================================================
-# PATH-FOLLOWING REWORK.
+# The controller node: MPC / PID / LoS on one control callback at 20 Hz.
 #
-# The reference used to be played on a WALL CLOCK:
-#   request.path_request.data = linspace(time.time()-t0, ..., steps)
-# so the desired pose advanced with real time regardless of where the boat
-# actually was. Combined with a 1 Hz control loop (self.dt = 1.0), the boat
-# received a target that ran away along the path and updated only once per
-# second, producing smooth path-blind arcs with no resemblance to the path.
+# The reference is NOT played on a clock. A path parameter tau is advanced by a
+# GOVERNOR that moves the virtual target at the path's authored speed while the
+# boat keeps up, and slows or freezes tau when it falls behind, so the target
+# can never outrun the boat (CLAUDE.md N8). Because the authored speed is the
+# spatial rate of the path's own parameterization, a speed profile that varies
+# along the path is followed with no extra machinery.
 #
-# This version:
-#   * runs the control loop at 20 Hz (self.dt = 0.05);
-#   * advances a PATH PARAMETER tau with a GOVERNOR that moves the virtual
-#     target at the path's authored speed when the boat keeps up, and slows
-#     or pauses tau when the boat falls behind, so the reference can never
-#     outrun the boat. The authored speed can vary along the path (it is the
-#     spatial rate of the parameterization), so a spatially varying speed
-#     profile is followed for free. A global self.path_speed_scale scales it.
-#   * uses canonical Fossen lookahead LoS for the 'LoS' controller type and
-#     adds path-speed feedforward to the 'PID' controller.
+# 'LoS' is canonical Fossen lookahead LoS; 'PID' is the same law with
+# path-speed feedforward; 'MPC' solves an acados OCP over a horizon window.
 #
-# INTERFACES ARE UNCHANGED: same node name/namespace, same topics, same
-# /path_request service (an array of parameter values in, a Path out -- so
-# path_generation.py needs no change), same message types, same
-# controller_type options, same monitoring format, same pinger and manual
-# behavior. Only the internals of how the reference is generated and how LoS
-# is computed have changed.
-#
-# Retains the world-frame monitoring target fix ("# --- world-frame
-# monitoring target ---").
+# The world-frame monitoring target is marked throughout with
+# "# --- world-frame monitoring target ---" (CLAUDE.md N9): /monitoring_data
+# carries world-frame x_d/y_d/psi_d in EVERY branch.
 # ============================================================================
-
-### FOR MANUAL TARGET IMPLEMENTATION IN THE VISUALISATION APP ###
 
 # ----------------------------------------------------------------------------
 # FILE MAP (class Controller) -- sections are banner-commented below.
@@ -66,16 +50,13 @@ from scipy.spatial.transform import Rotation as R
 from datetime import datetime
 
 # ROS2 msg libraries
-from std_msgs.msg import String, Bool, Float32, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray
 from nav_msgs.msg import Odometry, Path
-from geometry_msgs.msg import PoseStamped, Pose, Twist, Point, Quaternion, Vector3
 from visualization_msgs.msg import Marker
 
 # Custom libraries
-from urdf_parser_py import urdf
 import ur_mpc
 import PID
-from blueboat_control import ROV
 from blueboat_interfaces.srv import RequestPath
 import custom_functions as cf
 import frame_math as fm         # pure world<->body geometry (ROS-free)
@@ -85,6 +66,22 @@ import thrust_limits as tl     # uniform thrust saturation (ROS-free)
 
 def _wrap(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
+
+
+def _reference_pose(path):
+    """[x, y, psi] of the FIRST pose of a reference window, world frame.
+
+    The one definition of "where the reference is right now", shared by every
+    controller branch so that /monitoring_data[4:6] -- and therefore the
+    position CSV's target_x/target_y and the .npy's x_d/y_d -- means the same
+    thing whatever controller ran (N9). It is deliberately NOT what the PID and
+    LoS laws are handed: cf.compute_target needs the second pose as well, to
+    difference the window into u, v and r.
+    """
+    pose = path.poses[0].pose
+    q = pose.orientation
+    psi = R.from_quat([q.x, q.y, q.z, q.w]).as_euler('xyz')[2]
+    return [pose.position.x, pose.position.y, psi]
 
 
 class Controller(Node):
@@ -185,7 +182,7 @@ class Controller(Node):
             # Derived from the horizon, never declared separately: the reference
             # window and the solver's horizon must not be able to disagree.
             #
-            # N + 1, not N (TODO.md F4). MPCController.solve reads N+1 poses --
+            # N + 1, not N. MPCController.solve reads N+1 poses --
             # N stages plus the terminal one -- so requesting N made it pad by
             # duplicating the last pose, giving a zero-velocity terminal
             # reference. It also desynchronised the two spacings: this window's
@@ -243,7 +240,7 @@ class Controller(Node):
         # Initialize monitoring values
         # Monitoring rows. The header goes in as strings, which is what makes
         # np.save coerce the whole array to <U32 on write -- unchanged, because
-        # every existing log and replay.py read that schema (CM-7). What did
+        # every existing log and every analysis script read that schema (CM-7). What did
         # change is WHEN: see save_monitoring().
         self.monitoring = []
         self.monitoring.append(['t','x','y','psi','x_d','y_d','psi_d','u1','u2'])
@@ -424,7 +421,7 @@ class Controller(Node):
         # cannot reduce is positive feedback: the target stalls, the boat
         # loses the forward authority it converges with, and the offset grows.
         # Raise the inner gains first, then set gov_Emax (5.0 is a reasonable
-        # starting point) - see TODO.md.
+        # starting point) - see CLAUDE.md section 4.
         self.gov_Emin = dbl('gov_Emin', 0.5)
         self.gov_Emax = dbl('gov_Emax', 0.0)
 
@@ -535,8 +532,8 @@ class Controller(Node):
         # about the boat, not only by what it is told to care about.
         #
         # THE MODEL. The real-boat column is unchanged: those coefficients have
-        # been in the tree since the beginning and CONTROLLERS.md section 6.4 records
-        # that their provenance is unknown, so nothing here claims to improve
+        # been in the tree since the beginning and their provenance is unknown,
+        # so nothing here claims to improve
         # them. The simulation column is FITTED TO THE GAZEBO PLANT, i.e. to
         # blueboat_description/urdf/hydrodynamics.xacro, which is what the boat
         # in simulation actually obeys. The two disagreed badly -- surge mass
@@ -566,7 +563,6 @@ class Controller(Node):
         #
         # These are FITTED NUMBERS, not physics: refit them if hydrodynamics.xacro
         # changes, or if missions settle at a cruise speed far from 0.45 m/s.
-        # docs/controllers/mpc_tuning_report.py scores a run for the symptoms.
         if not self.isSimulation:
             self.mpc_model = {'robot_mass': 16.01,   # blueboat.xacro mass
                               'iz':          5.64,   # blueboat.xacro izz
@@ -583,12 +579,12 @@ class Controller(Node):
                               'd_r':  -9.74}         # secant of nR + nRabsR*|r|
 
         # THE HORIZON. 6.0 s / 30 steps in simulation is the one MPC change in
-        # this repository with a measurement behind it (CONTROLLERS.md section 5.2):
-        # the circle's steady radial offset goes -1.019 m -> -0.011 m and cruise
+        # this repository with a measurement behind it: the circle's steady
+        # radial offset goes -1.019 m -> -0.011 m and cruise
         # speed 26 % fast -> exact. The real boat stays at 2.5 s / 15 until the
         # solve time is measured on the companion computer -- doubling the
         # horizon is precisely the change that would break the 50 ms budget, and
-        # TODO.md section 2 records that it has never been timed on target hardware.
+        # it has never been timed on target hardware.
         # Both keep dt = time/horizon at 0.167-0.200 s.
         self.mpc_horizon = integer('mpc_horizon', 30 if self.isSimulation else 15)
         self.mpc_time    = dbl('mpc_time', 6.0 if self.isSimulation else 2.5)
@@ -610,7 +606,7 @@ class Controller(Node):
         # throttle literally the cheaper option, which is why the MPC saturates
         # where PID -- whose demand its own P-gain bounds -- does not. 0.10 in
         # simulation puts the break-even outside the governor's own 0.5 m
-        # dead-band; CONTROLLERS.md section 10 advises 0.05-0.1 on general grounds.
+        # dead-band.
         self.R_weight = np.diag(arr('mpc_R_diag', [0.10, 0.10] if self.isSimulation
                                                   else [0.015, 0.015]))
 
@@ -623,7 +619,7 @@ class Controller(Node):
         # saturating solve failed by construction and acados returned status 4
         # with the primal iterate untouched. That stale iterate was then
         # published as a command: a constant asymmetric thruster pair, which is
-        # a constant-radius circle. CONTROLLERS.md C6 carries the forensics.
+        # a constant-radius circle.
         #
         # 0 (the default) means "derive it from the horizon" in
         # ur_mpc.MPCController, so the arithmetic lives in exactly one place:
@@ -811,11 +807,11 @@ class Controller(Node):
                         f"{self.controller.last_status}, "
                         f"{self.controller.fail_count} consecutive, "
                         f"{self.controller.total_failures} total) - commanding "
-                        "ZERO thrust. The boat will drift. See CONTROLLERS.md C6.",
+                        "ZERO thrust. The boat will drift.",
                         throttle_duration_sec=1.0)
                 elif self.controller.last_solve_time > 0.5 * self.dt:
                     # The 20 Hz budget has never been measured on the boat's
-                    # companion computer (TODO.md section 2), and doubling the
+                    # companion computer, and doubling the
                     # horizon is precisely the change that would break it. This
                     # makes it visible from /rosout without a field harness (N7).
                     self.get_logger().warning(
@@ -824,15 +820,17 @@ class Controller(Node):
                         f"{self.dt * 1e3:.0f} ms tick.", throttle_duration_sec=5.0)
 
                 # Desired state for monitoring (first pose of the reference path)
-                desired_pose = self.controller_path.poses[0].pose
-                q = desired_pose.orientation
-                psi_d = R.from_quat([q.x, q.y, q.z, q.w]).as_euler('xyz')[2]
-                target = [desired_pose.position.x, desired_pose.position.y, psi_d]
-                world_target = list(target[:3])  # --- world-frame monitoring target ---
+                target = _reference_pose(self.controller_path)
+                world_target = list(target)  # --- world-frame monitoring target ---
                 
             if self.controller_type == 'PID':
                 target = cf.compute_target(self.controller_path, self.dt)
-                world_target = list(target[:3])  # --- world-frame monitoring target ---
+                # --- world-frame monitoring target ---
+                # poses[0], NOT target[:3]: cf.compute_target returns the SECOND
+                # pose of the window, so reporting it here made x_d/y_d mean the
+                # pose at tau + path_time on this branch and the pose at tau on
+                # the MPC branch. The law below still gets the full target.
+                world_target = _reference_pose(self.controller_path)
                 # Feed path tangent (target[2]) and authored speed (target[3])
                 # so LoS steering and speed feedforward use the real path.
                 psi_path, slow = target[2], False
@@ -862,7 +860,8 @@ class Controller(Node):
 
             if self.controller_type == 'LoS':
                 target = cf.compute_target(self.controller_path, self.dt)
-                world_target = list(target[:3])  # --- world-frame monitoring target ---
+                # --- world-frame monitoring target --- see the PID branch above
+                world_target = _reference_pose(self.controller_path)
                 u = self.los_guidance(target, current_state)
         
         elif self.use_pinger and self.pinger_target is not None: # MPC is not supported for this
@@ -1436,8 +1435,7 @@ class Controller(Node):
         bounded (the allocator scales the same way, and the MPC's input bounds
         are the same number). It binds on solve_LoS, which builds its array by
         hand, goes through no allocator, and can reach 30-40 N -- the most
-        likely source of the recorded thrust above the clamp that TODO.md
-        section 5 could not account for.
+        likely source of thrust recorded above the clamp before this landed.
         """
         limited, scale = tl.scale_to_limit(u, self.thrust_limit)
         if scale < 1.0:
@@ -1470,7 +1468,7 @@ class Controller(Node):
         Two changes, and neither touches the file's contents: the write happens
         on a slower timer of its own, and it is skipped entirely when no new row
         has arrived. The on-disk schema is byte-identical, so existing logs,
-        replay.py and every analysis script are unaffected (CM-7).
+        every analysis script and the log reviewer are unaffected (CM-7).
         """
         rows = len(self.monitoring)
         if rows == self.monitoring_saved_rows:

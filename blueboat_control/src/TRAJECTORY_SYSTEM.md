@@ -1,12 +1,10 @@
-# The BlueBoat Trajectory System — Complete Review
+# The BlueBoat Trajectory System
 
 **Scope:** how a reference trajectory is defined, evaluated, advanced in time, and turned
 into a target for the controller, in `blueboat_control`.
 
-**See also:** [CONTROLLERS.md](CONTROLLERS.md) — what each controller does with that target,
-compared side by side with simulated plots. Numbers quoted in this document come from that
-same closed-loop harness — **simulation evidence, not field data**; see "How the numbers in
-this document were produced" there.
+**See also:** `FIELD_TUNING.md` — every tuning knob, with real/sim defaults and a
+symptom→knob index. Numbers quoted here were measured in simulation, not on the water.
 
 **Files covered:**
 [master_control.py](master_control.py) ·
@@ -88,8 +86,8 @@ y and yaw with a bit of trigonometry and returns a `PoseStamped`. It is **pure i
 for `t = 12.0` a thousand times, in any order, you get the same pose a thousand times. `fsin`
 is the one shape that cannot be evaluated in closed form; it reads an integration table that
 is built once and only ever extended, which is a cache, not state: what comes back for a given
-`t` does not depend on what was asked for before it (§9, F1). A name that is not a shape
-raises rather than falling through (§9, F9).
+`t` does not depend on what was asked for before it. A name that is not a shape raises rather
+than falling through.
 
 The service [`generate_path`](_custom_libraries/path_generation.py) is just a loop:
 receive a list of `t` values, call `single_pose` on each, return them as a `nav_msgs/Path`.
@@ -110,17 +108,23 @@ formula** — there is no separate speed setting. `x = 0.5*t` *means* 0.5 m/s.
 | `straight_line` | Line along +x | 0.5 m/s | (0, **1**), yaw 0 |
 | `circle` | 4 m radius circle, centre (−4, 0) | 0.32 m/s | (0, 0), yaw **π/2** |
 | `sin` | Sine weave along +x, amplitude 3.5 m | 0.28–0.56 m/s | (0.5, 0), yaw 0 |
-| `fsin` | Oscillating heading, constant surge — weave of **1.5 m turn radius**, 300 s per cycle | 0.1 m/s | (0, 0), yaw 0 |
-| `square` | Square *wave* — instantaneous ±4 m jumps | 0.5 m/s + ∞ spikes | (0, **2**), yaw 0 |
+| `fsin` | Oscillating heading, constant surge — weave of **1.5 m turn radius**, 60 s per cycle | 0.5 m/s | (0, 0), yaw 0 |
+| `square` | Square *wave* — instantaneous ±4 m jumps ⚠ | 0.5 m/s + ∞ spikes | (0, **2**), yaw 0 |
 | `kin_square` | Zig-zag: +x, +y, +x, −y, 5 m legs | 0.3 m/s | (0, 0), yaw 0 |
 | `seabed_scanning` | Scripted survey with arcs and a helix | 0.5 m/s | (0, 0), yaw 0 |
 | `from_yaml:<path>` | Designer-generated file | whatever was authored | (0, 0), yaw 0 |
 
-> ⚠️ **Start alignment matters.** `robot_interface` zeroes the world frame at the boat's
-> position *and heading* when it boots
-> ([robot_interface.py:675-682](robot_interaction/robot_interface.py#L675-L682)). So the
-> trajectory always starts relative to wherever the boat was switched on. A trajectory that
-> begins at (0, 2) or at yaw π/2 asks the boat to make an immediate correction manoeuvre.
+> ⚠️ **`square` is not physically followable.** The `y` flip between +2 and −2 is an
+> instantaneous 4 m teleport. When that discontinuity falls inside the 0.05 s reference window,
+> `compute_target` reports a desired speed of `4.0 / 0.05 = 80 m/s` and a 90° heading step,
+> which goes straight into the LoS and PID speed feedforward. Use `kin_square`, the properly
+> time-parameterised version of the same idea.
+
+> ⚠️ **Start alignment matters.** Every shape is expressed in the `/blueboat/odom` world frame,
+> which is **local ENU**: the origin is the boat's launch point (position only — yaw is absolute
+> ENU and is *not* re-zeroed, fixed 2026-08-31), so a shape authored to start at (0, 0) with
+> `yaw = 0` starts at the launch position heading **East**. A trajectory that begins at (0, 2)
+> or at yaw π/2 asks the boat for an immediate correction manoeuvre.
 
 > ⚠️ **These shapes are reference conditions for existing field data.** Every earlier field
 > run was recorded against the formula as it stands here. Changing one invalidates comparison
@@ -134,9 +138,10 @@ formula** — there is no separate speed setting. `x = 0.5*t` *means* 0.5 m/s.
 > | Date | Shape(s) | What changed | Prior runs comparable? |
 > |---|---|---|---|
 > | 2026-08-28 | — | Baseline: every shape is at its original formula. | — |
-> | 2026-08-30 | `sin`, `kin_square` | **F7.** `t > 500` holds the last pose instead of teleporting back to the pose at t = 50. Below t = 500, bit-identical. | **Yes.** The path parameter advances at most 1.0 per second, and no run has come near τ = 500 (the longest harness scenario reaches τ ≈ 160), so the changed region was never exercised. |
-> | 2026-08-30 | `fsin` | **F1.** Per-pose re-integration replaced by a cumulative table on the same 0.01 s grid. | **Yes.** Bit-identical to the original loop at every sampled t; `check_trajectory_library.py` asserts it against an embedded copy of that loop. |
-> | 2026-09-01 | `fsin` | **Turn radius 0.1 m → 1.5 m**, now a named `radius` in the `fsin` branch of `single_pose`. Surge stays 0.1 m/s, so the radius sets the yaw-rate amplitude (`A = V/radius`) and the frequency follows it (`f = A/20`) to hold the total yaw swing fixed: the same curve, scaled 15×, one cycle every 300 s instead of 20 s. | **No.** Every pose moves. The old weave was ±0.23 m wide — the boat could not resolve it — so no earlier run on `fsin` is worth comparing against; `check_trajectory_library.py`'s reference poses were re-captured at the new radius, and it still asserts bit-identity against the Euler loop at both radii. |
+> | 2026-08-30 | `sin`, `kin_square` | `t > 500` holds the last pose instead of teleporting back to the pose at t = 50. Below t = 500, bit-identical. | **Yes.** The path parameter advances at most 1.0 per second, and no run has come near τ = 500 (the longest harness scenario reaches τ ≈ 160), so the changed region was never exercised. |
+> | 2026-08-30 | `fsin` | Per-pose re-integration replaced by a cumulative table on the same 0.01 s grid. | **Yes.** Verified bit-identical to the original loop at every sampled t. |
+> | 2026-09-01 | `fsin` | **Turn radius 0.1 m → 1.5 m**, now a named `radius` in the `fsin` branch of `single_pose`. The radius sets the yaw-rate amplitude (`A = V/radius`) and the frequency follows it (`f = A/20`), holding the total yaw swing fixed: the same curve, scaled 15×. | **No.** Every pose moves. The old weave was ±0.23 m wide — the boat could not resolve it — so no earlier run on `fsin` is worth comparing against. |
+> | 2026-09-07 | `fsin` | **Surge `_FSIN_V` 0.1 → 0.5 m/s** (commit `e6dff70`). The geometry is unchanged — the same 1.5 m turn radius — but it is traversed 5× faster: one cycle every 60 s instead of 300 s, yaw-rate amplitude 0.333 rad/s instead of 0.067, and `U_d = 0.5` reaching every controller's feedforward. | **No.** `fsin` runs recorded before and after this commit are not comparable. |
 
 ---
 
@@ -219,7 +224,9 @@ fac_cross = clip((gov_Emax - |e_y|)  /(gov_Emax - gov_Emin), 0, 1)   # 1 when go
 tau      += path_speed_scale * fac_along * fac_cross * dt
 ```
 
-`fac_cross` is disabled by default (`gov_Emax = 0`); see F5 below.
+`fac_cross` is disabled by default (`gov_Emax = 0`): throttling the target on an error the
+inner loops cannot reduce is positive feedback — the target stalls, the boat loses the forward
+authority it converges laterally with, and the offset grows. Raise the inner gains first.
 
 `factor` is the throttle on the target's motion:
 
@@ -285,9 +292,15 @@ The shape of the request depends on the controller, and that is the only thing
 
 ### PID and LoS — two poses are enough
 
-[`cf.compute_target`](_custom_libraries/custom_functions.py#L77) turns the two poses into a
+[`cf.compute_target`](_custom_libraries/custom_functions.py) turns the two poses into a
 6-element target `[x, y, psi, u, v, r]`: position and heading from the *second* pose, and
 velocities from the difference between them divided by `dt`.
+
+> The **second** pose is what the law is steered at, and that is deliberate — the velocities
+> have to come from somewhere. It is **not** what gets logged: `/monitoring_data[4:6]` (and so
+> the CSV's `target_x`/`target_y` and the `.npy`'s `x_d`/`y_d`) reports `poses[0]` in every
+> branch, via `_reference_pose`, so "target" means one thing whatever controller ran. At the
+> 0.05 s window the two differ by about 2.5 cm.
 
 Both then run the **canonical Fossen lookahead line-of-sight law**:
 
@@ -325,7 +338,7 @@ Path following is not always in charge. Priority order in
    the body frame. **τ is frozen while this is active** ([line 440](master_control.py#L682)),
    so when you release manual control the mission resumes exactly where it left off. Nice
    detail. Once the target is reached the boat **holds** it rather than stopping on it
-   (`manual_keep_location`, `CONTROLLERS.md` §4.4), so a current cannot carry it away while
+   (`manual_keep_location`), so a current cannot carry it away while
    the operator decides what to do next.
 2. **Pinger** (`use_pinger:=True`) — chases acoustic coordinates; `path_generation` isn't
    even launched in that mode.
@@ -360,298 +373,7 @@ Path following is not always in charge. Priority order in
 
 ---
 
-## 8. Design verdict
-
-**The architecture is sound and the maths is correct.** Specifically, three things are
-genuinely well done:
-
-1. **Path-parameter control instead of clock control.** This is the right answer to the
-   original problem, and the governor is a clean, minimal implementation of it: three lines
-   of code, no tuning traps, provably monotonic and speed-bounded.
-2. **The stateless-function trajectory model.** Because `single_pose(t)` is pure, the
-   trajectory can be swapped, re-derived, replayed, or hot-reloaded from disk with zero
-   coupling to the controller. It is also why the YAML feature could be bolted on without
-   touching a single line of control code.
-3. **Sign conventions are consistent.** I checked the cross-track error and lookahead law in
-   all three places it appears ([master_control.py:274-275](master_control.py#L274-L275),
-   [master_control.py:310-311](master_control.py#L310-L311),
-   [PID.py:166-176](PID/PID.py#L166-L176)) — all three agree with each other and with the
-   standard Fossen formulation. That is unusual and worth keeping.
-
-The problems below are all *around* the core, not in it.
-
----
-
-## 9. Review findings
-
-### 🔴 Blocking  — *both closed*
-
-**F1 — `fsin` will stall `path_generation` and, through it, the control loop.** *(closed)*
-`fsin` re-integrated the trajectory from t=0 in a Python loop with a 0.01 s step **on every
-single evaluation** — 30 000 iterations per pose at τ = 300 s, and ≈5×10⁸ for the 10 001-pose
-whole-path request `path_publisher` makes, which appeared to hang the launch.
-
-Closed form is not available: the heading is the integral of a sine and is analytic, but x
-and y are integrals of the cosine and sine *of that heading* and are not. So the integration
-is done once on the same fixed 0.01 s grid and read out by index
-([`_fsin_state`](_custom_libraries/path_generation.py)). The table only grows, and each
-extension continues the accumulation from its stored last value —
-`cumsum([last, *increments])`, never `cumsum(increments) + last` — so the float sequence is
-identical to a single pass and the function stays **pure in t**: the same t gives the same
-pose whatever order poses are asked for.
-
-Measured: bit-identical to the original loop at every sampled t, and the 10 001-pose window
-evaluates in **0.14 s** against ≈15 min extrapolated from the old loop. `check_trajectory_library.py`
-carries the original loop as its oracle and asserts both.
-
-**F2 — neither path controller can station-keep, or hold the end of a finished mission.**
-*(closed)*
-`LoS`'s surge command was `u_cmd = los_speed_scale * U_d * max(0, cos(psi_err))`, identically
-zero whenever the authored speed `U_d` is — `station_keeping`, a clamped-out YAML mission, or
-the not-yet-deployed-file fallback — so the boat steered onto the line through the target and
-then drifted off it with no restoring force.
-
-**`PID` was not fine either**, contrary to what this document and `CONTROLLERS.md` both used to
-say. Its outer `pid_x` loop does act on the along-track error whatever `u_ff` is, but it
-projects onto the *path tangent*, and a stationary reference has no meaningful tangent: a pure
-cross-track error produces no along-track error and therefore no surge. Measured, not reasoned:
-against a 4 N lateral current it drifted to 11.9 m and against 10 N to 30.6 m, as far as the
-broken `LoS`. Raising the inner gains to the C1 recommendation does not help — the limit is
-structural, not authority.
-
-Both are now gated by `hold_speed` (0.05 m/s) and `hold_radius` (0.5 m). `los_guidance` steers
-at the reference point and commands `min(los_hold_umax, w * los_hold_kx * gap)` of surge for
-the range `gap` outside the radius, never reverse — a lookahead law steers the wrong way
-backwards, so the yaw channel turns the boat round instead. The `PID` branch instead rotates
-the `psi_path` it hands `PIDLoS` toward the **bearing** to the hold point, fading in over
-`hold_radius`, so the class's own along-track error becomes the range and its own steering
-points at the point; `slow_on_turn`, the class's own option, stops it driving away while it
-turns round. Neither is a new control law — both re-aim laws that already existed.
-
-A **manual target** gets the same treatment from a third place, `manual_keep_location`, with its
-own `manual_hold_radius` / `manual_reacquire_radius` / `manual_hold_kx` rather than these
-parameters. The gains cannot be shared: `los_hold_kx` and `los_hold_umax` are velocities fed
-through `los_ku` and the allocator, while the point law writes its surge straight onto the wire.
-`CONTROLLERS.md` §4.4 carries the measurements.
-
-The blend weight `w = 1 - U_d/hold_speed` is **exactly zero** for every trajectory in the
-library (all ≥ 0.28 m/s against the gate), so path following is unchanged to the last bit for
-both controllers; `check_los_hold.py` asserts that against the real harness controllers rather
-than assuming it. Measured at 150 s, distance from the hold point:
-
-| case | LoS before | LoS after | PID before | PID after |
-|---|---|---|---|---|
-| displaced 2.2 m, no disturbance | 2.236 m | **0.499 m** | 1.433 m | **0.631 m** |
-| 4 N lateral current | 12.052 m, growing | **0.700 m** | 11.893 m, growing | **0.898 m** |
-| 10 N lateral current | 30.162 m, growing | **1.000 m** | 30.585 m, growing | **2.137 m** |
-| started 3 m past the point | 3.000 m | **0.499 m** | 3.000 m | **0.462 m** |
-
-Every "after" figure is steady (σ ≤ 0.05 m over the last 20 s) with zero thrust sign changes,
-so the hold settles rather than hunting, and neither controller overshoots outward on the way
-in.
-
-### 🟠 Important
-
-**F3 — `path_publisher` asks for the path exactly once, at construction.** *(closed)*
-It made a single blocking request in `__init__` and then republished that frozen `Path` at
-1 Hz forever, so for every GPS-anchored mission RViz showed a single dot at the origin for the
-entire run: the deployed file did not exist when `path_publisher` started.
-
-The request now repeats on a `refresh_period` (default 5 s, a declared parameter) and nothing
-blocks in `__init__` — neither on service discovery nor on a response — so the node reaches
-`spin()` even if `path_generation` is slow, starts later, or never starts. The last good path
-keeps publishing while a request is in flight, so the display never blanks, and a response
-that never arrives is dropped and retried rather than wedging the node. `/set_path` keeps its
-name, type and QoS (N1).
-
-Verified end to end: with the publisher started **first** and no service running, it reaches
-spin and publishes an empty path; when `path_generation` appears it picks up the origin hold;
-when the mission file is written it shows the real mission within one refresh; when the file is
-edited mid-run it follows.
-
-**F4 — MPC receives 15 poses but needs 16, at the wrong spacing.**
-`path_steps = 15`, `mpc_horizon = 15`, but `solve()` reads `poses[:N+1]` = 16
-([ur_mpc.py:216-218](MPC/ur_mpc.py#L216-L218)) and pads by duplicating the last pose — so the
-terminal reference always has **zero velocity**, telling the MPC to brake at the end of every
-horizon. Separately, the window spacing is `2.5/14 = 0.1786 s` while the MPC divides by
-`self.dt = 2.5/15 = 0.1667 s` ([ur_mpc.py:156](MPC/ur_mpc.py#L156)), so every reference speed
-is **7.1 % too high**.
-*Fix:* `self.path_steps = self.mpc_horizon + 1` — with `path_time` left at `mpc_time`, that
-single change makes the spacing `2.5/15` exactly, correcting both problems at once.
-
-*Measured impact:* small. Making this fix changes circle-tracking RMS error from 1.027 m to
-1.048 m — i.e. not at all. It is a real bug and worth fixing for correctness, but the metre of
-error it was suspected of causing turns out to come from the MPC's too-short prediction
-horizon instead (finding **C9** in [CONTROLLERS.md](CONTROLLERS.md), which has the evidence).
-Fix F4, but do not expect it to buy accuracy on its own.
-
-**F5 — The governor's cross-track term is built, and disabled.**
-A boat perfectly abreast of its target but **20 m off to the side** sees `e_along ≈ 0`, so on
-the along-track factor alone the governor runs at full authored speed and the target walks the
-whole mission while the boat is nowhere near the path. That was the one case where the
-reference could still "escape".
-
-`advance_governor` now takes `e_y` and multiplies in a second unit-bounded factor
-`clip((gov_Emax - |e_y|)/(gov_Emax - gov_Emin), 0, 1)`. The multiplicative form was chosen
-over `hypot(e_along, e_y)` because it is exactly 1 when `e_y = 0`, so it cannot perturb the
-along-track behaviour, and because a product of two `[0,1]` factors is still in `[0,1]` — τ
-stays monotonic and stays bounded by the authored speed.
-
-**`gov_Emax = 0` disables it, and that is the default.** The term is only safe once the inner
-loops can close a lateral gap. At the current gains they cannot, and throttling τ on an error
-the controller cannot reduce is positive feedback: the target stalls, the boat loses the
-forward authority it converges laterally with, and the offset grows. Measured at the current
-gains, acquisition RMS goes 0.661 → 3.508 m and progress 0.43× → 0.11×. At `u = 5 / r = 30`
-the same term is neutral-to-better everywhere. See `TODO.md` C1 and F5.
-
-**F6 — `square` is not physically followable.**
-[path_generation.py:351-359](_custom_libraries/path_generation.py#L351-L359) flips `y`
-between +2 and −2 with `math.floor` — an **instantaneous 4 m teleport**. When that
-discontinuity falls inside the 0.05 s window, `compute_target` reports a desired speed of
-`4.0 / 0.05 = 80 m/s` and a 90° heading step, which goes straight into the LoS surge
-feedforward and the PID feedforward. Either remove it or replace it with `kin_square`, which
-is the properly time-parameterised version of the same idea.
-
-**F7 — `sin` and `kin_square` jump *backwards* when the parameter runs out.** *(closed)*
-`if t > 500: t = 50` was not a clamp — it teleported the reference back to the pose at t = 50
-(`kin_square` went from x = 75.0 m at t = 499 to x = 10.0 m at t = 501). Both are now
-`t = min(t, 500.0)`, the "hold the last point" convention every other shape and the YAML
-loader already used, so the library has one rule rather than two.
-
-Past t = 500 the reference is stationary, so the authored speed `U_d` goes to zero and the
-station-keeping hold (F2) takes over: the boat holds the end of the shape instead of chasing a
-teleport. Below t = 500 both shapes are bit-identical to what they were, and no harness
-scenario reaches t = 500 at all (the longest gets to τ ≈ 102), so every number in
-`CONTROLLERS.md` is unaffected. The same change is mirrored in
-[docs/controllers/sim.py](docs/controllers/sim.py), whose copy of `single_pose` must stay
-verbatim; `check_trajectory_library.py` asserts that it has.
-
-### 🟡 Worth fixing
-
-**F8 — Body-frame velocity feedback. Decided: no change, the disabled correction was wrong.**
-[robot_interface.py:467-472](robot_interaction/robot_interface.py#L467-L472) — the disabled
-block argued that MAVROS's linear velocity arrives in the raw `map` frame, so that rotating it
-by −yaw0 was needed to keep pose and twist in one frame. It does not arrive in `map`. MAVROS
-publishes `/mavros/local_position/odom` with `child_frame_id: base_link` and its twist already
-rotated into that frame (`local_position.cpp`, `transform_frame_enu_baselink`, both the
-`LOCAL_POSITION_NED` and `_COV` handlers); the ENU velocity goes out separately on
-`local_position/velocity_local`.
-
-Measured against mavros 2.14.0 driven by a synthetic FCU holding 1 m/s due **north**, so the
-two readings separate: at heading north the odom twist reads (1.000, 0.000), at heading NE it
-reads (0.707, 0.707) — the body-frame values — while `velocity_local` reads (0.000, 1.000) at
-both. End to end through `robot_interface` at `yaw0 = 45°`, `/blueboat/odom` carries (0.707,
-0.707) with the pose position translated to the launch point (since 2026-08-31 the frame is
-local ENU: yaw is no longer re-zeroed). So `master_control`'s `current_twist[0]`
-([master_control.py:401](master_control.py#L401)) is already body-frame surge, and enabling the
-block would have turned a correct 0.707 into 1.000. The block and its argument are removed;
-N3 stands. Two independent facts agree: the pinger dead-reckoning at `robot_interface.py:505`
-subtracts `self.vel + ω × p` from body-frame pinger coordinates, which is only dimensionally
-correct if `self.vel` is body-frame too.
-
-**F9 — An unknown `trajectory:=` name crashes the service.** *(closed)*
-`single_pose` was a chain of `if`s with no `else` and no defaults, so a typo
-(`trajectory:=circel`) left a local undefined → `UnboundLocalError` inside the service handler.
-rclpy does not marshal a callback exception back to the caller, so the effect was that
-`path_generation` **died on the first request** and `master_control` logged "Nothing to target
-yet." forever with no hint as to why.
-
-The name is now validated in `PathGeneration.__init__` against `SHAPES`: an unrecognised one
-logs a FATAL naming the shape and the full valid set, and the node exits at launch, before
-anything is armed. `master_control` then holds at zero thrust, which it already does on the
-no-path early return. The `if` chain is also `if`/`elif` with a terminating `else` that raises
-`ValueError` carrying the same message, so the pure function is diagnosable on its own and the
-unbound local cannot come back.
-
-```
-[FATAL] [path_generation]: unknown trajectory 'circel'. valid: station_keeping, circle,
-  straight_line, sin, fsin, square, kin_square, seabed_scanning, from_yaml:<abs path>
-```
-
-**F10 — `/controller_target` is only published in pinger mode. Decided: no change.**
-[master_control.py:432-435](master_control.py#L432-L435) sits inside the `elif use_pinger`
-branch, so during path following and manual-target control the topic is silent. It stays that
-way. The topic carries the **body-frame** pinger vector, while the world-frame target is
-already on `/monitoring_data[4:6]` in every branch (N9) — which is what the station map and
-the no-pinger CSV read — and `robot_interface`, the only subscriber in the project, stores the
-value without ever reading it. Hoisting would either put two different frames on one topic or
-duplicate a signal that already exists.
-
-**F11 — The path tangent comes from the authored yaw, not from the geometry.**
-`gamma_p` is read from the pose's quaternion. For the built-in trajectories yaw and direction
-of travel agree, so this is correct today. But nothing enforces it: a YAML mission that
-authors a crab-wise heading (yaw ≠ course, entirely plausible for a side-scan survey in
-current) would feed a wrong tangent into the LoS law and bend the path. Consider deriving
-`gamma_p` from `atan2(y1-y0, x1-x0)` and treating the authored yaw as a separate
-heading *setpoint*.
-
-**F12 — τ never resets on re-arm.**
-`self.time_set` latches `True` on the first tick ([line 402-405](master_control.py#L386-L389))
-and is never cleared, so if `/blueboat/controller_ready` drops and comes back (motor
-disable/enable, safety stop), τ resumes mid-mission rather than restarting. That may well be
-desirable — but it is undocumented and there is no way to command a reset. A `reset_tau`
-service would be two lines.
-
-**F13 — Monitoring uses wall clock while control uses the ROS clock.**
-`current_time = time.time() - self.initial_time` ([line 407](master_control.py#L649)) versus
-`self.get_time()` from `get_clock()` ([line 224](master_control.py#L228)). Under
-`use_sim_time:=True` these diverge whenever Gazebo does not run at real time, so the saved
-`.npy` timestamps do not line up with the simulation. Also, since the log stores a string
-header row alongside float rows, `np.save` silently coerces **the entire array to strings**
-([line 214](master_control.py#L751) + [line 568](master_control.py#L399)).
-
-**F14 — No mission-complete signal.**
-When a finite mission ends, τ keeps incrementing forever into the clamped region. Nothing
-publishes "done", nothing stops the thrusters, nothing tells the operator. Worth a
-`/mission_complete` latched Bool once `tau > duration`.
-
-**F15 — Dead code.** *(closed)* `single_request` published to a `self.pose_publisher` that
-was never created, so it would have raised `AttributeError` if anything had called it. Nothing
-did. It and the then-unused `std_msgs` import are gone.
-
-**F16 — Tuning constants are ROS parameters.** *(closed)*
-`_declare_tuning_parameters` declares all of them — the governor pair and the new cross-track
-pair, both lookaheads, every LoS and PID gain, the MPC horizon and weights, the point-following
-gains, `safety_distance`, the five manual keep-location knobs, `thrust_limit` and `control_dt`
-— each with its previous value as the default, so nothing moved. These are exactly the knobs you want to change on a boat ramp
-without a rebuild, and now you can: `--params-file`, or `-p <name>:=<value>`.
-
-**F18 — No zero-thrust on loss of reference.** *(closed)*
-Several paths in `timer_callback` returned early without publishing, and `robot_interface`
-kept streaming the **last received** `thruster_input` to the motors, so a stalled
-`master_control` left the boat running at its last commanded thrust indefinitely. Fixed at
-both ends. `master_control` publishes an explicit `[0, 0]` on each of its three early returns
-instead of falling silent. `robot_interface` and `simulation_interface` each run a
-`thruster_input_timeout` watchdog (0.5 s, a declared parameter — ten missed ticks of the
-producer's 20 Hz loop, and well inside ArduPilot's own `RC_OVERRIDE_TIME`) that zeroes the
-thrust and releases itself when commands resume. That is what covers the case a publish cannot:
-a crashed or hung controller.
-
-It zeroes and does **not** disarm: these stalls are transient by design, and `full_stop()`
-stays bound to the operator `stop` command. On the real boat the zeroing goes through
-`manualMove([0, 0])` without `force`, so the `enable_motors` gate still holds.
-
-Measured. Node-level, at the PWM on `/mavros/rc/override`: 400 messages over 20 s of steady
-20 Hz publication with no trip, neutral 1500/1500 reached 0.53 s after the last command, held,
-and back to the commanded PWM on resume. In Gazebo, with the boat under way at 0.193 m/s and
-3.03 N per thruster, killing `master_control` zeroed both thrusters at t+0.51 s and the boat
-coasted to 0.003 m/s.
-
----
-
-## 10. Suggested order of work
-
-| Priority | Items | Effort |
-|---|---|---|
-| 1 | **F4** (MPC off-by-one + 7 % speed error), **F5** (cross-track gating) | small |
-| 2 | **F14** (mission complete) | small |
-| 3 | **F6** (fix or remove `square`) | trivial |
-
-**F1**, **F3**, **F7**, **F9**, **F15** and **F16** are closed; see §9.
-
----
-
-## 11. Cheat sheet
+## 8. Cheat sheet
 
 ### Launch
 
@@ -668,40 +390,26 @@ ros2 launch blueboat_control BlueBoat_launch.py \
     controller_type:=LoS trajectory:=from_yaml:/home/op/.config/blueboat_mcs/trajectories/survey.yaml
 ```
 
-### The knobs that shape the trajectory behaviour
+### The knobs
 
-All of the `master_control` rows below are **ROS parameters** (F16), declared in
-[`_declare_tuning_parameters`](master_control.py#L753); the "default" column is what they
-declare. Override with `-p <name>:=<value>` or `--params-file`, no rebuild.
-
-| Constant | File / line | Default | Effect |
-|---|---|---|---|
-| `control_dt` | [master_control.py:257](master_control.py#L257) | 0.05 | Control loop period (20 Hz) |
-| `path_speed_scale` | [master_control.py:260](master_control.py#L260) | 1.0 | Global mission speed multiplier |
-| `gov_Lmin` | [master_control.py:261](master_control.py#L261) | 0.5 m | Along-track gap below which τ runs at full speed |
-| `gov_Lmax` | [master_control.py:262](master_control.py#L262) | 3.0 m | Along-track gap at which τ **freezes** |
-| `gov_Emin` / `gov_Emax` | [master_control.py:273-274](master_control.py#L273-L274) | 0.5 m / **0** | Cross-track equivalents; `gov_Emax = 0` disables the term (F5) |
-| `los_lookahead` | [master_control.py:284](master_control.py#L284) | 2.5 m | LoS aggressiveness (↑ = gentler) |
-| `pid_lookahead` | [master_control.py:281](master_control.py#L281) | 2.5 m | Same, for the PID controller |
-| `los_ku` / `los_kpsi` / `los_kd` | [master_control.py:285-287](master_control.py#L285-L287) | 20 / 10 / 1 | LoS surge, heading, yaw damping |
-| `inner_gains_u` / `inner_gains_r` | [master_control.py:279-280](master_control.py#L279-L280) | 1.0 / 1.5 | PID inner loops (C1 — low against drag) |
-| `mpc_horizon` / `mpc_time` | [master_control.py:298-299](master_control.py#L298-L299) | 15 / 2.5 s | MPC prediction window |
-| `thrust_limit` | [master_control.py:312](master_control.py#L312) | 20.0 N | Allocator clamp and MPC input bounds |
-| `total_time` / `dt` | [path_publisher.py](_custom_libraries/path_publisher.py) | 1000 s / 0.1 s | RViz preview extent only |
-| `refresh_period` | [path_publisher.py](_custom_libraries/path_publisher.py) | 5.0 s | How often the whole path is re-requested — what picks up a mission deployed or edited after launch |
+Every tuning constant is a declared ROS parameter — the full table, with real/sim
+defaults and a symptom→knob index, is in `FIELD_TUNING.md`. The two that belong to the
+*preview* rather than the control loop live in `path_publisher.py`: `total_time` / `dt`
+(1000 s / 0.1 s, the RViz extent) and `refresh_period` (5.0 s, how often the whole path is
+re-requested — what picks up a mission deployed or edited after launch).
 
 ### Debugging by symptom
 
 | Symptom | Look at |
 |---|---|
 | Thrusters go to zero mid-mission | The loss-of-reference watchdog fired: `master_control` stopped publishing. Look for `No /thruster_input for …` in the interface node's log |
-| "Nothing to target yet." forever | `/path_request` service down. A bad `trajectory:=` name is no longer a cause — since **F9** it is refused at launch with a FATAL naming the valid set |
+| "Nothing to target yet." forever | `/path_request` service down. A bad `trajectory:=` name is no longer a cause — it is refused at launch with a FATAL naming the valid set |
 | Boat sits still, mission never starts | τ frozen → `e_along` ≥ 3 m. Check the trajectory's start offset (§3) |
-| Boat drifts off during station-keeping | Not F2 — that is closed for both controllers. Check `hold_speed` was not launched at 0, which disables the hold in both |
+| Boat drifts off during station-keeping | Check `hold_speed` was not launched at 0, which disables the zero-authored-speed hold in both controllers |
 | Boat drifts off a reached **manual** target | Check `manual_hold_radius` was not launched at 0, which disables the keep-location hold and restores the old abandon-on-arrival behaviour |
 | Target jumps somewhere far away every few ticks, on every controller | **Two `/path_request` servers** — a second mission launch that was never shut down. Since 2026-09-03 the second `path_generation` refuses to start, and `master_control` rejects any response that does not answer its own request and logs an error naming both servers. On an older build, check `ros2 node list` for two `path_generation` entries. The station's LIVE DISTANCE plot renders the tick-by-tick alternation as a square wave because it decimates by stride |
 | `Path window stale (…) - holding tau` in the log | The path server stopped answering. `tau` is deliberately frozen rather than advanced against a window that is no longer a reference, so the boat holds the last good target instead of running open loop |
-| RViz shows nothing / one dot | Since **F3** the path is re-requested every `refresh_period`, so check `path_generation` is up and, for a `from_yaml` mission, that the file has been deployed |
+| RViz shows nothing / one dot | The path is re-requested every `refresh_period`, so check `path_generation` is up and, for a `from_yaml` mission, that the file has been deployed |
 | Mission runs slower than authored | Working as designed — the governor is throttling. Check `e_along` |
-| Wild speed spikes in the log | `trajectory:=square` (**F6**). Not a τ wrap-around — **F7** is closed, the parameter range clamps |
-| Path mirrored / diagonal drift on the real boat | Not the velocity frame — **F8** is settled, the twist is body-frame. Check the `SERVO1`/`SERVO3` → right/left wiring, `TODO.md` §2 |
+| Wild speed spikes in the log | `trajectory:=square` — its 4 m discontinuity (§3). Not a τ wrap-around: the parameter range clamps |
+| Path mirrored / diagonal drift on the real boat | Not the velocity frame — the MAVROS twist is body-frame and measured as such (CLAUDE.md N3). Check the `SERVO1`/`SERVO3` → right/left thruster wiring |
