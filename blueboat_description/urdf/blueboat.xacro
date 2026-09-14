@@ -71,7 +71,6 @@
   
 <xacro:include filename="hydrodynamics.xacro"/>
 <xacro:include filename="$(arg thrusters).xacro"/>
-<!-- <xacro:include filename="sensors.xacro"/> -->
 
   
 <!-- other Gazebo plugins -->

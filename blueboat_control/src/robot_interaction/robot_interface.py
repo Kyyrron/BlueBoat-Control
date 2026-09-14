@@ -1,33 +1,49 @@
 #!/usr/bin/env python3
 
 # ============================================================================
-# PATCHED for the Mission Control Station (logging update). Marked with
-# "# --- logging update ---". Changes:
-#   1. CSV columns reorganised with the important ones FIRST (names kept):
-#      date, robot pose, target, [pinger + GPS], thrusters, then raw sensors.
-#   2. All log rows are filled BY COLUMN NAME (df.loc with the column label)
-#      instead of positional iloc indices, so the order can never silently
-#      de-synchronise from the data again.
-#   3. Fixed swapped thruster columns: thruster_input is [right, left]
-#      (master_control convention), but index 0 was written into
-#      'left_thr_in' in both logging paths.
-#   4. Pinger-mode CSV: removed the duplicated 'target_x/y/psi' columns
-#      (they were /controller_target = the same pinger vector as
-#      'corrected_pinger_x/y', just in the robot frame); the world-frame
-#      corrected_pinger columns are kept.
-#   5. Fixed the no-pinger target logging: /monitoring_data x_d/y_d are now
-#      world-frame for every controller (patched master_control), the two
-#      debug spam logs are removed, and an empty monitoring buffer logs
-#      zeros without raising.
-# Everything else is byte-identical to the original.
+# MAVROS bridge, thrust -> PWM, pose re-zeroing, pinger dead reckoning and the
+# position CSV. Two things here are easy to get wrong and are commented at the
+# point they happen rather than here:
+#
+#   * THRUST SATURATION IS UNIFORM, NOT PER-SIDE (manualMove, section 3). The
+#     two thrusters carry one wrench, so clipping each independently rewrites
+#     the command instead of clamping it -- [+45, +18] became [+20, +18], which
+#     collapses the turn and makes the boat diverge. See thrust_limits.py.
+#   * ONE CSV WRITER, BOTH LAYOUTS (section 8). The pinger layout used to be
+#     written from uw_gps_callback, so a Water Linked dropout stopped recording
+#     the robot too. That callback now only caches; the timer owns the file.
+#
+# Column layout, its revision history and the actuation_state encoding live in
+# _custom_libraries/robot_log_schema.py. Rows are filled BY COLUMN NAME so the
+# two can never desynchronise.
 # ============================================================================
+
+# ----------------------------------------------------------------------------
+# FILE MAP (class BlueBoatController) -- sections are banner-commented below.
+#
+#   1. WIRING                     __init__
+#   2. MAIN LOOP AND SAFETY       timer_callback, thruster_input_stale, full_stop
+#   3. THRUST -> PWM              manualMove                   <-- calibration, N4 gate
+#   4. OPERATOR COMMANDS          str_input_callback, move_callback,
+#                                 request_param_mode
+#   5. POSE / PINGER              odom_callback                <-- frame re-zeroing
+#   6. INBOUND TELEMETRY          imu_, gps_, state_, uw_gps_, target_,
+#                                 thr_input_, monitoring_data_, param_, mode_
+#   7. MAVROS PLUMBING            set_servo, send_rc_override, setArmedStatus,
+#                                 SetMode, set_motors, publish
+#   8. CSV LOGGING                log_timer_callback
+#
+# Moved out of this file:
+#   CSV column layout  ->  _custom_libraries/robot_log_schema.py  (data only,
+#                          ROS-free; write-once field-data contract, CM-7)
+# ----------------------------------------------------------------------------
 
 # Common libraries import
 import os
+import re
 import time
 from datetime import datetime
 import numpy as np
-import pandas as pd
 
 # ROS2 import
 import rclpy
@@ -46,6 +62,8 @@ from mavros_msgs.srv import CommandLong
 
 # Custom imports
 import custom_functions as cf
+import robot_log_schema as rls   # CSV column layout (ROS-free, _custom_libraries/)
+import thrust_limits as tl       # uniform thrust saturation (ROS-free)
 
 # RC override channel conventions (MAVLink / mavros)
 CHAN_RELEASE = 0        # give the channel back to the RC receiver
@@ -53,6 +71,11 @@ CHAN_NOCHANGE = 65535   # leave the channel untouched
 PWM_NEUTRAL = 1500
 
 class BlueBoatController(Node):
+
+    # ======================================================================
+    #  1. WIRING
+    #  parameters, topics, service clients, timers.
+    # ======================================================================
 
     def __init__(self):
         super().__init__('blueboat_controller')
@@ -74,6 +97,25 @@ class BlueBoatController(Node):
 
         self.declare_parameter('controller_type', '') 
         self.controller_type = self.get_parameter('controller_type').get_parameter_value().string_value
+
+        # Loss-of-reference watchdog. master_control publishes /thruster_input once
+        # per 20 Hz control tick; 0.5 s is ten consecutive missed ticks, well outside
+        # DDS jitter at that rate and well inside ArduPilot's own RC_OVERRIDE_TIME.
+        self.declare_parameter('thruster_input_timeout', 0.5)
+        self.thruster_input_timeout = self.get_parameter('thruster_input_timeout').get_parameter_value().double_value
+
+        # Per-thruster saturation, same name and default as master_control's.
+        # This used to be two hard-coded literals inside manualMove, which meant
+        # master_control's thrust_limit parameter bought nothing on the real boat:
+        # raising it there just moved the clamp to the one here that no parameter
+        # could reach. One name, one number, both ends.
+        self.declare_parameter('thrust_limit', 20.0)
+        self.thrust_limit = self.get_parameter('thrust_limit').get_parameter_value().double_value
+
+        # Empty means "resolve it" - see custom_functions.data_root for the order.
+        self.declare_parameter('data_dir', '')
+        self.data_root = cf.data_root(
+            self.get_parameter('data_dir').get_parameter_value().string_value)
 
         ################## ROS2 Communication ##################
         ## Publishers
@@ -137,6 +179,20 @@ class BlueBoatController(Node):
         self.last_ready_tx = 0.0
         self.ready_republish_period = 1.0
 
+        # Loss-of-reference watchdog state. last_thr_rx is None until the first
+        # /thruster_input arrives, which is itself a "no reference" condition.
+        self.last_thr_rx = None
+        self.thr_watchdog_tripped = False
+
+        # E-STOP latch. Set by full_stop() (the 'stop' token), cleared ONLY by
+        # 'enable'. Without the latch a 'stop' is undone one tick (50 ms) later
+        # by the next manualMove(self.thruster_input): full_stop zeroes the
+        # thrust it holds, but master_control keeps publishing. The latch is
+        # what makes E-STOP an actual stop now that it no longer works by
+        # dropping out of override.
+        self.estopped = False
+        self.motors_disabled_logged = False
+
         self.timer = self.create_timer(0.05, self.timer_callback)
         self.log_timer = self.create_timer(0.33, self.log_timer_callback) # 3 times per seconds 
 
@@ -175,93 +231,558 @@ class BlueBoatController(Node):
 
         ################## Initialize data collection ##################
 
-        # --- logging update: important columns first (names kept) ---
-        if not self.use_UWgps:
-                self.data_columns = ['Year',
-                                'Month',
-                                'Day',
-                                'Hour',
-                                'Minute',
-                                'Second',
-                                'MicroSecond',
-                                'relative_x',
-                                'relative_y',
-                                'relative_psi',
-                                'target_x',
-                                'target_y',
-                                'gps_latitude',
-                                'gps_longitude',
-                                'right_thr_in',
-                                'left_thr_in',
-                                'quat_x',
-                                'quat_y',
-                                'quat_z',
-                                'quat_w',
-                                'ang_vel_x',
-                                'ang_vel_y',
-                                'ang_vel_z',
-                                'lin_acc_x',
-                                'lin_acc_y',
-                                'lin_acc_z']
+        # Column layout lives in robot_log_schema.py (ROS-free, in
+        # _custom_libraries/). It is a WRITE-ONCE field-data contract: read the
+        # module docstring before touching a name or an order. Rows are filled
+        # by column NAME below, never by index, so the two cannot desynchronise.
+        self.data_columns = rls.columns_for(self.use_UWgps)
+        # ((world_x, world_y), (latitude, longitude)) under this layout's names,
+        # so the shared leading block is filled once instead of branched twice.
+        self.target_cols, self.target_gps_cols = rls.target_columns_for(self.use_UWgps)
 
-        else:
-            self.data_columns = ['Year',
-                                'Month',
-                                'Day',
-                                'Hour',
-                                'Minute',
-                                'Second',
-                                'MicroSecond',
-                                'relative_x',
-                                'relative_y',
-                                'relative_psi',
-                                'corrected_pinger_x',
-                                'corrected_pinger_y',
-                                'gps_latitude',
-                                'gps_longitude',
-                                'pinger_latitude',
-                                'pinger_longitude',
-                                'right_thr_in',
-                                'left_thr_in',
-                                'aco_x',
-                                'aco_y',
-                                'aco_z',
-                                'ant_x',
-                                'ant_y',
-                                'ant_z',
-                                'lat',
-                                'lon',
-                                'dep',
-                                'filaco_x',
-                                'filaco_y',
-                                'filaco_z',
-                                'quat_x',
-                                'quat_y',
-                                'quat_z',
-                                'quat_w',
-                                'ang_vel_x',
-                                'ang_vel_y',
-                                'ang_vel_z',
-                                'lin_acc_x',
-                                'lin_acc_y',
-                                'lin_acc_z']
-
-        self.data_size = len(self.data_columns)
-
-        self.uw_gps_log = [0]*self.data_size
-
-        self.df_log = pd.DataFrame(np.zeros(self.data_size).reshape(1, self.data_size),
-                                  columns=self.data_columns)
+        # Latest /uw_gps_data packet (19 raw values), CACHED here by
+        # uw_gps_callback. That callback used to assemble and write a CSV row
+        # itself, which tied the whole log -- robot pose included -- to the Water
+        # Linked link: a UGPS dropout stopped recording the boat. Now it only
+        # caches, and log_timer_callback is the single writer for both layouts.
+        self.uw_gps_log = [0.0] * 19
 
         self.date = datetime.today().strftime('%Y_%m_%d-%H_%M_%S')
-        os.makedirs('../../../data/Robot_data', exist_ok=True)  # avoid every log write silently failing when the folder is missing
-        self.path = f'../../../data/Robot_data/{self.date}-{self.note}-poslog.csv'
+        log_dir = cf.ensure_data_dir(self, self.data_root, 'data', 'Robot_data')
+        stem = f'{self.date}-{self.note}-poslog' if self.note else f'{self.date}-poslog'
+        self.path = cf.reserve_run_file(log_dir, stem, '.csv') + '.csv'
+        # Sidecar name derived by pattern, not by a fixed-length slice: when
+        # reserve_run_file breaks a same-second collision the CSV is
+        # '...-poslog-2.csv', and stripping len('-poslog.csv') characters from
+        # that produced a mangled '...-pos-origin.yaml' that no reader finds.
+        self.origin_path = re.sub(r'-poslog(-\d+)?\.csv$', r'-origin\1.yaml', self.path)
+
+        # Header once, then one appended-and-flushed row per tick. The previous
+        # version accumulated every row in a DataFrame and rewrote the WHOLE file
+        # on each write, which is O(n^2) in both time and bytes and, despite the
+        # comment claiming it was "for safety in case of unexpected shutdowns",
+        # is strictly less safe than this: a row appended and flushed is already
+        # on disk, and a kill mid-rewrite truncates a full file rather than one
+        # row. index=False drops the unnamed pandas index column the old writer
+        # emitted (it read 0 on every row), and there is no all-zero seed row.
+        self.log_file = open(self.path, 'w', buffering=1)
+        self.log_file.write(','.join(self.data_columns) + '\n')
+        self.log_file.flush()
+        self.origin_written = False
+        self.get_logger().info(f"Position log: {self.path}")
+
+    # ======================================================================
+    #  2. MAIN LOOP AND SAFETY
+    #  20 Hz tick + loss-of-reference watchdog. Zero thrust on any doubt.
+    # ======================================================================
+
+    def timer_callback(self):
+        """
+        Main loop
+        """
+
+        ################## Initialize robot ##################
+        if not self.init:
+            # Wait until connected
+            if not self.robot_state.connected:
+                self.get_logger().info('Waiting for FCU connection...')
+                return
+
+            # Set mode
+            if self.robot_state.mode != "MANUAL": 
+                self.SetMode('MANUAL')
+                return
+
+            self.request_param_mode('override')
+
+            self.init = True
+
+        ################## Handshake maintenance ##################
+        # Re-send the mode request until param_set confirms it. This closes the
+        # discovery race that used to make the launch hang at random.
+        if (self.desired_param_mode is not None
+                and self.mode != self.desired_param_mode
+                and time.time() - self.last_param_tx > self.param_retry_period):
+            self.get_logger().info(f"Waiting for param mode '{self.desired_param_mode}' (current: '{self.mode}'), re-requesting...")
+            self.last_param_tx = time.time()
+            self.publish(String(), self.desired_param_mode, self.param_publisher)
+
+        # Wait for direct control to be enabled
+        if self.mode != 'override':
+            return
+
+        ################## E-STOP latch ##################
+        # Held until an explicit 'enable'. Everything below is skipped, and the
+        # thrust command is re-zeroed every tick through the UNFORCED manualMove
+        # so the enable_motors gate still owns the actuator (N4). full_stop() has
+        # already set enable_motors False, so that call takes the neutral-hold
+        # path below and pins the passthrough channels at 1500/1500 rather than
+        # going silent.
+        if self.estopped:
+            self.thruster_input = [0, 0]
+            self.manualMove([0, 0])
+            # Re-assert the withdrawal of readiness at the normal republish rate
+            # (not at 20 Hz): master_control stops commanding, and the station
+            # reads this as its E-STOP acknowledgement.
+            if time.time() - self.last_ready_tx > self.ready_republish_period:
+                self.last_ready_tx = time.time()
+                self.publish(Bool(), False, self.set_controller_publisher)
+            return
+
+        ################## Control loop ##################
+        
+        # Start recording time
+        if not self.time_set:
+            self.initial_time = time.time()
+
+            # Send ready msg to controller node
+            self.publish(Bool(), True, self.set_controller_publisher)
+            self.last_ready_tx = time.time()
+
+            self.time_set = True
+
+        # Periodically re-publish readiness so a controller node that finished
+        # starting late (e.g. blocked on the path service) still receives it
+        if time.time() - self.last_ready_tx > self.ready_republish_period:
+            self.last_ready_tx = time.time()
+            self.publish(Bool(), True, self.set_controller_publisher)
+        
+        current_time = time.time()
+        
+        ## Send input to thrusters
+
+        # If no controller is set, allow for manual input
+        if self.controller_type == '' and current_time - self.initial_time >= self.manual_move_timer:
+            self.manualMove([0, 0]) # If override + no controler, stop the robot after any manual move command
+
+        # Loss-of-reference watchdog: a controller is configured but has gone quiet.
+        # Zero the thrust and keep zeroing it until commands come back. Deliberately
+        # NOT full_stop(): that also disarms, and these stalls are transient by design.
+        # The call goes through manualMove without force, so the enable_motors gate
+        # still holds (N4) - this is not a new /mavros/rc/override bypass.
+        elif self.thruster_input_stale(current_time):
+            if not self.thr_watchdog_tripped:
+                self.thr_watchdog_tripped = True
+                self.get_logger().warn(
+                    f"No /thruster_input for {self.thruster_input_timeout:.2f} s "
+                    f"(controller_type='{self.controller_type}') - zeroing thrust.")
+            self.thruster_input = [0, 0]
+            self.manualMove([0, 0])
+
+        else:
+            if self.thr_watchdog_tripped:
+                self.thr_watchdog_tripped = False
+                self.get_logger().info("/thruster_input resumed - releasing watchdog.")
+            self.manualMove(self.thruster_input)        
+
+    def thruster_input_stale(self, now):
+        """
+        Loss-of-reference watchdog predicate.
+
+        True when a controller is configured but its /thruster_input has gone
+        quiet for longer than thruster_input_timeout - a stalled, crashed or
+        early-returning master_control. Without this the last received thrust
+        keeps being streamed to the motors indefinitely.
+
+        Inert when no controller is configured: that case already has its own
+        stale-command guard (manual_move_timer, set by the 'move' CLI command).
+        """
+        if self.controller_type == '':
+            return False
+        if self.last_thr_rx is None:
+            return True
+        return (now - self.last_thr_rx) > self.thruster_input_timeout
+
+    def full_stop(self):
+        """
+        EMERGENCY STOP. Cancels any thruster input, latches the motor gate off
+        and disarms.
+
+        Deliberately does NOT change the parameter mode: dropping out of
+        override is a separate operator action ('default'), because leaving
+        override hands the RC channels back to whatever else is transmitting.
+        An E-STOP must remove authority from everyone, not transfer it.
+
+        The latch is what makes this stick - see self.estopped.
+        """
+        self.estopped = True
+        self.thruster_input = [0,0]
+        self.manualMove([0,0], force=True)
+        self.setArmedStatus(False) 
+        self.set_motors(False)
+        # Immediate acknowledgement, published here rather than from the timer
+        # so it does not depend on the timer reaching its override branch: the
+        # station waits on this to confirm the E-STOP landed, and master_control
+        # zeroes its own output on it.
+        self.publish(Bool(), False, self.set_controller_publisher)
+        self.last_ready_tx = time.time()
+        self.get_logger().warn("E-STOP: thrust zeroed, motors disabled, disarmed. "
+                               "Send 'enable' to release the latch.")
+
+    def release_estop(self):
+        """Clear the E-STOP latch and re-enable the motor gate ('enable')."""
+        if self.estopped:
+            self.get_logger().warn("E-STOP latch released by operator 'enable'.")
+        self.estopped = False
+        self.motors_disabled_logged = False
+        self.set_motors(True)
+
+    # ======================================================================
+    #  3. THRUST -> PWM CALIBRATION
+    #  The enable_motors gate (N4) and the Newton->PWM mapping. Tunable.
+    # ======================================================================
+
+    def manualMove(self, input, force=False):
+        """
+        Convert a newton input to pwm and stream it to the motors through RC override
+        """
+
+        # Safety gate (N4 / superproject CM-16).
+        #
+        # With the gate closed this used to `return`, i.e. publish NOTHING. That
+        # is not inert: by then param_set has already mapped SERVO1/3_FUNCTION to
+        # RCIN1/RCIN3 passthrough, so the ESCs follow RC channels 1 and 3 from
+        # whatever else is transmitting - a hand transmitter, a QGC joystick, or
+        # ArduPilot's own RC failsafe values - and nothing is feeding
+        # RC_OVERRIDE_TIME to keep those channels ours. Motors could and did spin
+        # with enable_motors:=False.
+        #
+        # So the closed gate now HOLDS NEUTRAL instead of going silent: thrust 0
+        # is an exact knot of the calibration table (0 N -> 1500 us, and
+        # 3000 - 1500 = 1500 for the reversed side), so this pins both channels at
+        # true neutral at the loop rate and keeps the override watchdog fed. No
+        # commanded thrust ever reaches the water while the gate is closed, which
+        # is what the gate has always promised; the CSV's actuation_state still
+        # reports ACT_MOTORS_DISABLED for the whole run.
+        #
+        # Only meaningful while we own the channels. Outside override the
+        # autopilot is not listening to us at all, and streaming would fight the
+        # release in mode_callback.
+        if not self.enable_motors and not force:
+            if self.mode == 'override':
+                if not self.motors_disabled_logged:
+                    self.motors_disabled_logged = True
+                    self.get_logger().warn(
+                        "enable_motors is False - holding RC channels at neutral "
+                        "1500/1500. Commanded thrust is logged but never applied.")
+                self.send_rc_override(right_pwm=PWM_NEUTRAL, left_pwm=PWM_NEUTRAL)
+            return
+
+        def thrust_to_pwm(T): # Thrust in Newton
+            return int(self.interpolator(T))
+        
+        # Compensate right thruster observed weaker output
+        if input[1] >= 0:
+            compensation_gain = 1.2
+        else:
+            compensation_gain = 0.75
+
+        compensation_gain=1.0
+        # Sanitize input.
+        #
+        # UNIFORM saturation, not two independent clips. The two thrusters do not
+        # carry independent signals: what the controller commands is a surge force
+        # and a yaw moment, split into a common mode and a differential. Clipping
+        # each side on its own therefore does not clamp the command, it rewrites
+        # it into a different one -- [+45, +18] became [+20, +18], collapsing a
+        # 27 N differential to 2 N, so the boat stopped turning and ran further
+        # from the path the harder the controller asked. One scale factor for both
+        # sides keeps the ratio, hence the turn, and only slows the boat down:
+        # [+45, +18] -> [+20, +8]. thrust_limits.py carries the full argument.
+        scaled, scale = tl.scale_to_limit(
+            [input[0] * compensation_gain, input[1]], self.thrust_limit)
+        if scale < 1.0:
+            self.get_logger().warn(
+                f"Thrust {list(input)} exceeds thrust_limit="
+                f"{self.thrust_limit:.1f} N - scaled by {scale:.3f} to "
+                f"[{scaled[0]:.1f}, {scaled[1]:.1f}] (direction preserved).",
+                throttle_duration_sec=2.0)
+
+        right = float(scaled[0])
+        left = float(scaled[1])
+
+        # Convert thrust to PWM (double sanitation)
+        max_PWM = 1900
+        min_PWM = 1100
+        right_pwm = np.clip(thrust_to_pwm(right), min_PWM, max_PWM)
+        left_pwm = 3000 - np.clip(thrust_to_pwm(left), min_PWM, max_PWM) # Reverses direction of thruster rotation to account for asymmetrical propeller
+
+        # Stream PWM to thrusters (published every control tick -> ~20 Hz refresh,
+        # which also keeps ArduPilot's RC_OVERRIDE_TIME watchdog fed)
+        self.send_rc_override(right_pwm=right_pwm, left_pwm=left_pwm)
+
+    # ======================================================================
+    #  4. OPERATOR COMMAND SURFACE
+    #  /blueboat/input_str: enable, stop, override, default, arm, disarm, move.
+    # ======================================================================
+
+    def str_input_callback(self, msg: String):
+        """
+        Read str_msg content and take required action
+        By default, any unrecognized command will be sent to the move_callback,
+        allowing for manual control through the input_str topic without needing to set the command to 'move'
+        """
+        input_string = msg.data.split()
+        if not input_string:
+            # An empty String message used to raise IndexError inside this
+            # subscription callback.
+            self.get_logger().warn("Empty input_str message ignored.")
+            return
+        command = input_string[0]
+
+        dispatch = {'enable': self.release_estop,
+                    'disable': lambda: self.set_motors(False),
+                    'stop': self.full_stop,
+                    'override': lambda: self.request_param_mode('override'),
+                    'default': lambda: self.request_param_mode('default'),
+                    'move': lambda: self.move_callback(input_string),
+                    'arm': lambda: self.setArmedStatus(True),
+                    'disarm': lambda: self.setArmedStatus(False)
+        }
+
+        action = dispatch.get(command, lambda: self.move_callback(input_string))
+        action()   
+
+    def move_callback(self, in_str):
+        """
+        Called when input_str is 'move', the first two floats are left and right thruster inputs, 
+        the last one is the length (in seconds) of the applied thrust
+        """
+
+        # Make sure the command is valid
+        if len(in_str) != 4:
+            self.get_logger().info(f" Incorrect move command.")
+            return
+
+        # Start measuring time and apply thrust
+        self.initial_time = time.time()
+        left, right, self.manual_move_timer = map(float, in_str[1:])
+        self.thruster_input = [right,left]
+
+    def request_param_mode(self, mode):
+        """
+        Ask param_set for a mode and remember the request so the main loop can
+        re-send it until param_set confirms on /blueboat/param_mode.
+        A single publish can be lost if it races DDS discovery or if param_set is
+        still waiting on mavros - this was the main cause of the random launch hangs.
+        """
+        self.desired_param_mode = mode
+        self.last_param_tx = time.time()
+        self.publish(String(), mode, self.param_publisher)
+
+    # ======================================================================
+    #  5. POSE RE-ZEROING AND PINGER DEAD RECKONING
+    #  Local-ENU frame: position is translated to the launch point, axes stay
+    #  ENU (+x = East, +y = North) and yaw stays ABSOLUTE ENU (0 = East,
+    #  CCW-positive). Yaw is deliberately NOT re-zeroed: subtracting yaw0
+    #  without also rotating the position axes produced a hybrid frame that
+    #  was only self-consistent when the boat launched facing East.
+    #  The twist is NOT rotated either (N3): it is body-frame from MAVROS.
+    # ======================================================================
+
+    def odom_callback(self, msg: Odometry):
+
+        # Set previous time measurement and compute dt
+        t = self.get_clock().now().nanoseconds * 1e-9
+        if self.prev_time is None:
+            self.prev_time = t
+            return
+        dt = t - self.prev_time
+        self.prev_time = t
+
+        # Initialize reference on first callback
+        if not hasattr(self, "origin_set") or not self.origin_set:
+            self.x0 = msg.pose.pose.position.x
+            self.y0 = msg.pose.pose.position.y
+            self.z0 = msg.pose.pose.position.z
+            self.yaw0 = cf.quaternion_to_yaw(msg.pose.pose.orientation)
+            self.lat0 = self.gps_data[0]
+            self.lon0 = self.gps_data[1]
+            self.origin_set = True
+
+        # Position offset (translation only -- axes stay ENU)
+        x_rel = msg.pose.pose.position.x - self.x0
+        y_rel = msg.pose.pose.position.y - self.y0
+        z_rel = msg.pose.pose.position.z - self.z0
+
+        # Yaw stays absolute ENU (0 = East, CCW+). yaw0 is latched above for
+        # the origin sidecar only; it is no longer part of the frame.
+        yaw = cf.quaternion_to_yaw(msg.pose.pose.orientation)
+
+        self.relative_coordinates = [x_rel, y_rel, yaw]
+
+        # Build modified odometry
+        odom_out = Odometry()
+        odom_out.header = msg.header
+        odom_out.child_frame_id = msg.child_frame_id
+
+        odom_out.pose.pose.position.x = x_rel
+        odom_out.pose.pose.position.y = y_rel
+        odom_out.pose.pose.position.z = z_rel
+        odom_out.pose.pose.orientation = cf.yaw_to_quaternion(yaw)
+
+        # Preserve velocity and covariance
+        odom_out.twist = msg.twist
+        odom_out.pose.covariance = msg.pose.covariance
+        odom_out.twist.covariance = msg.twist.covariance
+
+        # The pose above is translated to the launch point (axes ENU, yaw
+        # absolute), but the twist is NOT rotated, and must not be: MAVROS
+        # already publishes this odometry's twist in child_frame_id 'base_link'
+        # (the ENU velocity goes out separately on local_position/velocity_local).
+        # It is body-frame surge/sway, which is what master_control and the
+        # pinger dead-reckoning below both want. See N3.
+
+        self.odom_publisher.publish(odom_out)
+
+        x_t = msg.twist.twist.linear.x
+        y_t = msg.twist.twist.linear.y
+
+
+        
+        z_t = msg.twist.twist.linear.z
+        self.vel = np.array([x_t,y_t,z_t])
+
+        av = self.angular_velocity
+
+        if self.fixed_pinger and not all(self.pinger_coordinates == np.zeros(3)): # Make sure the pinger has been detected
+            # rotate pinger coordinates into the local-ENU world frame
+            x_body = self.pinger_coordinates[0]
+            y_body = self.pinger_coordinates[1]
+
+            x_world, y_world = cf.transform_body_to_world(x_rel, y_rel, yaw, x_body, y_body) # now in the local-ENU world frame
+
+            self.corrected_pinger = [x_world, y_world]
+            self.publish(Float32MultiArray(), self.corrected_pinger, self.pinger_publisher)
+            return
+
+        if self.fixed_pinger:
+            return
+
+        # Apply sensor fusion to get a smoother approximation at higher frequency of pinger_coordinates
+        if av is not None and not all(self.pinger_coordinates == np.zeros(3)): # Make sure the pinger has been detected
+            omega = np.array([0.0, 0.0, av.z])
+            p = self.pinger_coordinates
+
+            self.pinger_coordinates -= (self.vel + np.cross(omega, p)) * dt
+        
+        self.publish(Float32MultiArray(), self.pinger_coordinates, self.pinger_publisher)
+
+        if not hasattr(self, "origin_set") or not self.origin_set:
+            return  
+
+        # rotate pinger coordinates into the local-ENU world frame
+        x_body = self.pinger_coordinates[0]
+        y_body = self.pinger_coordinates[1]
+
+        x_world, y_world = cf.transform_body_to_world(x_rel, y_rel, yaw, x_body, y_body) # now in the local-ENU world frame
+
+        self.corrected_pinger = [x_world, y_world]
+
+        # The world frame IS local ENU about (lat0, lon0), so world -> east/north
+        # is the identity by construction.
+        east, north = x_world, y_world
+
+        lat, lon = cf.enu_to_gps(self.lat0, self.lon0, east, north)
+
+        self.pinger_gps = [lat, lon]
+
+    # ======================================================================
+    #  6. INBOUND TELEMETRY
+    #  Sensor and status callbacks. None of these command anything.
+    # ======================================================================
+
+    def imu_callback(self, msg: Imu):
+        self.orientation = msg.orientation                  # (quaternion)
+        self.angular_velocity = msg.angular_velocity        # (rad/s)
+        self.linear_acceleration = msg.linear_acceleration  # (m/s^2)
+
+    def gps_callback(self, msg : NavSatFix):
+        self.gps_data = [msg.latitude, msg.longitude]
+
+    def state_callback(self, msg):
+        """
+        Read the state of the robot
+        """
+        self.robot_state = msg
+
+    def uw_gps_callback(self, msg):
+        """
+        Cache the Water Linked UGPS packet and reseed the pinger dead reckoning.
+
+        This callback does NOT write the CSV any more. It used to assemble and
+        write a whole row, which meant the pinger-mode log was driven by the UGPS
+        link at 2 Hz and stopped entirely -- robot pose included -- whenever that
+        link dropped. log_timer_callback is now the single writer for both
+        layouts, and reads self.uw_gps_log from here.
+
+        /uw_gps_data layout, 19 values:
+            [date x7, aco xyz, ant xyz, lat, lon, dep, filaco xyz]
+        """
+        if not self.use_UWgps:
+            return
+
+        self.uw_gps_log = list(msg.data)
+
+        # filaco = the FILTERED acoustic position; it seeds the dead reckoning
+        # that odom_callback then propagates at odom rate.
+        t_x, t_y, t_z = msg.data[16], msg.data[17], msg.data[18]
+        self.pinger_coordinates = np.array([t_x, t_y, t_z])
+
+    def target_callback(self, msg: Float32MultiArray):
+        """
+        Update the target, used when interacting with the controller node
+        """
+        self.target = msg.data
+
+    def thr_input_callback(self, msg: Float32MultiArray):
+        """
+        Update the thruster inputs, used when interacting with the controller node
+        """
+        self.thruster_input = msg.data
+        self.last_thr_rx = time.time()
 
     def monitoring_data_callback(self, msg: Float32MultiArray):
         """
         Callback for monitoring data.
         """
         self.monitoring_data = msg.data
+
+    ################## ROS2 node interaction ##################
+
+    def param_callback(self, msg: String):
+        """
+        Prints true if the parameter changes are successful (used with the 'default' and 'override' command).
+
+        Edge-triggered: param_set heartbeats this at 1 Hz so a late subscriber
+        can see the state without waiting for a transition, and logging every
+        message would bury the console.
+        """
+        if getattr(self, '_last_param_ready', None) == msg.data:
+            return
+        self._last_param_ready = msg.data
+        self.get_logger().info(f" Parameters ready: {msg.data}")
+
+    def mode_callback(self, msg: String):
+        """
+        Displays the mode sent to the robot to confirm the changes
+        """
+        previous_mode = self.mode
+        self.mode = msg.data
+
+        if previous_mode != self.mode:
+            self.get_logger().info(f" Mode received: {self.mode}")
+
+            # When leaving override, hand the RC channels back so the default
+            # thruster mapping (QGC / xbox controller) works again
+            if previous_mode == 'override':
+                self.send_rc_override(right_pwm=PWM_NEUTRAL, left_pwm=PWM_NEUTRAL)
+                self.send_rc_override(release=True)
+
+    # ======================================================================
+    #  7. MAVROS / MAVLINK PLUMBING
+    #  RC override stream (N6), arming, mode. Rarely edited.
+    # ======================================================================
 
     ################## Thruster interaction ##################
 
@@ -307,42 +828,6 @@ class BlueBoatController(Node):
         msg.channels = channels
         self.rc_override_publisher.publish(msg)
 
-    def manualMove(self, input, force=False):
-        """
-        Convert a newton input to pwm and stream it to the motors through RC override
-        """
-
-        # Safety
-        if not self.enable_motors and not force:
-            return
-
-        def thrust_to_pwm(T): # Thrust in Newton
-            return int(self.interpolator(T))
-        
-        # Compensate right thruster observed weaker output
-        if input[1] >= 0:
-            compensation_gain = 1.2
-        else:
-            compensation_gain = 0.75
-
-        compensation_gain=1.0
-        # Sanitize input
-        max_input = 20.
-        min_input = -20.
-        left = np.clip(input[1], min_input, max_input)
-        right = np.clip(input[0]*compensation_gain, min_input, max_input)
-
-        # Convert thrust to PWM (double sanitation)
-        max_PWM = 1900
-        min_PWM = 1100
-        right_pwm = np.clip(thrust_to_pwm(right), min_PWM, max_PWM)
-        left_pwm = 3000 - np.clip(thrust_to_pwm(left), min_PWM, max_PWM) # Reverses direction of thruster rotation to account for asymmetrical propeller
-
-        # Stream PWM to thrusters (published every control tick -> ~20 Hz refresh,
-        # which also keeps ArduPilot's RC_OVERRIDE_TIME watchdog fed)
-        self.send_rc_override(right_pwm=right_pwm, left_pwm=left_pwm)
-
-
     ################## User interaction ##################
     def setArmedStatus(self,command):
         """
@@ -365,7 +850,7 @@ class BlueBoatController(Node):
             req = SetMode.Request()
             req.custom_mode = mode
             self.mode_client.call_async(req)
-    
+
     def set_motors(self, inBool):
         """
         Set the bool value of enable_motors. 
@@ -373,15 +858,6 @@ class BlueBoatController(Node):
         """
         self.enable_motors = inBool
         self.get_logger().info(f" Enable motors: {self.enable_motors}")
-
-    def full_stop(self):
-        """
-        Cancels any thruster input and set control parameters to False
-        """
-        self.thruster_input = [0,0]
-        self.manualMove([0,0], force=True)
-        self.setArmedStatus(False) 
-        self.set_motors(False)
 
     def publish(self, msg_type, in_msg, publisher):
         """
@@ -391,431 +867,276 @@ class BlueBoatController(Node):
         msg.data = in_msg
         publisher.publish(msg)
 
-    def request_param_mode(self, mode):
-        """
-        Ask param_set for a mode and remember the request so the main loop can
-        re-send it until param_set confirms on /blueboat/param_mode.
-        A single publish can be lost if it races DDS discovery or if param_set is
-        still waiting on mavros - this was the main cause of the random launch hangs.
-        """
-        self.desired_param_mode = mode
-        self.last_param_tx = time.time()
-        self.publish(String(), mode, self.param_publisher)
+    # ======================================================================
+    #  8. CSV LOGGING
+    #  Write-once field data. Columns in _custom_libraries/robot_log_schema.py.
+    #  ONE writer for BOTH layouts, on this node's own timer. The pinger layout
+    #  used to be written from uw_gps_callback instead, i.e. at the Water Linked
+    #  link's rate, so a UGPS dropout stopped recording the robot as well.
+    # ======================================================================
 
-    def move_callback(self, in_str):
+    def actuation_state(self):
         """
-        Called when input_str is 'move', the first two floats are left and right thruster inputs, 
-        the last one is the length (in seconds) of the applied thrust
-        """
+        One integer saying whether the logged thrust command could reach the water.
 
-        # Make sure the command is valid
-        if len(in_str) != 4:
-            self.get_logger().info(f" Incorrect move command.")
+        Output : int, see robot_log_schema for the encoding --
+                 0 motors disabled, 1 live (enabled and in override),
+                 2 enabled but not in override, 3 watchdog forcing zero.
+
+        State 0 means NO COMMANDED THRUST reached the water. It does not mean
+        the node was silent on /mavros/rc/override: with the gate closed and the
+        autopilot in override, manualMove holds both channels at neutral 1500
+        so nothing else can drive them. Neutral is not thrust, so the meaning of
+        the column is unchanged and no recorded CSV is reinterpreted.
+
+        Without this the CSV cannot distinguish a controller that commanded zero
+        from a boat that was never listening: enable_motors False produces a
+        completely normal-looking log with no PWM ever leaving the boat, and the
+        loss-of-reference watchdog writes [0, 0] into the same thruster_input
+        field a genuine zero command uses.
+        """
+        if self.thr_watchdog_tripped:
+            return rls.ACT_WATCHDOG
+        if not self.enable_motors:
+            return rls.ACT_MOTORS_DISABLED
+        if self.mode != 'override':
+            return rls.ACT_NOT_OVERRIDE
+        return rls.ACT_LIVE
+
+    def write_origin_sidecar(self):
+        """
+        Record the world frame's own origin, once, beside the CSV.
+
+        The world frame is local ENU: origin latched at the first odom
+        callback, axes East/North, yaw absolute ENU. Every world-frame column
+        in the log -- relative_x/y/psi, the target pair, corrected_pinger_x/y
+        -- is expressed in it, and (lat0, lon0) is what georeferences a
+        recorded run afterwards. yaw0_rad is the boat's ENU heading at the
+        latch instant, kept for provenance only (it is NOT part of the frame;
+        logs recorded before the local-ENU fix used yaw - yaw0 as relative_psi).
+        """
+        if self.origin_written or not getattr(self, 'origin_set', False):
             return
+        try:
+            with open(self.origin_path, 'w') as f:
+                f.write('# Origin of the local-ENU world frame (translation only,\n'
+                        '# axes East/North, yaw absolute ENU) used by every\n'
+                        '# world-frame column of the CSV beside this file. Latched\n'
+                        '# at robot_interface\'s first odom callback. yaw0_rad is\n'
+                        '# the boat\'s ENU heading at that instant, provenance only.\n')
+                f.write(f'latitude: {self.lat0}\n')
+                f.write(f'longitude: {self.lon0}\n')
+                f.write(f'yaw0_rad: {self.yaw0}\n')
+                f.write(f'poslog: {os.path.basename(self.path)}\n')
+            self.origin_written = True
+            self.get_logger().info(f"Frame origin: {self.origin_path}")
+        except OSError as exc:
+            self.get_logger().warn(f"Could not write the frame origin sidecar: {exc}")
 
-        # Start measuring time and apply thrust
-        self.initial_time = time.time()
-        left, right, self.manual_move_timer = map(float, in_str[1:])
-        self.thruster_input = [right,left]
+    def build_log_row(self):
+        """
+        Assemble one CSV row for whichever layout this run selected.
 
-    def str_input_callback(self, msg: String):
+        Output : dict {column name: value} covering every column of
+                 self.data_columns. Filled BY COLUMN NAME, never by index, so
+                 the order in robot_log_schema can never silently desynchronise
+                 from the values written into it.
+
+        Raises AttributeError while the IMU has not reported yet; the caller
+        treats that as "not ready" rather than as a failure.
         """
-        Read str_msg content and take required action
-        By default, any unrecognized command will be sent to the move_callback,
-        allowing for manual control through the input_str topic without needing to set the command to 'move'
-        """
-        input_string = msg.data.split()
-        command = input_string[0]
-        
-        dispatch = {'enable': lambda: self.set_motors(True),
-                    'stop': self.full_stop,
-                    'override': lambda: self.request_param_mode('override'),
-                    'default': lambda: self.request_param_mode('default'),
-                    'move': lambda: self.move_callback(input_string),
-                    'arm': lambda: self.setArmedStatus(True),
-                    'disarm': lambda: self.setArmedStatus(False)
+        now = datetime.today()
+        roll, pitch, _ = cf.quaternion_to_rpy(self.orientation)
+
+        row = {
+            # Wall clock. MicroSecond is FULL microseconds in both layouts --
+            # the no-pinger path used to write now.microsecond // 1000, i.e.
+            # milliseconds under a column named MicroSecond.
+            'Year': now.year, 'Month': now.month, 'Day': now.day,
+            'Hour': now.hour, 'Minute': now.minute, 'Second': now.second,
+            'MicroSecond': now.microsecond,
+
+            # Robot pose, local-ENU world frame (origin = launch point;
+            # relative_psi is ABSOLUTE ENU yaw, 0 = East, CCW+).
+            'relative_x': self.relative_coordinates[0],
+            'relative_y': self.relative_coordinates[1],
+            'relative_psi': self.relative_coordinates[2],
+
+            # Robot fix, immediately followed by the target's below so the two
+            # can be selected and plotted together.
+            'gps_latitude': self.gps_data[0],
+            'gps_longitude': self.gps_data[1],
+
+            # thruster_input is [right, left] (master_control's convention).
+            'right_thr_in': self.thruster_input[0],
+            'left_thr_in': self.thruster_input[1],
+            'actuation_state': self.actuation_state(),
+
+            # Attitude. Yaw is not repeated -- it is relative_psi above.
+            'roll': roll,
+            'pitch': pitch,
+
+            'ang_vel_x': self.angular_velocity.x,
+            'ang_vel_y': self.angular_velocity.y,
+            'ang_vel_z': self.angular_velocity.z,
+
+            'lin_acc_x': self.linear_acceleration.x,
+            'lin_acc_y': self.linear_acceleration.y,
+            'lin_acc_z': self.linear_acceleration.z,
         }
 
-        action = dispatch.get(command, lambda: self.move_callback(input_string))
-        action()   
+        # --- the target block, under whichever names this layout uses --------
+        if self.use_UWgps:
+            # The pinger IS the target. corrected_pinger is the dead-reckoned
+            # vector rotated into the world frame; pinger_gps is that same point
+            # in WGS84, both maintained by odom_callback.
+            target_xy = self.corrected_pinger
+            target_gps = self.pinger_gps
+        else:
+            # /monitoring_data = [t, x, y, psi, x_d, y_d, psi_d, u1, u2].
+            # x_d/y_d are world-frame in EVERY controller branch (CM-8 / N9), so
+            # no frame correction is applied here or downstream. An empty buffer
+            # (no controller running yet) logs zeros rather than raising.
+            if len(self.monitoring_data) >= 6:
+                target_xy = [self.monitoring_data[4], self.monitoring_data[5]]
+            else:
+                target_xy = [0.0, 0.0]
+            target_gps = self.target_to_gps(target_xy)
 
-    ################## ROS2 node interaction ##################
+        row[self.target_cols[0]] = target_xy[0]
+        row[self.target_cols[1]] = target_xy[1]
+        row[self.target_gps_cols[0]] = target_gps[0]
+        row[self.target_gps_cols[1]] = target_gps[1]
 
-    def param_callback(self, msg: String):
+        # --- raw Water Linked packet, pinger layout only ---------------------
+        if self.use_UWgps:
+            # /uw_gps_data indices 7..18; 0..6 are its own date fields, which the
+            # wall-clock stamp above already covers.
+            ugps_names = ('aco_x', 'aco_y', 'aco_z',
+                          'ant_x', 'ant_y', 'ant_z',
+                          'lat', 'lon', 'dep',
+                          'filaco_x', 'filaco_y', 'filaco_z')
+            for name, value in zip(ugps_names, self.uw_gps_log[7:19]):
+                row[name] = value
+
+        return row
+
+    def target_to_gps(self, target_xy):
         """
-        Prints true if the parameter changes are successful (used with the 'default' and 'override' command)
+        Convert a local-ENU world-frame target into WGS84 degrees.
+
+        Input  : target_xy -- [x, y] in the same frame as relative_x/y.
+        Output : [latitude, longitude] in degrees, or [0.0, 0.0] before the
+                 frame origin has been latched by the first odom callback.
+
+        The world frame is local ENU about (lat0, lon0), so world -> east/north
+        is the identity and only the equirectangular projection remains --
+        identical to the pinger path.
         """
-        self.get_logger().info(f" Parameters ready: {msg.data}")
+        if not getattr(self, 'origin_set', False):
+            return [0.0, 0.0]
 
-    def mode_callback(self, msg: String):
-        """
-        Displays the mode sent to the robot to confirm the changes
-        """
-        previous_mode = self.mode
-        self.mode = msg.data
-
-        if previous_mode != self.mode:
-            self.get_logger().info(f" Mode received: {self.mode}")
-
-            # When leaving override, hand the RC channels back so the default
-            # thruster mapping (QGC / xbox controller) works again
-            if previous_mode == 'override':
-                self.send_rc_override(right_pwm=PWM_NEUTRAL, left_pwm=PWM_NEUTRAL)
-                self.send_rc_override(release=True)
-
-    def state_callback(self, msg):
-        """
-        Read the state of the robot
-        """
-        self.robot_state = msg
-
-    def imu_callback(self, msg: Imu):
-        self.orientation = msg.orientation                  # (quaternion)
-        self.angular_velocity = msg.angular_velocity        # (rad/s)
-        self.linear_acceleration = msg.linear_acceleration  # (m/s^2)
-
-    def odom_callback(self, msg: Odometry):
-
-        # Set previous time measurement and compute dt
-        t = self.get_clock().now().nanoseconds * 1e-9
-        if self.prev_time is None:
-            self.prev_time = t
-            return
-        dt = t - self.prev_time
-        self.prev_time = t
-
-        # Initialize reference on first callback
-        if not hasattr(self, "origin_set") or not self.origin_set:
-            self.x0 = msg.pose.pose.position.x
-            self.y0 = msg.pose.pose.position.y
-            self.z0 = msg.pose.pose.position.z
-            self.yaw0 = cf.quaternion_to_yaw(msg.pose.pose.orientation)
-            self.lat0 = self.gps_data[0]
-            self.lon0 = self.gps_data[1]
-            self.origin_set = True
-
-        # Position offset
-        x_rel = msg.pose.pose.position.x - self.x0
-        y_rel = msg.pose.pose.position.y - self.y0
-        z_rel = msg.pose.pose.position.z - self.z0
-
-        # Yaw offset
-        yaw = cf.quaternion_to_yaw(msg.pose.pose.orientation)        
-        yaw_rel = cf.normalize_angle(yaw - self.yaw0)
-
-        self.relative_coordinates = [x_rel,y_rel,yaw_rel]
-
-        # Build modified odometry
-        odom_out = Odometry()
-        odom_out.header = msg.header
-        odom_out.child_frame_id = msg.child_frame_id
-
-        odom_out.pose.pose.position.x = x_rel
-        odom_out.pose.pose.position.y = y_rel
-        odom_out.pose.pose.position.z = z_rel
-        odom_out.pose.pose.orientation = cf.yaw_to_quaternion(yaw_rel)
-
-        # Preserve velocity and covariance
-        odom_out.twist = msg.twist
-        odom_out.pose.covariance = msg.pose.covariance
-        odom_out.twist.covariance = msg.twist.covariance
-
-        # --- FRAME CONSISTENCY FIX -------------------------------------------
-        # The pose above is re-expressed in the boot-relative frame (position
-        # offset by (x0,y0), heading rotated by -yaw0). The linear velocity from
-        # MAVROS is still in the raw 'map' frame, so pose and twist lived in two
-        # frames differing by a constant rotation of yaw0. Any world->body
-        # transform downstream (inRobotFrame / PID) then rotated the velocity
-        # feedback by yaw0 relative to the position error, producing a fixed
-        # diagonal drift and mirroring heading-swept paths (e.g. sin onto -y).
-        # Pinger mode was immune because it zeroes position/yaw and works purely
-        # in body frame. Rotate the linear velocity by -yaw0 so the WHOLE
-        # /blueboat/odom message is in one consistent frame.
-        
-        # c0 = np.cos(self.yaw0)
-        # s0 = np.sin(self.yaw0)
-        # vx_raw = msg.twist.twist.linear.x
-        # vy_raw = msg.twist.twist.linear.y
-        # vx_rel =  c0 * vx_raw + s0 * vy_raw   # R(-yaw0) * v_map
-        # vy_rel = -s0 * vx_raw + c0 * vy_raw
-        # odom_out.twist.twist.linear.x = vx_rel
-        # odom_out.twist.twist.linear.y = vy_rel
-        
-        # ---------------------------------------------------------------------
-
-        self.odom_publisher.publish(odom_out)
-
-        # x_t = vx_rel
-        # y_t = vy_rel
-        x_t = msg.twist.twist.linear.x
-        y_t = msg.twist.twist.linear.y
-
-
-        
-        z_t = msg.twist.twist.linear.z
-        self.vel = np.array([x_t,y_t,z_t])
-
-        av = self.angular_velocity
-
-        if self.fixed_pinger and not all(self.pinger_coordinates == np.zeros(3)): # Make sure the pinger has been detected
-            # rotate pinger coordinates into original frame
-            x_body = self.pinger_coordinates[0]
-            y_body = self.pinger_coordinates[1]
-
-            x_world, y_world = cf.transform_body_to_world(x_rel, y_rel, yaw_rel, x_body, y_body) # now relative to the original frame of reference 
-
-            self.corrected_pinger = [x_world, y_world]
-            self.publish(Float32MultiArray(), self.corrected_pinger, self.pinger_publisher)
-            return
-
-        if self.fixed_pinger:
-            return
-
-        # Apply sensor fusion to get a smoother approximation at higher frequency of pinger_coordinates
-        if av is not None and not all(self.pinger_coordinates == np.zeros(3)): # Make sure the pinger has been detected
-            omega = np.array([0.0, 0.0, av.z])
-            p = self.pinger_coordinates
-
-            self.pinger_coordinates -= (self.vel + np.cross(omega, p)) * dt
-        
-        self.publish(Float32MultiArray(), self.pinger_coordinates, self.pinger_publisher)
-
-        if not hasattr(self, "origin_set") or not self.origin_set:
-            return  
-
-        # rotate pinger coordinates into original frame
-        x_body = self.pinger_coordinates[0]
-        y_body = self.pinger_coordinates[1]
-
-        x_world, y_world = cf.transform_body_to_world(x_rel, y_rel, yaw_rel, x_body, y_body) # now relative to the original frame of reference 
-
-        self.corrected_pinger = [x_world, y_world]
-
-        # convert local pinger into gps coordinates
-        east, north = cf.local_to_enu(x_world, y_world, self.yaw0)
-
+        east, north = target_xy[0], target_xy[1]
         lat, lon = cf.enu_to_gps(self.lat0, self.lon0, east, north)
-
-        self.pinger_gps = [lat, lon]
-
-    def gps_callback(self, msg : NavSatFix):
-        self.gps_data = [msg.latitude, msg.longitude]
-
-    def uw_gps_callback(self, msg):
-        """
-        Read msg from the underwater_gps node, compile it with robot data and save the log
-        """
-
-        if not self.use_UWgps:
-            return
-
-        # Make sure the robot's data is available
-        if self.orientation is None or self.angular_velocity is None or self.linear_acceleration is None:
-            return
-
-        ## Compile data from gps, imu, and others
-        self.uw_gps_log = msg.data
-
-        # --- logging update: fill BY COLUMN NAME (order-independent) ------
-        # /uw_gps_data layout: [date(7), aco xyz, ant xyz, lat, lon, dep,
-        # filaco xyz] = 19 values.
-        df_tmp = pd.DataFrame(np.zeros(self.data_size).reshape(1, self.data_size), columns=self.data_columns)
-
-        raw_names = ['Year', 'Month', 'Day', 'Hour', 'Minute', 'Second',
-                     'MicroSecond', 'aco_x', 'aco_y', 'aco_z',
-                     'ant_x', 'ant_y', 'ant_z', 'lat', 'lon', 'dep',
-                     'filaco_x', 'filaco_y', 'filaco_z']
-        for name, value in zip(raw_names, msg.data):
-            df_tmp.loc[df_tmp.index[0], name] = value
-
-        t_x, t_y, t_z = msg.data[16], msg.data[17], msg.data[18]  # filaco
-        self.pinger_coordinates = np.array([t_x,t_y,t_z])
-
-        row = df_tmp.index[0]
-        df_tmp.loc[row, 'quat_x'] = self.orientation.x
-        df_tmp.loc[row, 'quat_y'] = self.orientation.y
-        df_tmp.loc[row, 'quat_z'] = self.orientation.z
-        df_tmp.loc[row, 'quat_w'] = self.orientation.w
-
-        df_tmp.loc[row, 'ang_vel_x'] = self.angular_velocity.x
-        df_tmp.loc[row, 'ang_vel_y'] = self.angular_velocity.y
-        df_tmp.loc[row, 'ang_vel_z'] = self.angular_velocity.z
-
-        df_tmp.loc[row, 'lin_acc_x'] = self.linear_acceleration.x
-        df_tmp.loc[row, 'lin_acc_y'] = self.linear_acceleration.y
-        df_tmp.loc[row, 'lin_acc_z'] = self.linear_acceleration.z
-
-        df_tmp.loc[row, 'relative_x'] = self.relative_coordinates[0]
-        df_tmp.loc[row, 'relative_y'] = self.relative_coordinates[1]
-        df_tmp.loc[row, 'relative_psi'] = self.relative_coordinates[2]
-
-        # --- logging update (2): target_x/y/psi removed from the pinger
-        # CSV — they were /controller_target, i.e. the SAME pinger vector as
-        # corrected_pinger_x/y but in the robot frame: duplicated
-        # information. corrected_pinger (world frame) is kept.
-        df_tmp.loc[row, 'corrected_pinger_x'] = self.corrected_pinger[0]
-        df_tmp.loc[row, 'corrected_pinger_y'] = self.corrected_pinger[1]
-
-        df_tmp.loc[row, 'gps_latitude'] = self.gps_data[0]
-        df_tmp.loc[row, 'gps_longitude'] = self.gps_data[1]
-
-        df_tmp.loc[row, 'pinger_latitude'] = self.pinger_gps[0]
-        df_tmp.loc[row, 'pinger_longitude'] = self.pinger_gps[1]
-
-        # thruster_input is [right, left] (master_control convention); the
-        # original wrote index 0 into 'left_thr_in' -> columns were swapped.
-        df_tmp.loc[row, 'right_thr_in'] = self.thruster_input[0]
-        df_tmp.loc[row, 'left_thr_in'] = self.thruster_input[1]
-        # ------------------------------------------------------------------
-
-        self.df_log = pd.concat([self.df_log, df_tmp])
-
-        self.df_log.to_csv(self.path) # Rewrite the entire file every time for safety in case of unexpected shutdowns
-
-    def target_callback(self, msg: Float32MultiArray):
-        """
-        Update the target, used when interacting with the controller node
-        """
-        self.target = msg.data
-
-    def thr_input_callback(self, msg: Float32MultiArray):
-        """
-        Update the thruster inputs, used when interacting with the controller node
-        """
-        self.thruster_input = msg.data
+        return [lat, lon]
 
     def log_timer_callback(self):
-
-        # Log here if no uw gps callback
-        if not self.use_UWgps: 
-
-            # --- logging update -------------------------------------------
-            # /monitoring_data = [t, x, y, psi, x_d, y_d, psi_d, u1, u2];
-            # x_d/y_d are WORLD-frame for every controller with the patched
-            # master_control, so the logged path target is now correct also
-            # for LoS and manual-target sessions (it used to arrive in the
-            # robot frame for those). Empty buffer -> zeros, no spam logs.
-            if len(self.monitoring_data) >= 6:
-                target_x = self.monitoring_data[4]
-                target_y = self.monitoring_data[5]
-            else:
-                target_x = 0.0
-                target_y = 0.0
-
-            try:
-                df_tmp = pd.DataFrame(np.zeros(self.data_size).reshape(1, self.data_size), columns=self.data_columns)
-                row = df_tmp.index[0]
-
-                now = datetime.today()
-
-                df_tmp.loc[row, 'Year'] = now.year
-                df_tmp.loc[row, 'Month'] = now.month
-                df_tmp.loc[row, 'Day'] = now.day
-                df_tmp.loc[row, 'Hour'] = now.hour
-                df_tmp.loc[row, 'Minute'] = now.minute
-                df_tmp.loc[row, 'Second'] = now.second
-                df_tmp.loc[row, 'MicroSecond'] = now.microsecond // 1000
-
-                df_tmp.loc[row, 'quat_x'] = self.orientation.x
-                df_tmp.loc[row, 'quat_y'] = self.orientation.y
-                df_tmp.loc[row, 'quat_z'] = self.orientation.z
-                df_tmp.loc[row, 'quat_w'] = self.orientation.w
-
-                df_tmp.loc[row, 'ang_vel_x'] = self.angular_velocity.x
-                df_tmp.loc[row, 'ang_vel_y'] = self.angular_velocity.y
-                df_tmp.loc[row, 'ang_vel_z'] = self.angular_velocity.z
-
-                df_tmp.loc[row, 'lin_acc_x'] = self.linear_acceleration.x
-                df_tmp.loc[row, 'lin_acc_y'] = self.linear_acceleration.y
-                df_tmp.loc[row, 'lin_acc_z'] = self.linear_acceleration.z
-
-                df_tmp.loc[row, 'relative_x'] = self.relative_coordinates[0]
-                df_tmp.loc[row, 'relative_y'] = self.relative_coordinates[1]
-                df_tmp.loc[row, 'relative_psi'] = self.relative_coordinates[2]
-
-                df_tmp.loc[row, 'gps_latitude'] = self.gps_data[0]
-                df_tmp.loc[row, 'gps_longitude'] = self.gps_data[1]
-
-                # [right, left] convention -> named columns (was swapped)
-                df_tmp.loc[row, 'right_thr_in'] = self.thruster_input[0]
-                df_tmp.loc[row, 'left_thr_in'] = self.thruster_input[1]
-
-                df_tmp.loc[row, 'target_x'] = target_x
-                df_tmp.loc[row, 'target_y'] = target_y
-                # --------------------------------------------------------------
-
-                self.df_log = pd.concat([self.df_log, df_tmp])
-
-                self.df_log.to_csv(self.path)
-            except Exception:
-                self.get_logger().warn(f" -- Not ready to log yet")
-
-
-    def timer_callback(self):
         """
-        Main loop
+        Append one row to the position CSV. The single writer, both layouts.
         """
-
-        ################## Initialize robot ##################
-        if not self.init:
-            # Wait until connected
-            if not self.robot_state.connected:
-                self.get_logger().info('Waiting for FCU connection...')
-                return
-
-            # Set mode
-            if self.robot_state.mode != "MANUAL": 
-                self.SetMode('MANUAL')
-                return
-
-            self.request_param_mode('override')
-
-            self.init = True
-
-        ################## Handshake maintenance ##################
-        # Re-send the mode request until param_set confirms it. This closes the
-        # discovery race that used to make the launch hang at random.
-        if (self.desired_param_mode is not None
-                and self.mode != self.desired_param_mode
-                and time.time() - self.last_param_tx > self.param_retry_period):
-            self.get_logger().info(f"Waiting for param mode '{self.desired_param_mode}' (current: '{self.mode}'), re-requesting...")
-            self.last_param_tx = time.time()
-            self.publish(String(), self.desired_param_mode, self.param_publisher)
-
-        # Wait for direct control to be enabled
-        if self.mode != 'override':
+        try:
+            row = self.build_log_row()
+        except (AttributeError, TypeError, IndexError) as exc:
+            # Normal before the first IMU / odom message; self.orientation and
+            # friends are None until then. Logged with the reason rather than a
+            # bare "not ready", so a genuine assembly bug is not hidden by it.
+            self.get_logger().warn(f" -- Not ready to log yet: {exc}",
+                                   throttle_duration_sec=5.0)
             return
 
-        ################## Control loop ##################
-        
-        # Start recording time
-        if not self.time_set:
-            self.initial_time = time.time()
+        try:
+            self.log_file.write(
+                ','.join(repr(float(row[c])) for c in self.data_columns) + '\n')
+            self.log_file.flush()
+        except (OSError, ValueError) as exc:
+            self.get_logger().error(f"Could not append to {self.path}: {exc}")
+            return
 
-            # Send ready msg to controller node
-            self.publish(Bool(), True, self.set_controller_publisher)
-            self.last_ready_tx = time.time()
+        self.write_origin_sidecar()
 
-            self.time_set = True
+    # ======================================================================
+    #  9. SHUTDOWN
+    #  Ordered teardown. Previously there was none: `rclpy.spin` raised
+    #  KeyboardInterrupt straight past destroy_node(), so the boat was left in
+    #  RC passthrough with nobody streaming and the CSV was never closed.
+    # ======================================================================
 
-        # Periodically re-publish readiness so a controller node that finished
-        # starting late (e.g. blocked on the path service) still receives it
-        if time.time() - self.last_ready_tx > self.ready_republish_period:
-            self.last_ready_tx = time.time()
-            self.publish(Bool(), True, self.set_controller_publisher)
-        
-        current_time = time.time()
-        
-        ## Send input to thrusters
+    def shutdown(self):
+        """
+        Best-effort ordered teardown, safest-first.
 
-        # If no controller is set, allow for manual input
-        if self.controller_type == '' and current_time - self.initial_time >= self.manual_move_timer:
-            self.manualMove([0, 0]) # If override + no controler, stop the robot after any manual move command
-        else:
-            self.manualMove(self.thruster_input)        
-        
-rclpy.init()
-node = BlueBoatController()
-rclpy.spin(node)
-node.destroy_node()
-rclpy.shutdown()
+        Called from a finally block while the launch is being torn down, so
+        every step is independently guarded: a failure in one must not skip the
+        ones after it, and none of them may raise out of the finally.
+        """
+        # 1. Motors first, always.
+        try:
+            self.full_stop()
+        except Exception as exc:                       # noqa: BLE001 - teardown
+            self.get_logger().error(f"Shutdown: full_stop failed: {exc}")
+
+        # 2. Hand the RC channels back. Neutral before release, so the autopilot
+        #    never sees a stale non-neutral value on the way out.
+        try:
+            self.send_rc_override(right_pwm=PWM_NEUTRAL, left_pwm=PWM_NEUTRAL)
+            self.send_rc_override(release=True)
+        except Exception as exc:                       # noqa: BLE001 - teardown
+            self.get_logger().error(f"Shutdown: RC release failed: {exc}")
+
+        # 3. Ask for the default servo mapping. Best effort and usually a no-op:
+        #    param_set is in the same process group and is running its own
+        #    restore at this moment (CM-15 is served by both halves, neither
+        #    depending on the other).
+        try:
+            self.request_param_mode('default')
+        except Exception as exc:                       # noqa: BLE001 - teardown
+            self.get_logger().error(f"Shutdown: 'default' request failed: {exc}")
+
+        # 4. Close the CSV BEFORE anything moves it.
+        try:
+            if getattr(self, 'log_file', None) and not self.log_file.closed:
+                self.log_file.flush()
+                self.log_file.close()
+                self.get_logger().info(f"Position log closed: {self.path}")
+        except Exception as exc:                       # noqa: BLE001 - teardown
+            self.get_logger().error(f"Shutdown: closing the log failed: {exc}")
+
+        # 5. Mission report. Imported HERE, not at module scope: matplotlib is
+        #    not declared in package.xml and must never be able to stop this
+        #    flight node from starting.
+        try:
+            import poslog_report
+            folder = poslog_report.finalise_run(self.path)
+            self.get_logger().info(f"Mission report: {folder}")
+        except Exception as exc:                       # noqa: BLE001 - teardown
+            self.get_logger().error(
+                f"Shutdown: mission report failed ({exc}). The CSV is intact; "
+                f"run `ros2 run blueboat_control poslog_report.py {self.path}` "
+                "to produce it later.")
+
+
+def main():
+    rclpy.init()
+    node = BlueBoatController()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.shutdown()
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+main()

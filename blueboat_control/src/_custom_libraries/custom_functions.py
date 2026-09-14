@@ -13,6 +13,86 @@ import os
 from scipy.interpolate import PchipInterpolator
 
 
+#################### Run-artifact locations ####################
+# Every run artifact (the position CSV, the controller .npy) is written under one
+# root, resolved at runtime rather than inherited from the launch working
+# directory. Inheriting it meant the launcher decided where field record landed:
+# the same runs ended up scattered across the workspace, this repository and the
+# Mission Control Station's repository. Field data is write-once (CLAUDE.md #6),
+# so where it lands must not depend on the directory the operator happened to
+# stand in.
+
+def data_root(explicit: str = '') -> str:
+    """
+    Absolute root directory for run artifacts. Precedence:
+
+      1. `explicit`            -- the node's `data_dir` parameter, when non-empty
+      2. $BLUEBOAT_DATA_DIR
+      3. the sourced ROS workspace -- parent of the first $COLCON_PREFIX_PATH entry
+      4. the process working directory -- previous behaviour, last resort
+
+    (3) is what normally answers: COLCON_PREFIX_PATH is set by the same
+    `install/setup.bash` that makes `ros2 launch blueboat_control ...` resolve at
+    all, and its parent is the workspace root that already holds `data/`.
+    """
+    if explicit:
+        return os.path.abspath(os.path.expanduser(explicit))
+
+    env = os.environ.get('BLUEBOAT_DATA_DIR', '')
+    if env:
+        return os.path.abspath(os.path.expanduser(env))
+
+    prefix_path = os.environ.get('COLCON_PREFIX_PATH', '')
+    first = prefix_path.split(os.pathsep)[0] if prefix_path else ''
+    if first:
+        return os.path.dirname(os.path.abspath(first))
+
+    return os.getcwd()
+
+
+def ensure_data_dir(node, root: str, *parts) -> str:
+    """
+    Create `root/*parts` and return it. An unwritable root is fatal and says so:
+    a mission that cannot record is worse than a launch that refuses, and the
+    refusal happens dry rather than in the water. Callers log the artifact path
+    they build from it, so a run is never ambiguous about where it wrote.
+    """
+    target = os.path.join(root, *parts)
+    try:
+        os.makedirs(target, exist_ok=True)
+    except OSError as exc:
+        node.get_logger().error(
+            f"Cannot create the run-data directory '{target}': {exc}. "
+            f"Set the 'data_dir' launch argument or $BLUEBOAT_DATA_DIR to a "
+            f"writable location.")
+        raise
+    return target
+
+
+def reserve_run_file(directory: str, stem: str, suffix: str) -> str:
+    """
+    Reserve `directory/stem+suffix`, returning a path that did not already exist.
+
+    Run artifacts are stamped to the second, so two runs started inside the same
+    second used to resolve to the same name and the later one silently rewrote
+    the earlier - the exact loss CLAUDE.md #6 forbids for a write-once field
+    record. The name is claimed with O_EXCL, which also settles the race between
+    two processes reserving at once; on collision a `-2`, `-3`, ... suffix is
+    appended. Uncontended runs keep byte-identical names to before.
+
+    Returns the reserved path WITHOUT `suffix`, since np.save appends its own.
+    """
+    n = 1
+    while True:
+        stem_n = stem if n == 1 else f'{stem}-{n}'
+        path = os.path.join(directory, stem_n + suffix)
+        try:
+            os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
+            return os.path.join(directory, stem_n)
+        except FileExistsError:
+            n += 1
+
+
 def generate_interpolator():
     pwm = np.array([1100,1110,1136,1162,1188,1214,1240,1266,1292,1318,1344,1370,1396,1422,1448,1474,1500,1526,1552,1578,1604,1630,1656,1682,1708,1734,1760,1786,1812,1838,1864,1890,1900])
     thr = 9.80665*np.array([-2.81,-2.78,-2.64,-2.42,-2.21,-2.04,-1.83,-1.57,-1.42,-1.2,-0.98,-0.82,-0.6,-0.41,-0.24,-0.09,0,0.21,0.5,0.82,1.17,1.58,1.93,2.37,2.76,3.23,3.57,3.99,4.36,4.84,5.22,5.45,5.63])
@@ -310,11 +390,38 @@ def seabed_scanning(t):
 
     return xr, yr, zr, phir, thetar, psir
 
-def quaternion_to_yaw(q: Quaternion):
+def quaternion_to_rpy(q: Quaternion):
+    """
+    Convert a quaternion to (roll, pitch, yaw) in radians, ZYX convention.
+
+    Input  : q -- geometry_msgs Quaternion (any object with .x/.y/.z/.w).
+    Output : (roll, pitch, yaw) tuple of floats.
+
+    Pitch is clamped rather than passed to asin directly, so a quaternion that
+    is a hair off unit length from accumulated float error cannot raise a
+    domain error at +/-90 degrees. The yaw branch is the one quaternion_to_yaw
+    has always used, so both functions agree by construction.
+    """
+    # roll (X axis rotation)
+    sinr_cosp = 2.0 * (q.w * q.x + q.y * q.z)
+    cosr_cosp = 1.0 - 2.0 * (q.x * q.x + q.y * q.y)
+    roll = math.atan2(sinr_cosp, cosr_cosp)
+
+    # pitch (Y axis rotation)
+    sinp = 2.0 * (q.w * q.y - q.z * q.x)
+    pitch = math.asin(max(-1.0, min(1.0, sinp)))
+
     # yaw (Z axis rotation)
     siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
     cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-    return math.atan2(siny_cosp, cosy_cosp)
+    yaw = math.atan2(siny_cosp, cosy_cosp)
+
+    return roll, pitch, yaw
+
+def quaternion_to_yaw(q: Quaternion):
+    # yaw (Z axis rotation). One conversion, shared with quaternion_to_rpy
+    # above, so the two can never drift apart.
+    return quaternion_to_rpy(q)[2]
 
 def yaw_to_quaternion(yaw: float):
     q = Quaternion()
@@ -350,14 +457,7 @@ def enu_to_gps(lat0_deg, lon0_deg, east, north):
 
     return math.degrees(lat), math.degrees(lon)
 
-def local_to_enu(x, y, yaw0):
-    # rotate local frame into ENU
-    theta = yaw0 - math.pi / 2.0
-
-    c = math.cos(theta)
-    s = math.sin(theta)
-
-    east  = c * x - s * y
-    north = s * x + c * y
-
-    return east, north
+# local_to_enu was removed: /blueboat/odom's world frame is local ENU by
+# construction (robot_interface translates position only and keeps yaw
+# absolute), so world -> east/north is the identity. The old function also
+# carried a spurious -pi/2 from treating an ENU yaw as a compass bearing.

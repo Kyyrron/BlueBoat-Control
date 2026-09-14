@@ -1,15 +1,15 @@
+# acados MPC solver -- the Python interface only. The C library and the Tera
+# template renderer are NOT installed by pip; see README.md > Installation.
 -e git+https://github.com/acados/acados.git@db1c3caa6571fbeadf06ac10081ed15965cd0926#egg=acados_template&subdirectory=interfaces/acados_template
 
-bluerobotics-ping==0.2.4
-casadi==3.7.2
-Cython==3.2.4
-matplotlib==3.10.8
+casadi==3.7.2          # symbolic thrust allocation + the MPC model
+sympy==1.14.0          # symbolic thrust allocation
 numpy==2.4.4
-pandas==3.0.2
-pyserial==3.5
-PyYAML==6.0.3
-requests==2.33.1
 scipy==1.17.1
-sympy==1.14.0
-transformations==2026.1.18
-lxml
+matplotlib==3.10.8     # post-mission report, log reviewer
+PyYAML==6.0.3
+requests==2.33.1       # Water Linked UGPS poller, satellite tiles
+PySide6>=6.5           # log reviewer GUI
+Cython==3.2.4          # acados build dependency
+lxml                   # pulled in by urdf_parser_py
+setuptools

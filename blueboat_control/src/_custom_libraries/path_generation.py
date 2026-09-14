@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 
 # ============================================================================
-# PATCHED for the Mission Pattern Designer (Mission Control Station).
-# The ONLY changes relative to the original file are marked with
+# The '/path_request' server: an array of path-parameter values in, a
+# nav_msgs/Path out. Deliberately parameter-agnostic -- the caller decides what
+# the numbers mean.
+#
+# Mission Pattern Designer support (Mission Control Station), marked below with
 # "# --- YAML trajectory support ---":
 #   1. import of the yaml_trajectory helper module (same directory);
 #   2. loading of a designer-generated YAML file when the 'trajectory'
@@ -14,20 +17,42 @@
 #      established, and the node holds position (station-keeping fallback
 #      pose) until then;
 #   3. one new branch in single_pose().
-# Every hard-coded trajectory below is byte-identical to the original and
-# keeps working exactly as before. generate_path() is unchanged.
+#
+# The hard-coded shapes are the reference conditions for existing field data.
+# Every one is byte-identical to the original except 'sin' and 'kin_square',
+# which now hold their last pose past t = 500 instead of teleporting back to
+# t = 50; TRAJECTORY_SYSTEM.md carries the shape revision record.
 # ============================================================================
+
+# ----------------------------------------------------------------------------
+# FILE MAP
+#
+#   module scope    SHAPES, is_valid_shape, the 'fsin' cumulative table
+#                   (_fsin_extend / _fsin_state and the _fsin_* globals).
+#                   The table MUST stay at this module's scope: _fsin_extend
+#                   and _fsin_state mutate the _fsin_* globals through the
+#                   `global` keyword, which only reaches names defined in this
+#                   module's own namespace.
+#
+#   class PathGeneration
+#     1. WIRING                   __init__
+#     2. SERVICE ENTRY POINT      generate_path
+#     3. from_yaml HOT RELOAD     _maybe_reload_yaml
+#     4. THE SHAPE LIBRARY        single_pose   <-- formulas are reference
+#                                 conditions for recorded field data
+# ----------------------------------------------------------------------------
 
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
-from std_msgs.msg import Float32, Float32MultiArray
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 from blueboat_interfaces.srv import RequestPath
 import math
+import time
 import custom_functions as cf
+import path_stamp as ps
 
 # --- YAML trajectory support ------------------------------------------------
 import yaml_trajectory as yt
@@ -37,7 +62,105 @@ import yaml_trajectory as yt
 Creates a services that handle path generation requests. Receives a an array of time values and responds with the associated path.
 """
 
+# The complete set of `trajectory:=` selectors single_pose serves. Anything else
+# is an operator typo: the node refuses to start rather than serving a path that
+# silently is not the one that was asked for.
+SHAPES = ('station_keeping', 'circle', 'straight_line', 'sin', 'fsin',
+          'square', 'kin_square', 'seabed_scanning', 'from_yaml:<abs path>')
+
+
+def _unknown_shape_message(path_shape) -> str:
+    return (f"unknown trajectory '{path_shape}'. valid: "
+            + ", ".join(SHAPES))
+
+
+def is_valid_shape(path_shape: str) -> bool:
+    """True for any selector single_pose can serve, including from_yaml."""
+    return (path_shape.startswith('from_yaml')
+            or path_shape in SHAPES)
+
+
+# --- 'fsin' cumulative table -------------------------------------------------
+# 'fsin' is the one shape with no closed form: its heading is the integral of a
+# sine (analytic), but x and y are integrals of the cosine and sine OF that
+# heading, which are not. It was therefore re-integrated from t=0, in a Python
+# loop at 0.01 s, on every single pose -- O(t) per pose, so a whole-path request
+# was O(n^2) and appeared to hang the launch.
+#
+# The integration is now done once on the same fixed 0.01 s grid and read out by
+# index. The table only ever grows, and each extension CONTINUES the accumulation
+# from the stored last value -- cumsum([last, *increments]), never
+# cumsum(increments) + last -- so the float sequence is identical to a single
+# pass. single_pose therefore stays pure in t: the same t gives the same pose
+# regardless of what was asked for before it, which is what lets a trajectory be
+# swapped, replayed or hot-reloaded.
+#
+# The one knob is the turn radius, handed in from the 'fsin' branch of
+# single_pose. Surge is fixed, so the radius alone sets the yaw-rate amplitude
+# (A = V/radius); the yaw-rate frequency then follows it (f = A/_FSIN_AF) so
+# that the total yaw swing -- and with it the SHAPE of the weave -- is
+# unchanged. The path is therefore the same curve scaled up, travelled at the
+# same authored speed, so a larger radius simply takes proportionally longer per
+# cycle. Changing the radius invalidates the table, which is rebuilt from t=0.
+_FSIN_V = 0.5           # surge [m/s] -- the authored speed
+_FSIN_AF = 20.0         # yaw-rate amplitude / frequency [s] -- fixes the weave shape
+_FSIN_DT = 0.01         # integration step [s]
+_FSIN_MAX_STEPS = 10_000_000    # 100 000 s of path; beyond it, hold the last pose
+
+_fsin_radius = None     # turn radius the table below was integrated for
+_fsin_yaw = np.zeros(1)
+_fsin_x = np.zeros(1)
+_fsin_y = np.zeros(1)
+
+
+def _fsin_extend(steps: int, radius: float) -> None:
+    """Grow the table so index `steps` exists, continuing the same recursion."""
+    global _fsin_yaw, _fsin_x, _fsin_y
+    have = _fsin_yaw.size - 1
+    if steps <= have:
+        return
+    target = min(max(steps, 2 * have, 1024), _FSIN_MAX_STEPS)
+    amplitude = _FSIN_V / radius              # yaw-rate amplitude [rad/s]
+    frequency = amplitude / _FSIN_AF          # yaw-rate frequency [Hz]
+    i = np.arange(have, target)                  # the steps still to take
+    tau = i * _FSIN_DT
+    omega = amplitude * np.sin(2 * np.pi * frequency * tau)
+    yaw = np.cumsum(np.concatenate(([_fsin_yaw[-1]], omega * _FSIN_DT)))
+    x = np.cumsum(np.concatenate(([_fsin_x[-1]], _FSIN_V * np.cos(yaw[1:]) * _FSIN_DT)))
+    y = np.cumsum(np.concatenate(([_fsin_y[-1]], _FSIN_V * np.sin(yaw[1:]) * _FSIN_DT)))
+    _fsin_yaw = np.concatenate((_fsin_yaw, yaw[1:]))
+    _fsin_x = np.concatenate((_fsin_x, x[1:]))
+    _fsin_y = np.concatenate((_fsin_y, y[1:]))
+
+
+def _fsin_state(t: float, radius: float):
+    """(x, y, yaw) of the 'fsin' trajectory of turn radius `radius` at time t.
+
+    Pure in t for a given radius. A different radius is a different shape, and
+    discards the table rather than reading it at the wrong scale.
+    """
+    global _fsin_radius, _fsin_yaw, _fsin_x, _fsin_y
+    if radius != _fsin_radius:
+        _fsin_radius = radius
+        _fsin_yaw = np.zeros(1)
+        _fsin_x = np.zeros(1)
+        _fsin_y = np.zeros(1)
+    steps = int(t / _FSIN_DT)
+    if steps <= 0:
+        return 0.0, 0.0, 0.0
+    steps = min(steps, _FSIN_MAX_STEPS)   # hold the last pose, as every shape does
+    _fsin_extend(steps, radius)
+    return _fsin_x[steps], _fsin_y[steps], _fsin_yaw[steps]
+# -----------------------------------------------------------------------------
+
+
 class PathGeneration(Node):
+
+    # ======================================================================
+    #  1. WIRING
+    #  parameters and the /path_request service.
+    # ======================================================================
+
     def __init__(self):
         super().__init__('path_generation')
 
@@ -47,6 +170,16 @@ class PathGeneration(Node):
 
         self.declare_parameter('trajectory', 'station_keeping')
         self.trajectory = self.get_parameter('trajectory').get_parameter_value().string_value
+
+        # An unrecognised name used to surface only as an exception inside the
+        # service handler, which kills the node on the first request: rclpy does
+        # not marshal a callback exception back to the caller, so master_control
+        # saw nothing but "Nothing to target yet." forever. Fail here instead,
+        # before anything is armed, naming the shape and the valid set.
+        if not is_valid_shape(self.trajectory):
+            msg = _unknown_shape_message(self.trajectory)
+            self.get_logger().fatal(msg)
+            raise ValueError(msg)
 
         # --- YAML trajectory support -----------------------------------------
         # A designer-generated trajectory is selected either with
@@ -70,8 +203,110 @@ class PathGeneration(Node):
                     "once the georeference is established).")
         # -----------------------------------------------------------------------
 
+        # --- exactly one server ----------------------------------------------
+        # ROS 2 does not stop a second node offering the same service name. When
+        # two do, every request is answered by whichever server replies first,
+        # and the response (a bare nav_msgs/Path) carries nothing identifying
+        # which request it answers -- so a controller cannot tell a foreign path
+        # from its own. Measured symptom: with two missions up, master_control's
+        # reference alternated tick by tick between two entirely different
+        # trajectories, both sampled at its own single path parameter, and the
+        # boat could not follow either. The invariant was long documented but
+        # nothing enforced it. This does.
+        self.declare_parameter('allow_duplicate_server', False)
+        self.declare_parameter('server_discovery_wait', 2.0)
+        if not self.get_parameter('allow_duplicate_server').get_parameter_value().bool_value:
+            self._refuse_if_server_running()
+
         # Service
         self.path_service = self.create_service(RequestPath, '/path_request', self.generate_path)
+
+    def _path_request_servers(self):
+        """Nodes currently offering /path_request, as 'ns/name' strings.
+
+        No self-exclusion, deliberately. This runs BEFORE create_service, so
+        this node offers no /path_request yet and anything found is somebody
+        else. Excluding by name would be actively wrong: the duplicate is
+        another `path_generation`, with the same name in the same namespace,
+        so a name test skips exactly the node it needs to find. (It did, on
+        the first attempt.)
+        """
+        found = []
+        for name, namespace in self.get_node_names_and_namespaces():
+            try:
+                services = self.get_service_names_and_types_by_node(name, namespace)
+            except Exception:
+                continue          # the node went away mid-enumeration
+            if any(service == '/path_request' for service, _ in services):
+                found.append(f"{namespace.rstrip('/')}/{name}")
+        # A duplicate is another `path_generation`, so the names collide and the
+        # per-node lookup resolves by name: the same node can be reported twice.
+        # Report distinct names -- the count is not meaningful, the fact is.
+        return sorted(set(found))
+
+    def _refuse_if_server_running(self):
+        """Exit rather than become the second /path_request server."""
+        # The graph is not populated the instant a node comes up, so give
+        # discovery a moment before believing an empty answer.
+        deadline = time.monotonic() + max(
+            0.0, self.get_parameter('server_discovery_wait').get_parameter_value().double_value)
+        others = []
+        while True:
+            others = self._path_request_servers()
+            if others or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+
+        if others:
+            msg = ("/path_request is already served by " + ", ".join(others) + ". "
+                   "Exactly one path server may run: with two, the controller's "
+                   "requests are answered by whichever replies first and it "
+                   "follows a mixture of two trajectories. Shut the other "
+                   "mission down first. Pass allow_duplicate_server:=true only "
+                   "if you deliberately want two.")
+            self.get_logger().fatal(msg)
+            raise SystemExit(1)
+
+    # ======================================================================
+    #  2. SERVICE ENTRY POINT
+    #  One pose per requested parameter value. Response frame_id is 'world'.
+    # ======================================================================
+
+    def generate_path(self, request, response):
+        # --- YAML trajectory support: pick up newly deployed files ---------
+        self._maybe_reload_yaml()
+        # -------------------------------------------------------------------
+        if self.display_log:
+            self.get_logger().info(f"Received path_request of type: {type(request.path_request)}")
+
+        path_msg = Path()
+        path_msg.header.frame_id = 'world'
+
+        for t in request.path_request.data:
+            temp_pose = self.single_pose(t, self.trajectory)
+            # Stamp the pose with the PATH PARAMETER it was evaluated at, not
+            # with the clock. The clock told a caller nothing; the parameter
+            # lets it verify that this response answers its own request rather
+            # than another server's (see _refuse_if_server_running). tau is
+            # non-negative and monotonic, so it encodes directly into the
+            # existing builtin_interfaces/Time field -- no .srv change, nothing
+            # added to the wire contract.
+            sec, nanosec = ps.encode(t)
+            temp_pose.header.stamp.sec = sec
+            temp_pose.header.stamp.nanosec = nanosec
+            path_msg.poses.append(temp_pose)
+
+        response.path = path_msg
+
+        if self.display_log:
+            self.get_logger().info("Returning response...")
+
+        return response
+
+    # ======================================================================
+    #  3. from_yaml HOT RELOAD
+    #  Watches the designer file so a GPS-anchored mission can be deployed mid-run.
+    # ======================================================================
 
     # --- YAML trajectory support ------------------------------------------
     def _maybe_reload_yaml(self):
@@ -96,14 +331,33 @@ class PathGeneration(Node):
             self.get_logger().error(
                 f"Failed to load YAML trajectory "
                 f"'{self._yaml_selected_path}': {exc}")
+
+    # ======================================================================
+    #  4. THE SHAPE LIBRARY
+    #  Formulas are REFERENCE CONDITIONS for recorded field data -- read the docstring.
+    # ======================================================================
+
     # -----------------------------------------------------------------------
 
     def single_pose(self, t: float, path_shape = 'station_keeping') -> PoseStamped:
         """
         Generate a path for a given time t.
-        """
-        #TODO Find a more elegant method to select path (probably a dictionnary)
 
+        The hard-coded shapes below are the REFERENCE CONDITIONS for existing field
+        data. Changing a formula silently invalidates comparison with every earlier
+        run on that shape: the shape is not versioned in the code, in the position
+        CSV or in the .npy log, so nothing raises an error. Field data is write-once
+        and cannot be re-collected to match a changed formula. If you change one,
+        record which shape moved and from what date in the shape revision record in
+        TRAJECTORY_SYSTEM.md ("The built-in shapes"), and treat prior runs on that
+        shape as not comparable.
+
+        Speed is baked into each formula -- `x = 0.5*t` means 0.5 m/s.
+
+        Raises ValueError, naming the shape and the valid set, for anything not
+        in SHAPES. The node also refuses to start on a bad `trajectory:=`, so
+        this is the second line of defence rather than the first.
+        """
         depth_per_circle = 2.0  # meters
         num_turns = 3
         total_length = 2 * np.pi * num_turns
@@ -142,7 +396,7 @@ class PathGeneration(Node):
             yaw = 0.0
         
         # Circle
-        if path_shape == 'circle':
+        elif path_shape == 'circle':
             radius = 4.0 # meters
             t *= 0.08
             x = -radius + radius * np.cos(t)
@@ -155,16 +409,15 @@ class PathGeneration(Node):
             yaw = (yaw + np.pi) % (2 * np.pi) - np.pi # Normalize
 
         # Straight line
-        if path_shape == 'straight_line':
+        elif path_shape == 'straight_line':
             x = 0.5*t
             y = 0.0*t + 1.0
             z = 0.0
             yaw = 0.0
 
         # Sin line
-        if path_shape == 'sin':
-            if t>500:
-                t = 50
+        elif path_shape == 'sin':
+            t = min(t, 500.0)   # hold the last pose (yaml_trajectory's convention)
             a = 3.5
             f = 0.2
             vx = 0.4
@@ -180,31 +433,20 @@ class PathGeneration(Node):
             yaw = np.arctan2(dy, dx)
 
         # Surge sin
-        if path_shape == 'fsin':
-            v = 0.1
-            A = 1
-            f = 0.05
-            dt = 0.01
+        elif path_shape == 'fsin':
+            # Turn radius of the weave [m] -- the one knob of this shape. Surge
+            # is fixed at _FSIN_V = 0.5 m/s, so the radius scales the whole path
+            # and its cycle time with it (1.5 m -> one cycle per 60 s); see
+            # _fsin_state.
+            radius = 1.5
 
-            x = 0.0
-            y = 0.0
+            # Same Euler integration as ever, read out of a cumulative table
+            # instead of re-run from t=0 on every pose (see _fsin_state).
             z = 0.0
-
-            yaw = 0.0
-
-            steps = int(t / dt)
-
-            for i in range(steps):
-                tau = i * dt
-
-                omega = A * np.sin(2 * np.pi * f * tau)
-                yaw += omega * dt
-
-                x += v * np.cos(yaw) * dt
-                y += v * np.sin(yaw) * dt
+            x, y, yaw = _fsin_state(t, radius)
 
         # Square wave
-        if path_shape == 'square':
+        elif path_shape == 'square':
             period = 0.01
             amplitude = 2.0
             heading_dt = 0.01
@@ -228,9 +470,8 @@ class PathGeneration(Node):
             yaw = math.atan2(dy, dx)
 
         # Kinematic square wave
-        if path_shape == 'kin_square':
-            if t>500:
-                t= 50
+        elif path_shape == 'kin_square':
+            t = min(t, 500.0)   # hold the last pose (yaml_trajectory's convention)
             segment_length = 5.0
             surge_speed = 0.3
             z = 0.0
@@ -270,12 +511,17 @@ class PathGeneration(Node):
             y += dy * surge_speed * t_in_segment
 
         # Seabed scanning
-        if path_shape == 'seabed_scanning':
+        elif path_shape == 'seabed_scanning':
             x,y,z,roll,pitch,yaw = cf.seabed_scanning(t)
             x = float(x)
             y = float(y)
             z = 0.0
             yaw = float(yaw)
+
+        else:
+            # No fall-through: the chain above is exhaustive over SHAPES, so an
+            # unrecognised name can never leave x/y/z/yaw unbound again.
+            raise ValueError(_unknown_shape_message(path_shape))
 
         # Create and return pose
         quat = R.from_euler('zyx', [yaw, 0.0, 0.0]).as_quat()
@@ -291,34 +537,6 @@ class PathGeneration(Node):
         pose.pose.orientation.w = quat[3]
 
         return pose
-
-    def generate_path(self, request, response):
-        # --- YAML trajectory support: pick up newly deployed files ---------
-        self._maybe_reload_yaml()
-        # -------------------------------------------------------------------
-        if self.display_log:
-            self.get_logger().info(f"Received path_request of type: {type(request.path_request)}")
-
-        path_msg = Path()
-        path_msg.header.frame_id = 'world'
-
-        for t in request.path_request.data:
-            temp_pose = self.single_pose(t, self.trajectory)
-            temp_pose.header.stamp = self.get_clock().now().to_msg()
-            path_msg.poses.append(temp_pose)
-
-        response.path = path_msg
-
-        if self.display_log:
-            self.get_logger().info("Returning response...")
-
-        return response
-
-    def single_request(self, msg: Float32):
-        time_request = msg.data
-        desired_pose = self.single_pose(time_request)
-        desired_pose.header.stamp = self.get_clock().now().to_msg()
-        self.pose_publisher.publish(desired_pose)
 
 
 def main(args=None):

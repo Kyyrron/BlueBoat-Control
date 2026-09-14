@@ -8,7 +8,7 @@ find_package(std_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
-install(DIRECTORY launch config DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
 
 install(PROGRAMS src/MPC/ur_mpc_control.py
         DESTINATION lib/${PROJECT_NAME})
@@ -30,6 +30,25 @@ install(PROGRAMS src/_custom_libraries/path_generation.py
 install(PROGRAMS src/_custom_libraries/custom_functions.py
         DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS src/_custom_libraries/yaml_trajectory.py
+        DESTINATION lib/${PROJECT_NAME})
+# ROS-free helper modules. They are imported as bare modules (`import
+# frame_math`) exactly like custom_functions, which only works because every
+# script below lands FLAT in lib/blueboat_control -- so a new file that is not
+# installed here works from the source tree and dies with ModuleNotFoundError
+# at node start after a clean colcon build.
+install(PROGRAMS src/_custom_libraries/frame_math.py
+        DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS src/_custom_libraries/robot_log_schema.py
+        DESTINATION lib/${PROJECT_NAME})
+# Also the post-mission report CLI: the flat destination is what makes both
+# `import poslog_report` (from robot_interface's shutdown hook) and
+# `ros2 run blueboat_control poslog_report.py <csv>` resolve from one install.
+install(PROGRAMS src/_custom_libraries/poslog_report.py
+        DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS src/_custom_libraries/path_stamp.py
+  DESTINATION lib/${PROJECT_NAME})
+
+install(PROGRAMS src/_custom_libraries/thrust_limits.py
         DESTINATION lib/${PROJECT_NAME})
 
 install(PROGRAMS src/robot_interaction/robot_interface.py

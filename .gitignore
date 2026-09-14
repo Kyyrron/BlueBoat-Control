@@ -5,3 +5,7 @@ data/
 metadata.yaml
 acados_ocp.json
 c_generated_code/
+cache/
+.claude/specs/
+.claude/tools/
+.claude/settings.json

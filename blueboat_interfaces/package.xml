@@ -5,7 +5,7 @@
   <description>Interface definitions for blueboat control</description>
 
   <maintainer email="you@example.com">Your Name</maintainer>
-  <license>Apache-2.0</license>
+  <license>MIT</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 

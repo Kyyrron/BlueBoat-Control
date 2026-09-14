@@ -7,6 +7,8 @@ sl_note = sl.declare_arg('note', default_value= '')                             
 sl_controller = sl.declare_arg('controller_type', default_value = '')           # As an option, it is possible to launch a controller along the robot interaction
 sl_trajectory = sl.declare_arg('trajectory', default_value = 'station_keeping') # Trajectory reference for the control
 sl_pinger = sl.declare_arg('use_pinger', default_value = False)                 # Tell the controller to rely on pinger coordinates or computed trajectory
+sl_fcu = sl.declare_arg('fcu_url', default_value = 'udp://:14550@192.168.2.2:14550') # MAVROS <-> autopilot endpoint. Port 14550 is also QGroundControl's default listen port: a running QGC takes it first and mavros fails to bind, which shows up as an intermittent launch failure. Close QGC, or move this launch to another port.
+sl_data = sl.declare_arg('data_dir', default_value = '')                       # Root for run artifacts (position CSV, controller .npy). Empty resolves to $BLUEBOAT_DATA_DIR, else the sourced workspace root.
 
 def launch_setup():
 
@@ -15,7 +17,7 @@ def launch_setup():
             'mavros_node',   # executable
             output='screen',
             parameters=[{
-                'fcu_url': 'udp://:14550@192.168.2.2:14550',
+                'fcu_url': sl_fcu,
                 'gcs_url': '',
                 'target_system_id': 1,
                 'target_component_id': 1
@@ -28,6 +30,7 @@ def launch_setup():
                         'note' : sl_note,
                         'controller_type' : sl_controller,
                         'use_UWgps': sl_pinger,
+                        'data_dir': sl_data,
                         'use_sim_time': False})
 
     # Connect to the pinger and log data
@@ -48,6 +51,7 @@ def launch_setup():
                 parameters={'controller_type' : sl_controller,
                             'simulation' : False,
                             'use_pinger': sl_pinger,
+                            'data_dir': sl_data,
                             'use_sim_time': False})
 
         if sl.arg('use_pinger') == False:
