@@ -242,7 +242,7 @@ def section_frames(logs, workspace):
     figure.savefig(out)
     check("the simulated report renders", os.path.getsize(out) > 40_000)
 
-    # And the archived boat-side PNG makes the same call, from the same code.
+    # And the archived poslog_report PNG makes the same call, from the same code.
     import poslog_report as pr
     check("poslog_report agrees the run is simulated", pr.is_simulation(sim))
     check("poslog_report draws it in the same frame",

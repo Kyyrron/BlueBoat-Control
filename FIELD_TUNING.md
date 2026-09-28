@@ -107,7 +107,7 @@ Surge = authored speed feedforward (no along-track integrator); yaw = P-D on hea
 | Parameter | Default real / sim | Effect |
 |---|---|---|
 | `mpc_horizon` N | 15 / **30** | Prediction steps; sets step `dt = mpc_time/N` and QP size `nv = 2N`. |
-| `mpc_time` | 2.5 s / **6.0 s** | Prediction span. ⚠ The real boat stays at 2.5 s — solve time has never been measured on the companion computer. |
+| `mpc_time` | 2.5 s / **6.0 s** | Prediction span. ⚠ Real-robot runs stay at 2.5 s — the solve time has never been measured in one. |
 | `mpc_Q_diag` `[x,y,psi,u,v,r]` | `[50,50,30,1,1,1]` | Tracking weights: `x/y` for position, `psi` for heading. |
 | `mpc_R_diag` | `[0.015,0.015]` / `[0.10,0.10]` | Effort penalty in N². Sets where full throttle becomes cheaper than the error: **0.015 → 0.49 m, 0.10 → 1.26 m, 0.25 → 2.00 m**. Raise it if the MPC saturates. |
 | `mpc_qp_iter_max` | 0 = derive | qpOASES working-set budget, `0` → `max(50, 4·nu·N)` = 240 at N=30. ⚠ Never pin it below `nv = 2N`, or a saturating solve fails by construction. |

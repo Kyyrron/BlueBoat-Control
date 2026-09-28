@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 r"""
-Column schema of the position CSV written by robot_interface.py on the boat
+Column schema of the position CSV written by robot_interface.py in real-robot runs
 and by simulation_interface.py in Gazebo.
 
 ROS-FREE BY CONSTRUCTION -- this module contains data and nothing else. It

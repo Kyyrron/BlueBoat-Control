@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 r"""
-Post-mission report for the robot-side position CSV.
+Post-mission report for the position CSV (robot_interface / simulation_interface).
 
 Reads `<root>/data/Robot_data/{date}-{note}-poslog.csv` (either layout, detected
 from the header), renders one PNG for quick analysis, then files the run away as

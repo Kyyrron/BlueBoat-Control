@@ -54,9 +54,11 @@ extra pieces `pip` does not install; see step 5 below. It is only required for
 `controller_type:='MPC'`, but `master_control` imports it unconditionally, so it must be
 present for any controller.
 
-**Real robot** — the boat runs [BlueOS](https://bluerobotics.com/learn/blueboat-software-setup/)
-with the [blueos-ros2 app](https://github.com/itskalvik/blueos-ros2) (installable from the
-BlueOS app tab). High-level supervision is
+**Real robot** — every node of this repository, MAVROS included, runs on the operator laptop
+(`~/ros2_ws`) and reaches the boat through the BlueBoat Base Station WiFi. The boat carries only
+its hardware and its own firmware: the [BlueOS](https://bluerobotics.com/learn/blueboat-software-setup/)
+/ ArduPilot autopilot, which MAVROS reaches at `192.168.2.2` (`fcu_url`), the sonars, GPS/compass
+and the Water Linked USBL. High-level supervision is
 [QGroundControl](https://s3.amazonaws.com/downloads.bluerobotics.com/QGC/latest/QGroundControl.AppImage) (runnable through `./QGroundControl.AppImage`).
 
 ---
@@ -150,7 +152,7 @@ ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: move 3 3 2"
 
 | Argument | Where | Meaning |
 |---|---|---|
-| `controller_type` | both | `'MPC'`, `'PID'` or `'LoS'`. Empty on the real boat starts no controller. |
+| `controller_type` | both | `'MPC'`, `'PID'` or `'LoS'`. Empty in a real-robot run (`BlueBoat_launch.py`) starts no controller. |
 | `trajectory` | both | The reference to follow. Full list in `blueboat_control/src/_custom_libraries/path_generation.py`; a designer mission is `from_yaml:/abs/path.yaml`. |
 | `data_dir` | both | Root for the run artifacts. Empty resolves automatically — see below. |
 | `note` | both | Tag added to the position-log file name. |

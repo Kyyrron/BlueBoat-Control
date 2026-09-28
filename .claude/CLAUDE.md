@@ -267,7 +267,7 @@ that binding.
 
 | Topic | Type | Published by | Subscribed by |
 |---|---|---|---|
-| `/blueboat/odom` | `nav_msgs/Odometry` | `robot_interface` (real boat) · Gazebo bridge (simulation, §8) | `master_control`, `simulation_interface` — frame is **local ENU** on both: origin = launch point (real) / Gazebo world origin (sim), axes East/North, yaw **absolute ENU** (0 = East, CCW+). Real yaw is NOT re-zeroed (fixed 2026-08-31: subtracting `yaw0` without rotating the position axes made a hybrid frame that was only consistent when the boat launched facing East — the cause of the East-only trajectory-following field symptom) |
+| `/blueboat/odom` | `nav_msgs/Odometry` | `robot_interface` (real-robot run) · Gazebo bridge (simulation, §8) | `master_control`, `simulation_interface` — frame is **local ENU** on both: origin = launch point (real) / Gazebo world origin (sim), axes East/North, yaw **absolute ENU** (0 = East, CCW+). Real yaw is NOT re-zeroed (fixed 2026-08-31: subtracting `yaw0` without rotating the position axes made a hybrid frame that was only consistent when the boat launched facing East — the cause of the East-only trajectory-following field symptom) |
 | `/blueboat/pinger_coordinates` | `std_msgs/Float32MultiArray` | `robot_interface` | `master_control` |
 | `/blueboat/controller_ready` | `std_msgs/Bool` | `robot_interface` · `simulation_interface` | `master_control` |
 | `/thruster_input` | `std_msgs/Float32MultiArray` | `master_control` | `robot_interface`, `simulation_interface` |
@@ -891,7 +891,7 @@ so the reference window and the solver's horizon cannot disagree.
 
 | Artifact | Path | Nature |
 |---|---|---|
-| Position/pinger CSV | `<root>/data/Robot_data/{date}-{note}-poslog.csv` | **Raw field record — never overwrite or regenerate.** Written by `robot_interface` on the boat and by `simulation_interface` in Gazebo |
+| Position/pinger CSV | `<root>/data/Robot_data/{date}-{note}-poslog.csv` | **Raw field record — never overwrite or regenerate.** Written by `robot_interface` in a real-robot run and by `simulation_interface` in Gazebo |
 | Controller monitoring | `<root>/data/{ctrl}_data/{date}-{ctrl}_{sim}_data.npy` | Per-run result |
 
 `<root>` is resolved at node start by `custom_functions.data_root`, first match wins: the
@@ -1120,7 +1120,7 @@ its config. Fixing it is a launch-behaviour change and has not been made.
 
 `upload_rov_launch.py` is where simulation gets its sensing: it bridges Gazebo's odometry to
 `/blueboat/odom` (the `OdometryPublisher` plugin runs at 20 Hz with `odom_frame: world`),
-plus `/blueboat/pose_gt`, `joint_states` and `cmd_thruster{1,2}`. So on the real boat
+plus `/blueboat/pose_gt`, `joint_states` and `cmd_thruster{1,2}`. So in a real-robot run
 `/blueboat/odom` comes from `robot_interface`, and in simulation it comes from the bridge —
 same topic, same type, different origin.
 
@@ -1311,7 +1311,7 @@ to `<stem>-origin.yaml`. Without that fallback a re-opened export silently loses
 ### 9.6 Simulation is drawn in world coordinates, never in GPS
 
 A run recorded in Gazebo is plotted in **local ENU metres** — east/north of the world origin —
-in the archived boat-side PNG and in the app alike, and **no latitude or longitude is printed
+in the archived `poslog_report` PNG and in the app alike, and **no latitude or longitude is printed
 anywhere for it**: not on the track axes, not in the summary's origin cell. A simulated
 position is not a surveyed one, and drawing it in degrees invites reading it as one.
 

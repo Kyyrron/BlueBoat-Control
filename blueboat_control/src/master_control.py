@@ -581,10 +581,10 @@ class Controller(Node):
         # THE HORIZON. 6.0 s / 30 steps in simulation is the one MPC change in
         # this repository with a measurement behind it: the circle's steady
         # radial offset goes -1.019 m -> -0.011 m and cruise
-        # speed 26 % fast -> exact. The real boat stays at 2.5 s / 15 until the
-        # solve time is measured on the companion computer -- doubling the
-        # horizon is precisely the change that would break the 50 ms budget, and
-        # it has never been timed on target hardware.
+        # speed 26 % fast -> exact. Real-robot runs stay at 2.5 s / 15 until the
+        # solve time is measured in one -- doubling the horizon is precisely the
+        # change that would break the 50 ms budget, and it has never been timed
+        # in a real-robot run.
         # Both keep dt = time/horizon at 0.167-0.200 s.
         self.mpc_horizon = integer('mpc_horizon', 30 if self.isSimulation else 15)
         self.mpc_time    = dbl('mpc_time', 6.0 if self.isSimulation else 2.5)
@@ -810,8 +810,8 @@ class Controller(Node):
                         "ZERO thrust. The boat will drift.",
                         throttle_duration_sec=1.0)
                 elif self.controller.last_solve_time > 0.5 * self.dt:
-                    # The 20 Hz budget has never been measured on the boat's
-                    # companion computer, and doubling the
+                    # The 20 Hz budget has never been measured in a
+                    # real-robot run, and doubling the
                     # horizon is precisely the change that would break it. This
                     # makes it visible from /rosout without a field harness (N7).
                     self.get_logger().warning(

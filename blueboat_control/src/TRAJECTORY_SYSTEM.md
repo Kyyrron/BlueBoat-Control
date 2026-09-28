@@ -168,7 +168,8 @@ the short way around the circle. Two edge rules:
 * **before the start** → clamps to the first sample.
 
 All the hard geometry (arcs, Béziers, splines, lawnmower patterns, per-segment speeds) is
-resolved on the laptop at export time. The robot only ever does linear interpolation.
+resolved by the MCS Pattern Designer at export time. `path_generation` only ever does linear
+interpolation.
 
 ### The "file appears later" trick (GPS-anchored missions)
 
