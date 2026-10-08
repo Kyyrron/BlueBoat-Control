@@ -45,14 +45,16 @@ repository's `requirements.txt`.
   disabled there, since they are georeferenced in degrees. A real run that
   lost its fix gets the same world-frame track rather than an empty panel.
 * **Name** — renames the *export*. The original log is never renamed.
-* **Export log** — writes the selection to
-  `~/ros2_ws/data/Processed_Robot_data/<name>/`:
+* **Export log** — opens a small dialog to confirm the name and choose the replay
+  video's speed (×5 to ×20, with the resulting GIF length shown live), then writes
+  the selection to `~/ros2_ws/data/Processed_Robot_data/<name>/`:
 
   | file | what it is |
   |---|---|
-  | `<name>.csv` | the rows inside the timeline, every column, copied field for field |
+  | `<name>.csv` | a description row and a unit row, the column names, then the rows inside the timeline, every column, copied field for field |
   | `<name>.png` | the report as you framed it — your text, your zoom, your tiles |
   | `<name>-origin.yaml` | a copy of the run's world-frame origin sidecar |
+  | `<name>.gif` | the track replayed at the chosen speed over the whole selection, framed as on screen |
   | `export.yaml` | the source, the crop, the wall-clock span and every edited string |
 
 ## The rule that matters
@@ -69,7 +71,7 @@ tree before and after a full session.
 QT_QPA_PLATFORM=offscreen python3 log_reviewer/smoke_test.py
 ```
 
-89 checks: reading, cropping, the simulation frame, that the numbers still match `poslog_report`'s
+121 checks: reading, cropping, the simulation frame, that the numbers still match `poslog_report`'s
 own, rendering, export contents, the tile cache, the window, and that the field
 data is byte-for-byte untouched. It needs at least one real poslog under
 `Robot_data/` and skips cleanly (exit 0) when there is none.

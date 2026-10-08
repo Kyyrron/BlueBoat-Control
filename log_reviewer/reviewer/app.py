@@ -17,8 +17,9 @@ import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDoubleSpinBox,
-                               QFileDialog, QFrame, QHBoxLayout, QHeaderView,
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QDialog,
+                               QDialogButtonBox, QDoubleSpinBox, QFileDialog,
+                               QFormLayout, QFrame, QHBoxLayout, QHeaderView,
                                QLabel, QLineEdit, QMainWindow, QMessageBox,
                                QPlainTextEdit, QPushButton, QScrollArea,
                                QSizePolicy, QSlider, QSplitter, QTableWidget,
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDoubleSpinBox,
 from . import export as E
 from . import figures as F
 from . import poslog_bridge as pb
+from . import replay_video as V
 from .cursor import LinkedCursor, Overlay
 from .tiles import TileProvider
 from .timeline import RangeSlider
@@ -114,6 +116,89 @@ class TextHeader(QWidget):
         self.description.blockSignals(False)
 
 
+def fmt_duration(seconds):
+    """`1 min 44 s` above a minute, `9.4 s` below."""
+    if seconds >= 60.0:
+        whole = int(round(seconds))
+        return "%d min %02d s" % (whole // 60, whole % 60)
+    return "%.1f s" % seconds
+
+
+class ExportDialog(QDialog):
+    """The last word before an export: its name, and how fast the GIF plays.
+
+    The duration preview is `replay_video.video_timing` - the arithmetic the
+    writer itself uses - so what it says is the length of the file, not an
+    estimate of it.
+    """
+
+    def __init__(self, name, t0, t1, speed=V.DEFAULT_SPEED, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Export log")
+        self._t0, self._t1 = float(t0), float(t1)
+
+        form = QFormLayout()
+        self.name_edit = QLineEdit(name)
+        self.name_edit.setMinimumWidth(380)
+        self.name_edit.setToolTip(
+            "Names the export folder and its files, and titles the picture.\n"
+            "The original log in Robot_data/ is never renamed.")
+        form.addRow("Name", self.name_edit)
+
+        row = QHBoxLayout()
+        self.speed_slider = QSlider(Qt.Horizontal)
+        self.speed_slider.setRange(V.MIN_SPEED, V.MAX_SPEED)
+        self.speed_slider.setSingleStep(1)
+        self.speed_slider.setPageStep(5)
+        self.speed_slider.setTickInterval(5)
+        self.speed_slider.setTickPosition(QSlider.TicksBelow)
+        self.speed_slider.setValue(int(speed))
+        self.speed_label = QLabel()
+        self.speed_label.setFixedWidth(40)
+        row.addWidget(self.speed_slider, 1)
+        row.addWidget(self.speed_label)
+        form.addRow("Replay video", row)
+
+        self.preview = QLabel()
+        self.preview.setStyleSheet("color: %s;" % pb.MUTED)
+        form.addRow("", self.preview)
+
+        self.buttons = QDialogButtonBox(QDialogButtonBox.Cancel)
+        self.export_button = self.buttons.addButton("Export", QDialogButtonBox.AcceptRole)
+        self.export_button.setDefault(True)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(self.buttons)
+
+        self.speed_slider.valueChanged.connect(self._update_preview)
+        self.name_edit.textChanged.connect(self._update_button)
+        self._update_preview()
+        self._update_button()
+
+    def name(self):
+        return self.name_edit.text()
+
+    def speed(self):
+        return int(self.speed_slider.value())
+
+    def preview_text(self):
+        return self.preview.text()
+
+    def _update_preview(self):
+        speed = self.speed()
+        self.speed_label.setText("\u00d7%d" % speed)
+        duration, frame_ms = V.video_timing(self._t0, self._t1, speed)
+        self.preview.setText("Selection %s  \u2192  GIF %s  \u00b7  %.1f fps" % (
+            fmt_duration(self._t1 - self._t0), fmt_duration(duration),
+            1000.0 / frame_ms))
+
+    def _update_button(self):
+        self.export_button.setEnabled(bool(self.name_edit.text().strip()))
+
+
 class ReviewerWindow(QMainWindow):
 
     def __init__(self, csv_path=None, fetch_tiles=True):
@@ -144,6 +229,7 @@ class ReviewerWindow(QMainWindow):
         self._frame.timeout.connect(self._tick)
         self._playhead = 0.0
         self._speed = 1
+        self._video_speed = V.DEFAULT_SPEED
 
         self._build_ui()
         self._set_enabled(False)
@@ -205,7 +291,8 @@ class ReviewerWindow(QMainWindow):
         self.export_button = QPushButton("Export log")
         self.export_button.clicked.connect(self._export)
         self.export_button.setToolTip(
-            "Write the selected window to ~/ros2_ws/data/Processed_Robot_data/")
+            "Write the selected window to ~/ros2_ws/data/Processed_Robot_data/,\n"
+            "with a \u00d75\u2013\u00d720 replay video of the track as framed here")
         row.addWidget(self.export_button)
         return row
 
@@ -626,6 +713,15 @@ class ReviewerWindow(QMainWindow):
     def _export(self):
         if self.crop is None:
             return
+        t = self.crop["t"]
+        dialog = ExportDialog(self.name_edit.text(), t[0] if len(t) else 0.0,
+                              t[-1] if len(t) else 0.0, self._video_speed, self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        # Written back to the toolbar: that entry is also the picture's title.
+        self.name_edit.setText(dialog.name())
+        self._video_speed = dialog.speed()
+
         name = E.safe_name(self.name_edit.text(), self.run["stem"])
         folder = os.path.join(E.DEFAULT_ROOT, name)
         overwrite = False
@@ -642,12 +738,19 @@ class ReviewerWindow(QMainWindow):
         if was_playing:
             self.play_button.setChecked(False)
         try:
-            written = E.export(
-                self.source_csv, name, self.crop, self.texts, root=E.DEFAULT_ROOT,
-                tile_provider=self.provider if self.satellite_box.isChecked() else None,
-                track_limits=self.track.limits(), overwrite=overwrite)
+            # The replay video takes a few seconds on a long run. Restored
+            # before any dialog, so an error box is not under a busy cursor.
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                written = E.export(
+                    self.source_csv, name, self.crop, self.texts, root=E.DEFAULT_ROOT,
+                    tile_provider=self.provider if self.satellite_box.isChecked() else None,
+                    track_limits=self.track.limits(), overwrite=overwrite,
+                    video_speed=self._video_speed)
+            finally:
+                QApplication.restoreOverrideCursor()
         except Exception as exc:                                # noqa: BLE001
-            # Deliberately broad. An export writes four files through three
+            # Deliberately broad. An export writes five files through three
             # libraries; whatever one of them raises, the operator must be told
             # in the window rather than in a terminal they may not be watching,
             # and the app must survive to let them try again.
@@ -656,8 +759,13 @@ class ReviewerWindow(QMainWindow):
                 "%s: %s\n\nPartial files may be left in\n%s"
                 % (type(exc).__name__, exc, folder))
             return
+        video = os.path.isfile(os.path.join(written, name + ".gif"))
+        duration, _ = V.video_timing(t[0], t[-1], self._video_speed) if len(t) else (0, 0)
         QMessageBox.information(
             self, "Exported",
-            "%d of %d rows written to\n\n%s" % (
-                self.crop["n_rows"], self.run["n_rows_full"], written))
+            "%d of %d rows written to\n\n%s\n\n%s" % (
+                self.crop["n_rows"], self.run["n_rows_full"], written,
+                "With a \u00d7%d replay video (%s)." % (self._video_speed,
+                                                        fmt_duration(duration))
+                if video else "No replay video (export.yaml says why)."))
         self.statusBar().showMessage("Exported to %s" % written)

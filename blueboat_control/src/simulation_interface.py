@@ -190,8 +190,11 @@ class Controller(Node):
         # same rule the reader in poslog_report uses.
         self.origin_path = re.sub(r'-poslog(-\d+)?\.csv$', r'-origin\1.yaml', self.path)
 
-        # Header once, then one appended-and-flushed row per tick.
+        # Legend (description row, unit row) and header once, then one
+        # appended-and-flushed row per tick. Same three lines as robot_interface.
         self.log_file = open(self.path, 'w', buffering=1)
+        for line in rls.legend_rows(self.data_columns):
+            self.log_file.write(','.join(line) + '\n')
         self.log_file.write(','.join(self.data_columns) + '\n')
         self.log_file.flush()
         self.origin_written = False

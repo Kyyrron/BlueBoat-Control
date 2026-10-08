@@ -28,6 +28,7 @@ import matplotlib.patheffects as patheffects
 import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
+from matplotlib.lines import Line2D
 
 from . import poslog_bridge as pb
 
@@ -302,6 +303,79 @@ def decorate_track(ax, lat0, world=False):
                     ha="center", va="bottom", color=INK2, fontsize=8, zorder=5,
                     path_effects=HALO)
     ax._decor_artists = [arrow, bar, label]
+
+
+# ---------------------------------------------------------------------------
+# Replay - shared by the live track and the exported video
+# ---------------------------------------------------------------------------
+
+def replay_series(run):
+    """Robot and target tracks with unusable rows punched out as NaN.
+
+    Taken from the SAME `track_series` the panel is drawn from, so replay
+    and hover follow the plotted frame - degrees on a real run, metres in
+    simulation - with no second decision to keep in step. The keys stay
+    named lon/lat because they are the panel's x and y whatever the frame.
+
+    NaN is what a Line2D needs to break rather than bridge a gap, and it
+    keeps the replay arrays index-aligned with `run["t"]`, so a playback
+    time maps to a row with one searchsorted and no bookkeeping.
+    """
+    series = pb.track_series(run)
+    fix, tfix = series["ok"], series["tok"]
+    return {
+        "t": run["t"],
+        "lon": np.where(fix, series["x"], np.nan),
+        "lat": np.where(fix, series["y"], np.nan),
+        "tlon": np.where(tfix, series["tx"], np.nan),
+        "tlat": np.where(tfix, series["ty"], np.nan),
+    }
+
+
+def make_replay_artists(ax, visible=False):
+    """The four replay artists - target trail, robot trail, target dot, robot
+    dot - added to `ax`. One definition, so the exported video draws exactly
+    what the on-screen replay draws."""
+    common = dict(visible=visible)
+    target_trail = Line2D([], [], color=TARGET, linewidth=2.6, zorder=6, **common)
+    robot_trail = Line2D([], [], color=ROBOT, linewidth=2.8, zorder=7, **common)
+    target_dot = Line2D([], [], marker="o", markersize=9, color=TARGET,
+                        markeredgecolor=SURFACE, markeredgewidth=1.8,
+                        linestyle="none", zorder=8, **common)
+    robot_dot = Line2D([], [], marker="o", markersize=11, color=ROBOT,
+                       markeredgecolor=SURFACE, markeredgewidth=2.0,
+                       linestyle="none", zorder=9, **common)
+    artists = [target_trail, robot_trail, target_dot, robot_dot]
+    for artist in artists:
+        ax.add_line(artist)
+    return artists
+
+
+def set_replay_frame(artists, series, t):
+    """Advance the four replay artists to mission time `t`. Draws nothing."""
+    times = series["t"]
+    if not len(times):
+        return
+    index = int(np.searchsorted(times, t, side="right")) - 1
+    index = min(max(index, 0), len(times) - 1)
+    artists[0].set_data(series["tlon"][:index + 1], series["tlat"][:index + 1])
+    artists[1].set_data(series["lon"][:index + 1], series["lat"][:index + 1])
+    artists[2].set_data(*last_valid(series["tlon"], series["tlat"], index))
+    artists[3].set_data(*last_valid(series["lon"], series["lat"], index))
+
+
+def last_valid(xs, ys, index):
+    """The most recent fixed sample at or before `index`.
+
+    A replay must not park its marker at a NaN just because the boat lost its
+    fix for one row; it holds the last place it actually was.
+    """
+    window = xs[:index + 1]
+    good = np.nonzero(~np.isnan(window))[0]
+    if not len(good):
+        return [], []
+    last = good[-1]
+    return [xs[last]], [ys[last]]
 
 
 # ---------------------------------------------------------------------------

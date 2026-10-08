@@ -4,7 +4,8 @@ r"""
 Post-mission report for the position CSV (robot_interface / simulation_interface).
 
 Reads `<root>/data/Robot_data/{date}-{note}-poslog.csv` (either layout, detected
-from the header), renders one PNG for quick analysis, then files the run away as
+from the header; with or without the two legend rows CSVs carry since
+2026-10-08 - robot_log_schema.split_header), renders one PNG for quick analysis, then files the run away as
 
     Robot_data/<csv stem>/
         <csv stem>.csv          the poslog, MOVED here
@@ -38,6 +39,9 @@ import shutil
 import sys
 
 import numpy as np
+
+# Flat beside this file in the source tree and in lib/blueboat_control alike.
+import robot_log_schema as rls
 
 # ---------------------------------------------------------------------------
 # House style. One validated light-mode palette, used project-wide, so every
@@ -135,17 +139,26 @@ def read_poslog(csv_path):
     """Parse one poslog into float arrays keyed by column name.
 
     Rows are read BY NAME, never by index - the schema's own rule, and what lets
-    one reader serve both layouts.
+    one reader serve both layouts. Both file formats too: a CSV written since
+    2026-10-08 carries a description row and a unit row above the column
+    names, an older one does not, and `rls.split_header` finds the names in
+    either. `run["legend"]` is (descriptions, units), or None for an old file.
     """
     with open(csv_path, newline="") as fh:
-        reader = csv.DictReader(fh)
-        header = reader.fieldnames or []
-        rows = list(reader)
+        table = list(csv.reader(fh))
 
-    if "relative_x" not in header:
+    legend, header_index = rls.split_header(table)
+    if header_index is None:
+        first = table[0] if table else []
         raise PoslogError(
             f"{csv_path}: not a poslog (no 'relative_x' column). "
-            f"Columns present: {', '.join(header) or '<empty file>'}")
+            f"Columns present: {', '.join(first) or '<empty file>'}")
+    header = table[header_index]
+    # Padded with None like csv.DictReader did, so a row cut short by a killed
+    # run fails float() (column skipped) rather than raising KeyError.
+    rows = [{name: (line[i] if i < len(line) else None)
+             for i, name in enumerate(header)}
+            for line in table[header_index + 1:] if line]
     if not rows:
         raise PoslogError(f"{csv_path}: header only, no data rows.")
 
@@ -172,6 +185,7 @@ def read_poslog(csv_path):
         "layout": layout,
         "spec": spec,
         "n_rows": len(rows),
+        "legend": legend,
         "data": data,
         "origin": read_origin(csv_path),
     }

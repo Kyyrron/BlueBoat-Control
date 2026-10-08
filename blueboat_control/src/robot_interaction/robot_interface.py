@@ -265,7 +265,12 @@ class BlueBoatController(Node):
         # on disk, and a kill mid-rewrite truncates a full file rather than one
         # row. index=False drops the unnamed pandas index column the old writer
         # emitted (it read 0 on every row), and there is no all-zero seed row.
+        # Since 2026-10-08 two legend rows -- description, unit -- precede the
+        # column names (robot_log_schema.LEGEND), written here with the header
+        # rather than at run end, so a killed run keeps them too.
         self.log_file = open(self.path, 'w', buffering=1)
+        for line in rls.legend_rows(self.data_columns):
+            self.log_file.write(','.join(line) + '\n')
         self.log_file.write(','.join(self.data_columns) + '\n')
         self.log_file.flush()
         self.origin_written = False

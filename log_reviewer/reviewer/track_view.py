@@ -21,7 +21,6 @@ other (see cursor.py).
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
-from matplotlib.lines import Line2D
 from PySide6.QtCore import QTimer, Signal
 
 from . import figures as F
@@ -91,7 +90,7 @@ class TrackCanvas(FigureCanvasQTAgg):
         self._world = bool(artists.get("world", False))
         self._track_lines = [a for a in (artists.get("robot_line"),
                                          artists.get("target_line")) if a]
-        self._series = self._replay_series(run)
+        self._series = F.replay_series(run)
         self._build_replay_artists()
         # ax.clear() threw the old cursor artists away; rebuild them onto the
         # fresh axes, robot first so it draws over the target.
@@ -108,43 +107,11 @@ class TrackCanvas(FigureCanvasQTAgg):
     def _canvas_px(self):
         return max(1.0, self.ax.bbox.width)
 
-    def _replay_series(self, run):
-        """Robot and target tracks with unusable rows punched out as NaN.
-
-        Taken from the SAME `track_series` the panel is drawn from, so replay
-        and hover follow the plotted frame - degrees on a real run, metres in
-        simulation - with no second decision to keep in step. The keys stay
-        named lon/lat because they are the panel's x and y whatever the frame.
-
-        NaN is what a Line2D needs to break rather than bridge a gap, and it
-        keeps the replay arrays index-aligned with `run["t"]`, so a playback
-        time maps to a row with one searchsorted and no bookkeeping.
-        """
-        series = pb.track_series(run)
-        fix, tfix = series["ok"], series["tok"]
-        return {
-            "t": run["t"],
-            "lon": np.where(fix, series["x"], np.nan),
-            "lat": np.where(fix, series["y"], np.nan),
-            "tlon": np.where(tfix, series["tx"], np.nan),
-            "tlat": np.where(tfix, series["ty"], np.nan),
-        }
-
     def _build_replay_artists(self):
         for artist in self._replay:
             self.overlay.discard(artist)
-        common = dict(visible=False)
-        target_trail = Line2D([], [], color=pb.TARGET, linewidth=2.6, zorder=6, **common)
-        robot_trail = Line2D([], [], color=pb.ROBOT, linewidth=2.8, zorder=7, **common)
-        target_dot = Line2D([], [], marker="o", markersize=9, color=pb.TARGET,
-                            markeredgecolor=pb.SURFACE, markeredgewidth=1.8,
-                            linestyle="none", zorder=8, **common)
-        robot_dot = Line2D([], [], marker="o", markersize=11, color=pb.ROBOT,
-                           markeredgecolor=pb.SURFACE, markeredgewidth=2.0,
-                           linestyle="none", zorder=9, **common)
-        self._replay = [target_trail, robot_trail, target_dot, robot_dot]
+        self._replay = F.make_replay_artists(self.ax)
         for artist in self._replay:
-            self.ax.add_line(artist)
             self.overlay.add(artist)
 
     # -- replay -----------------------------------------------------------
@@ -163,17 +130,7 @@ class TrackCanvas(FigureCanvasQTAgg):
         """Advance the trail to mission time `t`. Cheap: blitted, four artists."""
         if not self._replay_on or self._series is None:
             return
-        series = self._series
-        times = series["t"]
-        if not len(times):
-            return
-        index = int(np.searchsorted(times, t, side="right")) - 1
-        index = min(max(index, 0), len(times) - 1)
-
-        self._replay[0].set_data(series["tlon"][:index + 1], series["tlat"][:index + 1])
-        self._replay[1].set_data(series["lon"][:index + 1], series["lat"][:index + 1])
-        self._replay[2].set_data(*_last_valid(series["tlon"], series["tlat"], index))
-        self._replay[3].set_data(*_last_valid(series["lon"], series["lat"], index))
+        F.set_replay_frame(self._replay, self._series, t)
         self.overlay.flush()
 
     # -- the linked cursor ------------------------------------------------
@@ -301,16 +258,3 @@ class TrackCanvas(FigureCanvasQTAgg):
         """What the export should frame, or None for 'fit the selection'."""
         return self.user_limits
 
-
-def _last_valid(xs, ys, index):
-    """The most recent fixed sample at or before `index`.
-
-    A replay must not park its marker at a NaN just because the boat lost its
-    fix for one row; it holds the last place it actually was.
-    """
-    window = xs[:index + 1]
-    good = np.nonzero(~np.isnan(window))[0]
-    if not len(good):
-        return [], []
-    last = good[-1]
-    return [xs[last]], [ys[last]]

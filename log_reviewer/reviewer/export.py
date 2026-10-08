@@ -10,8 +10,10 @@ rewrites or deletes one - not even the file the operator has just renamed in
 the toolbar, which renames only the EXPORT. Everything written goes into
 
     ~/ros2_ws/data/Processed_Robot_data/<name>/
-        <name>.csv            the rows inside the timeline, every column, verbatim
+        <name>.csv            legend rows, then the rows inside the timeline,
+                              every column, verbatim
         <name>.png            the report as framed in the app
+        <name>.gif            the track replayed at x5-x20, as framed in the app
         <name>-origin.yaml    a COPY of the run's origin sidecar
         export.yaml           what was cropped, from what, with which text
 
@@ -35,6 +37,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 from . import figures as F
 from . import poslog_bridge as pb
+from . import replay_video as V
 
 DEFAULT_ROOT = os.path.join(os.path.expanduser("~"), "ros2_ws", "data",
                             "Processed_Robot_data")
@@ -89,8 +92,8 @@ def safe_name(name, fallback="log"):
 
 
 def export(source_csv, name, crop, texts, root=None, tile_provider=None,
-           track_limits=None, overwrite=False):
-    """Write the four files. Returns the folder path.
+           track_limits=None, overwrite=False, video_speed=V.DEFAULT_SPEED):
+    """Write the five files. Returns the folder path.
 
     `root` resolves at CALL time, not at import time. A default argument of
     `DEFAULT_ROOT` binds the value once, so anything that redirects the root
@@ -109,7 +112,7 @@ def export(source_csv, name, crop, texts, root=None, tile_provider=None,
 
     csv_out = os.path.join(folder, name + ".csv")
     png_out = os.path.join(folder, name + ".png")
-    written_rows = write_cropped_csv(source_csv, csv_out, crop["row_index"])
+    written_rows, legend_from = write_cropped_csv(source_csv, csv_out, crop["row_index"])
 
     figure = F.build_report_figure(crop, texts, tile_provider, track_limits)
     FigureCanvasAgg(figure)
@@ -123,36 +126,67 @@ def export(source_csv, name, crop, texts, root=None, tile_provider=None,
         sidecar_out = os.path.join(folder, name + "-origin.yaml")
         shutil.copy2(sidecar_in, sidecar_out)      # copied, never moved
 
+    # The video is a convenience on top of the record, so its failure is
+    # written into the manifest instead of costing the export its manifest.
+    gif_out = os.path.join(folder, name + ".gif")
+    try:
+        video = V.write_replay_gif(gif_out, crop, texts, tile_provider,
+                                   track_limits, video_speed)
+    except Exception as exc:                                    # noqa: BLE001
+        video = {"error": "%s: %s" % (type(exc).__name__, exc)}
+    if video is None:
+        video = {"skipped": "no drawable track in this selection"}
+    if "file" not in video and os.path.isfile(gif_out):
+        os.remove(gif_out)                  # a stale or partial video would lie
+
     write_manifest(os.path.join(folder, "export.yaml"), source_csv, sidecar_in,
-                   crop, texts, written_rows, track_limits, name)
+                   crop, texts, written_rows, track_limits, name, video,
+                   legend_from)
     return folder
 
 
 def write_cropped_csv(source_csv, out_csv, row_index):
-    """Copy the header and the selected data rows, field for field.
+    """Copy the legend, the header and the selected data rows, field for field.
 
-    `row_index` counts DATA rows, ignoring the header - the same numbering
-    `poslog_report.read_poslog` produces, which is what the crop carries.
+    An export ALWAYS opens with the two legend rows (description, unit) of
+    `robot_log_schema`, whatever the source's age: a log written since
+    2026-10-08 carries them and they are copied verbatim; an older one has
+    none, and they are built from the schema for its header (a column the
+    schema does not know gets empty cells). The data rows are copied verbatim
+    either way - only the export gains the legend, never the source.
+
+    `row_index` counts DATA rows, ignoring legend and header, and skipping
+    blank lines - the same numbering `poslog_report.read_poslog` produces,
+    which is what the crop carries.
+
+    Returns (rows written, "source" or "schema" - where the legend came from).
     """
     wanted = set(int(i) for i in row_index)
     written = 0
-    with open(source_csv, newline="") as source, \
-            open(out_csv, "w", newline="") as target:
-        reader = csv.reader(source)
+    with open(source_csv, newline="") as source:
+        table = list(csv.reader(source))
+    legend, header_index = pb.rls.split_header(table)
+    if header_index is None:
+        raise pb.PoslogError("%s: not a poslog (no 'relative_x' column)" % source_csv)
+    header = table[header_index]
+    legend_from = "source" if legend else "schema"
+    if legend is None:
+        legend = pb.rls.legend_rows(header)
+
+    with open(out_csv, "w", newline="") as target:
         writer = csv.writer(target, lineterminator="\n")
-        try:
-            writer.writerow(next(reader))
-        except StopIteration:
-            return 0
-        for number, row in enumerate(reader):
+        writer.writerows(legend)
+        writer.writerow(header)
+        data_rows = (row for row in table[header_index + 1:] if row)
+        for number, row in enumerate(data_rows):
             if number in wanted:
                 writer.writerow(row)
                 written += 1
-    return written
+    return written, legend_from
 
 
 def write_manifest(path, source_csv, sidecar_in, crop, texts, written_rows,
-                   track_limits, name):
+                   track_limits, name, video=None, legend_from=None):
     """Everything needed to say what this export is and redo it."""
     t = crop["t"]
     rows = crop["row_index"]
@@ -168,6 +202,9 @@ def write_manifest(path, source_csv, sidecar_in, crop, texts, written_rows,
             "layout": crop["layout"],
             "target": crop["spec"]["target_name"],
             "rows": int(crop.get("n_rows_full", crop["n_rows"])),
+            # Where the export's legend rows came from: copied from the source,
+            # or built from robot_log_schema for a log older than 2026-10-08.
+            "legend": legend_from,
         },
         "crop": {
             "t_start_s": round(float(window[0]), 3),
@@ -186,6 +223,7 @@ def write_manifest(path, source_csv, sidecar_in, crop, texts, written_rows,
                         "lat_min": round(float(track_limits[2]), 8),
                         "lat_max": round(float(track_limits[3]), 8)}
                        if track_limits else {"framed": "fit to selection"}),
+        "video": video,
         "texts": dict(texts),
     }
     with open(path, "w") as handle:

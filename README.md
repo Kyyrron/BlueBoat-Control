@@ -185,6 +185,10 @@ ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: <value>"
 Under `<root>/data/Robot_data/{date}-{note}-poslog.csv` for the position/target/pinger log (primary log file) and
 `<root>/data/{controller}_data/{date}-…npy` for the controller log (secondary, not usefull for basic usage of the USV). 
 
+The CSV opens with a short description of each column (row 1) and its unit (row 2); the
+column names are on row 3 and the data starts on row 4 (`pandas.read_csv(path, header=2)`).
+Logs recorded before 2026-10-08 have no legend rows and are read just the same.
+
 When a run ends, the CSV, its `-origin.yaml` sidecar and a report PNG
 are filed into `Robot_data/<csv stem>/`.
 

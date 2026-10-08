@@ -37,6 +37,7 @@ if _LIBS not in sys.path:
     sys.path.insert(0, _LIBS)
 
 import poslog_report as pr                                        # noqa: E402
+import robot_log_schema as rls                                    # noqa: E402
 
 # --- re-exported unchanged, so the app cannot drift from the PNG -----------
 PoslogError = pr.PoslogError

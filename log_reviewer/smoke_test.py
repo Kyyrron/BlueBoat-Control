@@ -83,6 +83,7 @@ def main():
     try:
         section_data(logs)
         section_frames(logs, workspace)
+        section_legend(logs, workspace)
         section_figures(logs, workspace)
         section_export(logs, workspace)
         section_tiles()
@@ -171,16 +172,96 @@ def make_sim_log(real_csv, workspace):
     """
     out = os.path.join(workspace, "1970_01_01-00_00_00-Sim-poslog.csv")
     import csv
-    with open(real_csv, newline="") as source, open(out, "w", newline="") as target:
-        reader = csv.DictReader(source)
-        writer = csv.DictWriter(target, fieldnames=reader.fieldnames)
-        writer.writeheader()
-        for row in reader:
-            row["Year"], row["Month"], row["Day"] = "1970.0", "1.0", "1.0"
-            writer.writerow(row)
+    from reviewer import poslog_bridge as pb
+    with open(real_csv, newline="") as source:
+        table = list(csv.reader(source))
+    # Either format: legend rows, if the source has them, are kept as they are.
+    _legend, top = pb.rls.split_header(table)
+    header = table[top]
+    date = [header.index(c) for c in ("Year", "Month", "Day")]
+    with open(out, "w", newline="") as target:
+        writer = csv.writer(target, lineterminator="\n")
+        writer.writerows(table[:top + 1])
+        for row in table[top + 1:]:
+            if row:
+                for i, value in zip(date, ("1970.0", "1.0", "1.0")):
+                    row[i] = value
+                writer.writerow(row)
     with open(os.path.join(workspace, "1970_01_01-00_00_00-Sim-origin.yaml"), "w") as fh:
         fh.write("latitude: 33.930593\nlongitude: 130.7312318\nyaw0_rad: 1.84\n")
     return out
+
+
+def make_legend_log(old_csv, workspace):
+    """A copy of a pre-2026-10-08 log in today's format.
+
+    The two legend rows are written exactly as robot_interface and
+    simulation_interface write them - `','.join` over
+    `robot_log_schema.legend_rows(columns)` - and every original line follows
+    byte for byte, so the two files differ in the legend and nothing else.
+    """
+    from reviewer import poslog_bridge as pb
+    stem = os.path.basename(old_csv)[:-len("-poslog.csv")]
+    out = os.path.join(workspace, stem + "-legend-poslog.csv")
+    with open(old_csv) as handle:
+        lines = handle.read().splitlines()
+    columns = lines[0].split(",")
+    with open(out, "w") as handle:
+        for line in pb.rls.legend_rows(columns):
+            handle.write(",".join(line) + "\n")
+        handle.write("\n".join(lines) + "\n")
+    sidecar = pb.sidecar_path(old_csv)
+    if os.path.isfile(sidecar):
+        shutil.copy2(sidecar, os.path.join(workspace, stem + "-legend-origin.yaml"))
+    return out
+
+
+def section_legend(logs, workspace):
+    print("\n[1c] legend rows (CSVs written since 2026-10-08)")
+    from reviewer import poslog_bridge as pb
+    rls = pb.rls
+
+    known = set(rls.COLUMNS_NO_PINGER) | set(rls.COLUMNS_PINGER)
+    check("the legend covers every column of both layouts",
+          known <= set(rls.LEGEND), str(sorted(known - set(rls.LEGEND))))
+    long = [c for c, (d, _u) in rls.LEGEND.items() if not 1 <= len(d.split()) <= 4]
+    check("every description is 1 to 4 words", not long, str(long))
+    bad = [c for c, pair in rls.LEGEND.items()
+           if any("," in v or not v.isascii() or not v for v in pair)]
+    check("legend text is ASCII, non-empty and comma-free", not bad, str(bad))
+    check("an unknown column gets empty legend cells, so the rows still line up",
+          rls.legend_rows(["relative_x", "quat_w"]) == ([rls.LEGEND["relative_x"][0], ""], ["m", ""]))
+
+    old = logs[-1]
+    new = make_legend_log(old, workspace)
+    with open(new) as handle:
+        top = [handle.readline().rstrip("\n").split(",") for _ in range(3)]
+    check("a new log opens with description, unit, then column names",
+          top[0][7] == rls.LEGEND["relative_x"][0] and top[1][7] == "m"
+          and top[2][7] == "relative_x", str([r[7] for r in top]))
+    import csv
+    with open(old, newline="") as handle:
+        old_rows = list(csv.reader(handle))[:3]
+    check("split_header: old format has its names on row 1",
+          rls.split_header(old_rows) == (None, 0))
+    legend, index = rls.split_header(top)
+    check("split_header: new format has them on row 3, under its legend",
+          index == 2 and legend == (top[0], top[1]))
+    check("split_header: a file with no relative_x is not a poslog",
+          rls.split_header([["a", "b"], ["1", "2"]]) == (None, None))
+
+    a, b = pb.load(old), pb.load(new)
+    check("both formats read to the same layout and row count",
+          (a["layout"], a["n_rows"]) == (b["layout"], b["n_rows"]))
+    check("both formats read to identical columns",
+          set(a["data"]) == set(b["data"]) and all(
+              np.array_equal(a["data"][k], b["data"][k], equal_nan=True)
+              for k in a["data"]))
+    check("both formats give the same metrics",
+          str(pb.compute_metrics(a)) == str(pb.compute_metrics(b)))
+    check("the reader exposes the legend of a new log, None for an old one",
+          a["legend"] is None and b["legend"] is not None
+          and b["legend"][1][7] == "m")
 
 
 def section_frames(logs, workspace):
@@ -301,8 +382,8 @@ def section_export(logs, workspace):
 
     folder = E.export(source, name, crop, F.default_texts(name), root=root)
     files = sorted(os.listdir(folder))
-    check("four files written", len(files) == 4, str(files))
-    for suffix in (".csv", ".png", "-origin.yaml"):
+    check("five files written", len(files) == 5, str(files))
+    for suffix in (".csv", ".png", "-origin.yaml", ".gif"):
         check("export carries %s" % suffix,
               any(f.endswith(suffix) for f in files), str(files))
     check("export carries export.yaml", "export.yaml" in files)
@@ -312,14 +393,20 @@ def section_export(logs, workspace):
         source_lines = handle.read().splitlines()
     with open(exported_csv) as handle:
         exported_lines = handle.read().splitlines()
+    # Exports always open with the legend; the source may or may not have it.
+    top = pb.rls.split_header([line.split(",") for line in source_lines[:3]])[1]
+    descriptions, units = pb.rls.legend_rows(source_lines[top].split(","))
+    check("an old log's export gains the legend rows",
+          exported_lines[0] == ",".join(descriptions)
+          and exported_lines[1] == ",".join(units))
     check("header is byte-identical to the source",
-          exported_lines[0] == source_lines[0])
+          exported_lines[2] == source_lines[top])
     check("row count equals the crop",
-          len(exported_lines) - 1 == crop["n_rows"],
-          "%d vs %d" % (len(exported_lines) - 1, crop["n_rows"]))
+          len(exported_lines) - 3 == crop["n_rows"],
+          "%d vs %d" % (len(exported_lines) - 3, crop["n_rows"]))
     first_source_row = int(crop["row_index"][0])
     check("rows are copied verbatim, not re-formatted",
-          exported_lines[1] == source_lines[first_source_row + 1])
+          exported_lines[3] == source_lines[top + first_source_row + 1])
 
     reopened = pb.load(exported_csv)
     check("an export re-opens in the app", reopened["n_rows"] == crop["n_rows"])
@@ -355,6 +442,67 @@ def section_export(logs, workspace):
     check("plain() keeps a bool a bool, not a 1",
           E.plain({"b": np_.bool_(True)})["b"] is True)
 
+    # The replay video: bounded, and as long as the window and speed say.
+    from PIL import Image
+    from reviewer import replay_video as V
+
+    def gif_timing(path):
+        gif = Image.open(path)
+        total = 0
+        for k in range(gif.n_frames):
+            gif.seek(k)
+            total += gif.info.get("duration", 0)
+        return gif.n_frames, total
+
+    frames, total_ms = gif_timing(os.path.join(folder, name + ".gif"))
+    span = float(crop["t"][-1] - crop["t"][0])
+    video = manifest.get("video") or {}
+    check("the replay video is animated", frames > 1, str(frames))
+    check("the replay video stays under its frame bound",
+          frames <= V.MAX_FRAMES + 1, str(frames))
+    check("the default replay video plays the window at x10",
+          abs(total_ms - V.END_HOLD_MS - 1000.0 * span / V.DEFAULT_SPEED)
+          <= video.get("frame_ms", 0),
+          "%d ms for %.1f s" % (total_ms, span))
+    check("manifest records the video", video.get("speed") == V.DEFAULT_SPEED
+          and video.get("frames") == frames, str(video))
+
+    fast = E.export(source, "smoke x20", crop, F.default_texts("x"), root=root,
+                    video_speed=20)
+    with open(os.path.join(fast, "export.yaml")) as handle:
+        fast_video = yaml.safe_load(handle)["video"]
+    _, fast_ms = gif_timing(os.path.join(fast, "smoke x20.gif"))
+    preview_s, _ = V.video_timing(crop["t"][0], crop["t"][-1], 20)
+    check("a chosen speed reaches the video and the manifest",
+          fast_video.get("speed") == 20, str(fast_video))
+    check("the duration preview is the file's length",
+          abs(fast_ms / 1000.0 - preview_s) < 0.011, "%d ms vs %.2f s" % (fast_ms, preview_s))
+    _, _, times = V.frame_timing(0.0, 1471.0)
+    check("a long window gets longer frames, not more",
+          len(times) <= V.MAX_FRAMES + 1, str(len(times)))
+
+    check("manifest says where the legend came from",
+          manifest["source"].get("legend") == "schema", str(manifest["source"].get("legend")))
+
+    new_source = make_legend_log(source, workspace)
+    new_run = pb.load(new_source)
+    new_crop = pb.crop_run(new_run, t0 + 5.0, t0 + 0.5 * (t1 - t0))
+    new_folder = E.export(new_source, "smoke legend", new_crop,
+                          F.default_texts("x"), root=root)
+    with open(new_source) as handle:
+        new_source_lines = handle.read().splitlines()
+    with open(os.path.join(new_folder, "smoke legend.csv")) as handle:
+        new_export_lines = handle.read().splitlines()
+    check("a new log's export copies its legend and header verbatim",
+          new_export_lines[:3] == new_source_lines[:3])
+    check("a new log's export rows are the old log's export rows",
+          new_export_lines[3:] == exported_lines[3:])
+    with open(os.path.join(new_folder, "export.yaml")) as handle:
+        check("…and the manifest says the legend came from the source",
+              yaml.safe_load(handle)["source"].get("legend") == "source")
+    check("an export with a legend re-opens in the app",
+          pb.load(os.path.join(new_folder, "smoke legend.csv"))["n_rows"] == new_crop["n_rows"])
+
     check("manifest names the source", manifest["source"]["csv"] == os.path.abspath(source))
     check("manifest records the crop", manifest["crop"]["rows"] == crop["n_rows"])
     check("manifest records the texts", "speed_desc" in manifest["texts"])
@@ -369,6 +517,9 @@ def section_export(logs, workspace):
         sim_manifest = yaml.safe_load(handle)
     check("the exported simulation keeps world-frame text",
           "GPS degrees" in sim_manifest["texts"]["track_desc"])
+    check("a simulated run gets a replay video",
+          os.path.isfile(os.path.join(sim_folder, "smoke sim.gif"))
+          and "file" in (sim_manifest.get("video") or {}), str(sim_manifest.get("video")))
     check("safe_name strips path separators", "/" not in E.safe_name("a/b"))
 
 
@@ -417,6 +568,25 @@ def section_gui(logs, workspace):
     check("the name entry seeds from the stem",
           window.name_edit.text() == window.run["stem"])
     check("the summary table is filled", window.table.rowCount() == 21)
+
+    from reviewer import replay_video as V
+    from reviewer.app import ExportDialog, fmt_duration
+    dialog = ExportDialog("dialog test", 0.0, 1000.0, parent=window)
+    check("the export dialog starts at x10", dialog.speed() == V.DEFAULT_SPEED)
+    dialog.speed_slider.setValue(V.MIN_SPEED)
+    slow = dialog.preview_text()
+    check("the preview quotes the writer's own duration",
+          fmt_duration(V.video_timing(0.0, 1000.0, V.MIN_SPEED)[0]) in slow, slow)
+    dialog.speed_slider.setValue(V.MAX_SPEED)
+    check("the preview follows the speed",
+          V.video_timing(0.0, 1000.0, V.MIN_SPEED)[0]
+          > V.video_timing(0.0, 1000.0, V.MAX_SPEED)[0]
+          and dialog.preview_text() != slow)
+    check("the slider stops at x5 and x20",
+          (dialog.speed_slider.minimum(), dialog.speed_slider.maximum()) == (5, 20))
+    dialog.name_edit.setText("   ")
+    check("a blank name cannot be exported", not dialog.export_button.isEnabled())
+    dialog.deleteLater()
 
     t0, t1 = window.run["t_full"]
     window.slider.set_values(t0 + 10.0, t0 + 0.5 * (t1 - t0))

@@ -157,10 +157,32 @@ COLUMNS_PINGER only, between the two blocks:
                               set from the same value as aco_z rather than
                               from an independent depth sensor.
 
+Legend rows -- 2026-10-08
+-------------------------
+A CSV started on or after this revision opens with TWO legend rows above
+the column names, written once at file creation with the header (never
+added at run end -- the file is write-once, and a killed run keeps it):
+
+    row 1   short description, 1-4 words     Robot X (odom frame), ...
+    row 2   unit                             m, ...
+    row 3   column names (as before)         relative_x, ...
+    row 4+  data
+
+Every CSV recorded before has no legend: column names on row 1, data from
+row 2. Both are valid and NEITHER IS REWRITTEN to look like the other. A
+reader tells them apart with `split_header` -- the header is the first row
+holding `relative_x`, which is never a description or a unit -- and never by
+date or file name. `LEGEND` below is the single source of both rows; no
+description or unit may contain a comma (the nodes write rows with
+`','.join`).
+
 Consumers
 ---------
-* offline analysis notebooks
-Indexes by column NAME. Does not tolerate a renamed column.
+* poslog_report.read_poslog (the archived PNG, its CLI) and, through it, the
+  log reviewer -- both formats, via split_header.
+* offline analysis notebooks -- index by column NAME, do not tolerate a
+  renamed column. A new-format file loads with `pd.read_csv(path, header=2)`
+  (descriptions and units are then lost; read them with header=None, nrows=2).
 """
 
 # Actuation-state encoding, for readers that would rather not hard-code ints.
@@ -206,6 +228,109 @@ TARGET_COLUMNS_NO_PINGER = (('target_x', 'target_y'),
                             ('target_latitude', 'target_longitude'))
 TARGET_COLUMNS_PINGER = (('corrected_pinger_x', 'corrected_pinger_y'),
                          ('pinger_latitude', 'pinger_longitude'))
+
+
+# Rows above the column names in a CSV written since 2026-10-08.
+LEGEND_ROWS = 2
+
+# column -> (description, unit). Covers every column of both layouts.
+# Descriptions are 1-4 words; units are ASCII so any spreadsheet opens them.
+# Each one names what the writers ACTUALLY put in the column, in the frame
+# they put it in -- not what the frame is assumed to be:
+#   odom frame  the pose frame of the odometry the interface node reads:
+#               /mavros/local_position/odom translated to the pose at the first
+#               odom message (robot_interface), or the Gazebo world as published
+#               on /blueboat/odom (simulation_interface). Origin = launch point.
+#               The code never rotates it, so 'east'/'north' would be a claim
+#               about MAVROS / Gazebo, not about this log.
+#   (derived)   computed from odom-frame x/y through the origin fix
+#               (cf.enu_to_gps), not measured by any receiver.
+#   UGPS        straight from the Water Linked API, in the frame the device
+#               reports it (locator relative to its topside receivers); `dep` is
+#               the raw acoustic Z again, not an independent depth sensor.
+#   Body        the vehicle frame: raw /mavros/imu/data on the boat (the
+#               acceleration includes gravity), the odometry twist and its time
+#               derivative in simulation (no gravity).
+LEGEND = {
+    'Year': ('Timestamp year', 'year'),
+    'Month': ('Timestamp month', 'month'),
+    'Day': ('Timestamp day', 'day'),
+    'Hour': ('Timestamp hour', 'h'),
+    'Minute': ('Timestamp minute', 'min'),
+    'Second': ('Timestamp second', 's'),
+    'MicroSecond': ('Timestamp microsecond', 'us'),
+    'relative_x': ('Robot X (odom frame)', 'm'),
+    'relative_y': ('Robot Y (odom frame)', 'm'),
+    'relative_psi': ('Robot yaw (odom frame)', 'rad'),
+    'target_x': ('Target X (odom frame)', 'm'),
+    'target_y': ('Target Y (odom frame)', 'm'),
+    'corrected_pinger_x': ('Pinger X (odom frame)', 'm'),
+    'corrected_pinger_y': ('Pinger Y (odom frame)', 'm'),
+    'gps_latitude': ('Robot GPS latitude', 'deg'),
+    'gps_longitude': ('Robot GPS longitude', 'deg'),
+    'target_latitude': ('Target latitude (derived)', 'deg'),
+    'target_longitude': ('Target longitude (derived)', 'deg'),
+    'pinger_latitude': ('Pinger latitude (derived)', 'deg'),
+    'pinger_longitude': ('Pinger longitude (derived)', 'deg'),
+    'right_thr_in': ('Right thrust command', 'N'),
+    'left_thr_in': ('Left thrust command', 'N'),
+    'actuation_state': ('Actuation state', 'code 0-3'),
+    'aco_x': ('Locator X (UGPS raw)', 'm'),
+    'aco_y': ('Locator Y (UGPS raw)', 'm'),
+    'aco_z': ('Locator Z (UGPS raw)', 'm'),
+    'ant_x': ('Antenna X (UGPS config)', 'm'),
+    'ant_y': ('Antenna Y (UGPS config)', 'm'),
+    'ant_z': ('Antenna Z (UGPS config)', 'm'),
+    'lat': ('Locator latitude (UGPS)', 'deg'),
+    'lon': ('Locator longitude (UGPS)', 'deg'),
+    'dep': ('Locator depth (UGPS raw)', 'm'),
+    'filaco_x': ('Locator X (UGPS filtered)', 'm'),
+    'filaco_y': ('Locator Y (UGPS filtered)', 'm'),
+    'filaco_z': ('Locator Z (UGPS filtered)', 'm'),
+    'roll': ('Robot roll angle', 'rad'),
+    'pitch': ('Robot pitch angle', 'rad'),
+    'ang_vel_x': ('Body angular rate X', 'rad/s'),
+    'ang_vel_y': ('Body angular rate Y', 'rad/s'),
+    'ang_vel_z': ('Body angular rate Z', 'rad/s'),
+    'lin_acc_x': ('Body acceleration X', 'm/s^2'),
+    'lin_acc_y': ('Body acceleration Y', 'm/s^2'),
+    'lin_acc_z': ('Body acceleration Z', 'm/s^2'),
+}
+
+
+def legend_rows(columns) -> tuple:
+    """
+    Return the two legend rows for a header.
+
+    Input  : columns -- the column names, in file order.
+    Output : (descriptions, units), two lists aligned with `columns`. A name
+             this schema does not know (an older layout's `quat_x`, say) gets
+             empty strings, so the rows still line up with the header.
+    """
+    return ([LEGEND.get(c, ('', ''))[0] for c in columns],
+            [LEGEND.get(c, ('', ''))[1] for c in columns])
+
+
+def split_header(rows) -> tuple:
+    """
+    Locate the column-name row at the top of a poslog, in either format.
+
+    Input  : rows -- the first parsed CSV rows (lists of strings); at least
+             LEGEND_ROWS + 1 of them when the file has that many.
+    Output : (legend, header_index). header_index is 0 for a CSV recorded
+             before 2026-10-08 and LEGEND_ROWS for one written since; legend is
+             (descriptions, units) as found in the file, or None for the old
+             format. header_index is None when no row among the first
+             LEGEND_ROWS + 1 holds `relative_x` -- the file is not a poslog.
+    """
+    for index, row in enumerate(list(rows)[:LEGEND_ROWS + 1]):
+        if 'relative_x' in row:
+            if index == 0:
+                return None, 0
+            if index == LEGEND_ROWS:
+                return (list(rows[0]), list(rows[1])), index
+            return None, None
+    return None, None
 
 
 def columns_for(use_UWgps: bool) -> list:
