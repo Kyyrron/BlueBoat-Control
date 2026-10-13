@@ -174,24 +174,38 @@ interpolation.
 ### The "file appears later" trick (GPS-anchored missions)
 
 `path_generation` **watches** the YAML file
-([`_maybe_reload_yaml`](_custom_libraries/path_generation.py#L220), called on every service
+([`_maybe_reload_yaml`](_custom_libraries/path_generation.py#L312), called on every service
 request). If the file doesn't exist yet, `single_pose` returns the origin — i.e. the boat
 station-keeps where it started. Once the Mission Control Station has established the
 odom↔GPS fit and writes the deployed file, the next path request picks it up (mtime change)
 and the boat transitions onto the real-world path. Same mechanism handles editing a
 trajectory mid-run.
 
+### Run sessions: one watched file, rewritten per run
+
+A real-robot launch from the Mission Control Station is a **run session**
+(`session_mode:=true`, 2026-10-09): `path_generation` is always started, pointed at one file,
+`~/.config/blueboat_mcs/trajectories/.session/run.yaml`, and the station rewrites that file
+(atomically) just before each `start` on `/blueboat/run_command`. A GPS-anchored mission is
+deployed there exactly as above (with the fit current at the start); any other mission is
+**placed at the boat** — rotated about its first sample by `yaw_boat − yaw_first` and moved so
+the first sample sits on the boat's odom position — so the path begins where the boat is and
+runs out ahead of it, wherever the boat was driven since the launch. `path_generation`
+applies no transform of its own, as ever; it just reloads on the mtime change at the first
+request after the start. Built-in shapes are not offered in a session.
+
 ---
 
 ## 5. Layer 3 — How the target moves: τ and the governor
 
 This is the heart of the system. It lives in
-[master_control.py:254-288](master_control.py#L254-L288).
+[master_control.py:1233-1292](master_control.py#L1233-L1292) (`path_progress_errors` and
+`advance_governor`).
 
 ### 5.1 What the old version did (and why it was replaced)
 
-The header comment on [master_control.py](master_control.py#L3-L33) documents the previous
-design: `t = time.time() - t0`. The reference advanced with **wall clock**, at **1 Hz**. If
+The previous design was `t = time.time() - t0` (the header comment of
+[master_control.py](master_control.py#L3-L27) now describes the governor that replaced it). The reference advanced with **wall clock**, at **1 Hz**. If
 the boat was slow, or turned the wrong way, or hit wind — the target kept going without it.
 The boat chased a point that had already left, and the result was "smooth path-blind arcs
 with no resemblance to the path."
@@ -206,7 +220,7 @@ self.dt = 0.05    # 20 Hz control loop
 Every tick, three things happen in order:
 
 **Step 1 — measure the gap.**
-[`path_progress_errors`](master_control.py#L254) takes the two poses currently in hand
+[`path_progress_errors`](master_control.py#L1233) takes the two poses currently in hand
 (`poses[0]` = the target at τ, `poses[1]` = a little further along) and computes:
 
 ```
@@ -217,7 +231,7 @@ U_d      = the authored speed of the path right there                [m/s]
            = distance(pose0, pose1) / (tau spacing)
 ```
 
-**Step 2 — turn the dial.** [`advance_governor`](master_control.py#L339):
+**Step 2 — turn the dial.** [`advance_governor`](master_control.py#L1257):
 
 ```python
 fac_along = clip((gov_Lmax - e_along)/(gov_Lmax - gov_Lmin), 0, 1)   # 3.0 - 0.5 = 2.5 m
@@ -245,7 +259,7 @@ Two properties fall out of the `clip(..., 0, 1)`:
 * **τ can never exceed the authored speed** (factor ≤ 1) — even if the boat overshoots
   and gets *ahead* of the target, the target does not sprint to catch up.
 
-**Step 3 — ask for the next window.** [master_control.py:687-692](master_control.py#L687-L692):
+**Step 3 — ask for the next window.** [master_control.py:869-880](master_control.py#L869-L880):
 
 ```python
 request.path_request.data = np.linspace(tau, tau + path_time, path_steps)
@@ -253,7 +267,7 @@ self.future = self.client.call_async(request)      # asynchronous: never blocks 
 ```
 
 The result is collected on a **later** tick, when `future.done()` is true
-([master_control.py:668-678](master_control.py#L668-L678)). Meanwhile the controller keeps
+([master_control.py:819-845](master_control.py#L819-L845)). Meanwhile the controller keeps
 using the previous window. So the reference is typically 1–2 ticks (50–100 ms) stale — a
 deliberate trade to keep the 20 Hz loop from ever blocking on a service call.
 
@@ -314,7 +328,7 @@ path, `atan2` saturates near ±90° and the boat cuts straight at it; close to t
 correction fades and the boat settles onto the tangent. Bigger `Delta` = gentler, more
 damped; smaller = more aggressive, risks weaving.
 
-* **`LoS`** ([`los_guidance`](master_control.py#L293)) is purely kinematic — proportional
+* **`LoS`** ([`los_guidance`](master_control.py#L1297)) is purely kinematic — proportional
   gains straight to a wrench `[X, 0, N]`, then `ThrustAllocator` splits it into two thrusters.
   Surge command is `U_d * max(0, cos(psi_err))`: **it slows down while turning hard**, which
   stops the boat from spiralling around a corner it cannot make.
@@ -325,7 +339,7 @@ damped; smaller = more aggressive, risks weaving.
 
 ### MPC — a whole horizon
 
-[`ur_mpc.MPCController.solve`](MPC/ur_mpc.py#L215) consumes the 15-pose window, converts it
+[`ur_mpc.MPCController.solve`](MPC/ur_mpc.py#L413) consumes the 15-pose window, converts it
 into a full state reference `[x, y, psi, u, v, r]` per node by finite differences, and solves
 an acados optimal-control problem that respects thruster bounds. Weights:
 position 50, heading 30, velocities 1, control effort 0.015.
@@ -333,17 +347,32 @@ position 50, heading 30, velocities 1, control effort 0.015.
 ### The two overrides
 
 Path following is not always in charge. Priority order in
-[`timer_callback`](master_control.py#L698-L767):
+[`timer_callback`](master_control.py#L772):
 
+0. **Arrow keys** (`/blueboat/arrow_thrust`, the Mission Control Station's ARROW CONTROL box,
+   since 2026-10-09) — the operator's `[right, left]` thrust goes straight to
+   `publish_thrust`; a stream older than `arrow_timeout` (0.5 s) commands zero and stays in
+   arrow control. **τ is frozen** exactly as for a manual target, and the logged target stays
+   the last one registered. Released by `[]` or by any manual target (the station's "hold
+   where released" publishes the boat's own position as one).
 1. **Manual target** (`/blueboat/manual_target`, from the visualisation app) — point LoS in
-   the body frame. **τ is frozen while this is active** ([line 440](master_control.py#L682)),
+   the body frame. **τ is frozen while this is active** ([line 860](master_control.py#L860)),
    so when you release manual control the mission resumes exactly where it left off. Nice
    detail. Once the target is reached the boat **holds** it rather than stopping on it
    (`manual_keep_location`), so a current cannot carry it away while
    the operator decides what to do next.
 2. **Pinger** (`use_pinger:=True`) — chases acoustic coordinates; `path_generation` isn't
-   even launched in that mode.
+   even launched in that mode (except in a run session, below).
 3. **Path following** — the subject of this document.
+
+**Run sessions** (`session_mode:=true`, real-robot launches from the station, 2026-10-09)
+add a gate in front of 2 and 3: the node starts **idle** — arrow keys and manual targets
+work, nothing follows a path or the pinger, no τ advances and no request is issued — until a
+`start` arrives on `/blueboat/run_command`. `start` resets τ to 0 and the window, and the
+station has just written the run's path into the one file `path_generation` watches (placed
+at the boat for a non-anchored mission, GPS-deployed otherwise — §4), so the first window
+is the new path's start. `stop` returns to idle. Outside a session a run is always active and
+none of this exists.
 
 ---
 
@@ -389,6 +418,11 @@ ros2 launch blueboat_control BlueBoat_launch.py \
 # Designer mission
 ros2 launch blueboat_control BlueBoat_launch.py \
     controller_type:=LoS trajectory:=from_yaml:/home/op/.config/blueboat_mcs/trajectories/survey.yaml
+
+# Run session (what the Mission Control Station launches): connect and idle; runs are
+# started / stopped on /blueboat/run_command, one CSV + .npy per run
+ros2 launch blueboat_control BlueBoat_launch.py session_mode:=true controller_type:=PID \
+    enable_motors:=True trajectory:=from_yaml:/home/op/.config/blueboat_mcs/trajectories/.session/run.yaml
 ```
 
 ### The knobs

@@ -124,14 +124,17 @@ that directory to force a rebuild.
 * **Safety** — a motor gate that holds neutral rather than going silent, a latching E-STOP, a
   thruster-command watchdog at both ends, and a servo-mapping restore on shutdown.
 * **Write-once run logging** — a position CSV and a controller `.npy` per run, plus an
-  automatic post-mission report PNG.
+  automatic post-mission report PNG; in a run session, also a **ros2bag of every non-sonar
+  topic** filed with them (v1.1).
+* **Bag replay in Gazebo** — a recorded run played back exactly (position, roll / pitch / yaw,
+  GPS, speed), in the empty world or a GPS-anchored built world (v1.1).
 * **Log reviewer** — trim, zoom, replay and export a recorded mission over satellite imagery.
 
 ---
 
 ## Usage
 
-Two launch files, sharing most arguments.
+Two launch files, sharing most arguments, plus a third to replay a recorded run.
 
 ```bash
 # Simulation
@@ -141,6 +144,10 @@ ros2 launch blueboat_control Sim_launch.py controller_type:='MPC' trajectory:='k
 # Real robot
 ros2 launch blueboat_control BlueBoat_launch.py
 ros2 launch blueboat_control BlueBoat_launch.py enable_motors:=True controller_type:='PID' note:='testing_gains'
+
+# Replay a recorded run in Gazebo (a Robot_data run folder, or its *-bag folder)
+ros2 launch blueboat_control Replay_launch.py bag:=$HOME/ros2_ws/data/Robot_data/<run folder>
+ros2 launch blueboat_control Replay_launch.py bag:=<...> world_dir:=$HOME/worlds/<path>/<world> rate:=2.0
 
 # Publishing inputs to the real robot (see ### Terminal commands)
 ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: default" 
@@ -161,6 +168,18 @@ ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: move 3 3 2"
 | `enable_motors` | real | **Defaults False.** No thrust-bearing signal reaches the motors unless this is True. |
 | `use_pinger` | real | With a Water Linked underwater GPS, `PID` and `LoS` follow an acoustic pinger instead of a trajectory. |
 | `fcu_url` | real | MAVROS ↔ autopilot endpoint. Defaults to `udp://:14550@192.168.2.2:14550`. |
+| `session_mode` | real | **Run session** (default False; the Mission Control Station always passes true). The boat connects and goes into override but nothing follows a path or logs until a run is started on `/blueboat/run_command`; each run gets its own position CSV, report and controller `.npy`. Requires a `controller_type`. |
+| `record_bag` | real | Run sessions only, default True: each run also records a ros2bag of every topic except the side-scan sonar's, filed into the run's folder. |
+
+`Replay_launch.py` takes `bag` (required), `world_dir` (empty = the stock world, in the run's
+own launch frame), `rate` (playback rate), `heave` (replay the recorded heave, default True),
+`start_paused` and `gui`. The boat is moved along the recording and cannot be pushed by
+anything else — no controller, no sea state. Pause it or change the rate live:
+
+```bash
+ros2 topic pub --once /replay/command std_msgs/msg/String '{data: "{\"cmd\": \"pause\"}"}'
+ros2 topic pub --once /replay/command std_msgs/msg/String '{data: "{\"cmd\": \"rate\", \"rate\": 4}"}'
+```
 
 Every controller gain is also a declared ROS parameter, so tuning costs a launch argument
 rather than a rebuild — `ros2 param list /blueboat/master_control`, and see `FIELD_TUNING.md`.
@@ -190,7 +209,9 @@ column names are on row 3 and the data starts on row 4 (`pandas.read_csv(path, h
 Logs recorded before 2026-10-08 have no legend rows and are read just the same.
 
 When a run ends, the CSV, its `-origin.yaml` sidecar and a report PNG
-are filed into `Robot_data/<csv stem>/`.
+are filed into `Robot_data/<csv stem>/`. In a run session the folder also holds the run's
+ros2bag (`{date}-{note}-bag/`, mcap — `ros2 bag info` it, or replay it as above) and, for a
+path run, a copy of the mission it followed (`{date}-{note}-path.yaml`).
 
 ### Log reviewer
 

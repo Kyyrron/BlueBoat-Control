@@ -16,9 +16,9 @@ the yaw inertia is the URDF value rounded (0.006 % low). The **hydrodynamics do 
 all**: `hydrodynamics.xacro` carries the BlueROV2 table (`xDotU -5.5`, `xU -25.15`, plus
 quadratic damping the MPC has no term for), while `master_control` passes `a_u = -26.77`,
 `a_v = -7.55`, `a_r = -21.77`, `d_u = -29.34`, `d_v = -51.54`, `d_r = -44.65`
-(`master_control.py:359-366`). So the Gazebo plant and the MPC's internal model share the rigid
-body and nothing else — an MPC result in simulation is not a solver-against-its-own-model
-result the way the offline harness's is. Thrusters
+(`master_control.py:659-662`, the real-boat `mpc_model`). So the Gazebo plant and the MPC's
+internal model share the rigid body and nothing else — an MPC result in simulation is not a
+solver-against-its-own-model result the way the offline harness's is. Thrusters
 sit at `x = -0.488`, `y = ∓0.295`, `z = -0.025`, with `thruster1` on the starboard side (§5).
 `thrusters_ur` (2 thrusters) is the default; `thrusters_uvr` (3) exists and is marked not
 functional.
@@ -32,6 +32,19 @@ commented out. ⚠ One live oddity survives that deletion: `upload_rov_launch.py
 `Sim_launch.py` passes `sliders: False` to `world_launch.py`, which neither declares nor
 forwards it. So `slider_publisher` is requested on every simulation launch and can never find
 its config. Fixing it is a launch-behaviour change and has not been made.
+
+**`replay` (v1.1, 2026-10-13).** `blueboat.xacro` declares `replay` (default `false`;
+the default output is unchanged), forwarded `upload_rov_launch.py` → `state_publisher_launch.py`
+and set only by `blueboat_control`'s `Replay_launch.py`. When `true` **no force can move the
+hull**: no Hydrodynamics include, no Thruster plugins (`thrusters_ur.xacro`), no collision
+geometry (the world's Buoyancy acts on collision volumes), `<gravity>0` on every link, and
+`gz-sim-velocity-control-system` with no command, which pins the model's velocity to zero
+every step. That last one is load-bearing: `set_pose` does not reset velocity, so the
+simulator's sea-state hull wrench (ApplyLinkWrench, injected at run time) still accumulated
+0.16 m of drift in 2 s without it (0.8 mm with it). A **static** model is not the fix:
+UserCommands' `set_pose` does not hold a static model. `upload_rov_launch.py` with `replay`
+bridges no odometry (`bag_replay` publishes `/blueboat/odom`) and no thruster commands, and
+keeps `pose_to_tf` on `base_link` for RViz.
 
 `upload_rov_launch.py` is where simulation gets its sensing: it bridges Gazebo's odometry to
 `/blueboat/odom` (the `OdometryPublisher` plugin runs at 20 Hz with `odom_frame: world`),

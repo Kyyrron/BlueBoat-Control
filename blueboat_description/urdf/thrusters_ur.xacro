@@ -57,6 +57,8 @@
 
     <!-- ignition topic is /model/{ns}/joint/{joint_name}/cmd_pos -->
 <!--    <xacro:if value="$(arg simulation)"> -->
+    <!-- no thrust in a kinematic replay (blueboat.xacro, arg replay) -->
+    <xacro:unless value="$(arg replay)">
     <gazebo>
         <plugin
             filename="ignition-gazebo-thruster-system"
@@ -73,6 +75,7 @@
             <min_thrust_cmd>-40</min_thrust_cmd>
         </plugin>
       </gazebo>
+    </xacro:unless>
 <!--  </xacro:if> -->
 </xacro:macro>
 

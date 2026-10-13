@@ -14,8 +14,17 @@ sets it True). A single value means both are the same. All of them are declared 
 `Controller._declare_tuning_parameters`; the **Used in** column names the method that reads
 it, not a line number — lines move, methods do not.
 
-Branch priority in `timer_callback`: manual target → path following → pinger → zero thrust.
-A manual target overrides the path in **every** `controller_type`.
+Branch priority in `timer_callback`: arrow keys → manual target → path following → pinger →
+zero thrust. A manual target overrides the path in **every** `controller_type`; the station's
+arrow keys override both.
+
+**Run sessions** (`session_mode:=true`, every real-robot launch from the Mission Control
+Station since 2026-10-09). The knobs below are still read once, at node construction, so a
+value passed at launch holds for **every run** of the session. What changes between runs is
+only what the station's Update Mission sends: `controller_type`, pinger-vs-path and the log
+note (`configure` on `/blueboat/run_command`). A switch to MPC builds its solver then, on a
+worker thread — about a second when cached, about a minute after any MPC knob below changed
+— and START RUN waits for it. To change a gain, relaunch the session.
 
 ---
 
@@ -28,6 +37,7 @@ A manual target overrides the path in **every** `controller_type`.
 | `min_thrust` | 2.0 N | `solve_LoS`, `manual_keep_location` | ESC breakaway floor on point-LoS and manual-hold surge; `0.0` = the unfloored law exactly. |
 | `path_request_timeout` | 1.0 s | `timer_callback` | Re-issue a `/path_request` whose answer never came. Without it one lost response wedges the node for the run. |
 | `path_stale_timeout` | 1.0 s | `timer_callback` | Older window → the governor **holds `tau`** instead of running open-loop. |
+| `arrow_timeout` | 0.5 s | `timer_callback` | Dead-man of the station's arrow-key stream (20 Hz): an older command is not applied — zero thrust, and arrow control stays engaged rather than handing back to autonomous control. |
 
 ### Governor (PID, LoS, MPC path following) — `advance_governor`
 

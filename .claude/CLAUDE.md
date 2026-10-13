@@ -60,10 +60,10 @@ its `twist` into that frame, so it is surge/sway/yaw-rate while `pose` is world-
 velocity is a separate topic, `/mavros/local_position/velocity_local`. `robot_interface`
 translates the **pose position** to the launch point (subtracting `x0, y0` only — axes stay
 ENU, yaw stays **absolute ENU**; the published frame is local ENU, see the §2.2 odom row) and
-passes **twist** through untouched (`robot_interface.py:492`). Two consumers depend on it staying
+passes **twist** through untouched (`robot_interface.py:674`). Two consumers depend on it staying
 body-frame: `master_control` reads `current_twist[0]` as surge for the inner speed loop of both
-`PID` and `LoS` (`master_control.py:401`), and the pinger dead-reckoning subtracts
-`self.vel + ω × p` from body-frame pinger coordinates (`robot_interface.py:534`).
+`PID` and `LoS` (`master_control.py:805`), and the pinger dead-reckoning subtracts
+`self.vel + ω × p` from body-frame pinger coordinates (`robot_interface.py:716`).
 
 Measured against mavros 2.14.0, not inferred. Driven by a synthetic FCU holding 1 m/s due
 **north**, so the two readings separate: at heading north the odom twist reads (1.000, 0.000),
@@ -131,11 +131,12 @@ and is the project's scarcest resource.
 
 **N8 — The path reference advances from the boat's measured progress, never from wall-clock
 time.** A time-driven reference is an open-loop player rather than a follower, and no gain
-tuning can compensate for it. The governor at `master_control.py:584-643`
+tuning can compensate for it. The governor at `master_control.py:1233-1292`
 (`path_progress_errors` + `advance_governor`) is what enforces this.
 
-`current_time = time.time() - self.initial_time` (`master_control.py:391`) still exists, but
-it only timestamps `/monitoring_data` and the `.npy` log — it does not touch the reference.
+`current_time = time.time() - self.initial_time` (`master_control.py:795`) still exists, but
+it only timestamps `/monitoring_data` and the `.npy` log (in a run session the `t` column
+counts from the run's start instead) — it does not touch the reference.
 Do not "fix" it by routing it back into path generation; that is precisely the design this
 replaced.
 
@@ -186,18 +187,20 @@ which is why the sources import each other as bare modules (`import custom_funct
 | `uwgps_log.py` | `src/robot_interaction/` | `underwater_gps_logger` | Water Linked UGPS HTTP poller |
 | `path_generation.py` | `src/_custom_libraries/` | `path_generation` | `/path_request` service; trajectory library |
 | `path_publisher.py` | `src/_custom_libraries/` | `path_publisher` | Whole-path preview for RViz; outside the control loop |
+| `bag_replay.py` | `src/` | `bag_replay` | **v1.1.** Kinematic Gazebo replay of one run's bag (`Replay_launch.py`): `set_pose` at 50 Hz from the recorded attitude/position, the recording republished (§2.3) |
 | `MPC/ur_mpc_control.py` | `src/MPC/` | `mpc_control` (ns `blueboat`) | Standalone MPC node — installed, launched by nothing |
 | `MPC/uvr_mpc_control.py` | `src/MPC/` | `mpc_control` (ns `blueboat`) | Standalone 3-thruster MPC node — installed, launched by nothing |
 
 `custom_functions.py` (shared helpers incl. `data_root`, `compute_target`) imports ROS;
-`frame_math.py`, `robot_log_schema.py`, `thrust_limits.py`, `path_stamp.py` and
-`poslog_report.py` (all `src/_custom_libraries/`) are **ROS-free by construction** — numpy
+`frame_math.py`, `robot_log_schema.py`, `thrust_limits.py`, `path_stamp.py`,
+`poslog_report.py` and `run_bag.py` (all `src/_custom_libraries/`) are **ROS-free by construction** — numpy
 only, or no imports at all — so the geometry and the CSV format are debuggable from a plain
 Python prompt with no sourced workspace. Keep them that way; anything needing `rclpy` belongs
 in `custom_functions.py` instead.
 
 `poslog_report.py` (ROS-free; also a CLI) files a finished run: it creates
-`Robot_data/<csv stem>/` and **moves** the CSV, its `-origin.yaml` sidecar and a PNG report in.
+`Robot_data/<csv stem>/` and **moves** the CSV, its `-origin.yaml` sidecar and a PNG report in
+— and, from a run session, the run's `-path.yaml` snapshot and its bag (`--bag <dir>`, §6).
 Moving a field record is allowed, rewriting one is not (CM-7): an existing folder is never
 touched, re-running is a no-op. Load-bearing details:
 - **matplotlib is imported lazily, inside the renderer only** — `robot_interface` calls it
@@ -241,6 +244,7 @@ that binding.
 | `/blueboat/param_ready` | `std_msgs/Bool` | `param_set` | `robot_interface` |
 | `/blueboat/param_mode` | `std_msgs/String` | `param_set` | `robot_interface` |
 | `/uw_gps_data` | `std_msgs/Float32MultiArray` | `uwgps_log` | `robot_interface` |
+| `/blueboat/run_state` | `std_msgs/String` (JSON) | `master_control` — **run session only** | `robot_interface` (opens / closes the run's CSV from it), Mission Control Station |
 
 The behaviour of these topics that crosses modules — `controller_ready`'s two publishers with
 different QoS (never make the subscriber latched), `/thruster_input` never silent (every early
@@ -258,6 +262,52 @@ superproject `.claude/CLAUDE.md` §4.1, which loads in every session here.
 | `/monitoring_data` | `std_msgs/Float32MultiArray` | out | `master_control` | Mission Control Station map display |
 | `/pose_arrow` | `visualization_msgs/Marker` | out | `master_control` | RViz / Gazebo debug (simulation only) |
 | `/set_path` | `nav_msgs/Path` | out | `path_publisher` | RViz / GCS |
+| `/blueboat/arrow_thrust` | `std_msgs/Float32MultiArray` | in | `master_control` | Mission Control Station ARROW CONTROL: `[right, left]` N at 20 Hz, `[]` = release (every mode) |
+| `/blueboat/run_command` | `std_msgs/String` (JSON) | in | `master_control` — run session only | Mission Control Station: `configure` / `start` / `stop` |
+| `/blueboat/run_state` | `std_msgs/String` (JSON) | out | `master_control` — run session only | Mission Control Station (ack + 1 Hz heartbeat) |
+| `/blueboat/run_log` | `std_msgs/String` (JSON) | out | `robot_interface` — run session only | Mission Control Station (the run's CSV, 1 Hz heartbeat) |
+
+**Run sessions (2026-10-09, ordered by the user).** A real-robot launch from the Mission
+Control Station passes `session_mode:=true`: the four rows above marked "run session only"
+exist only then, and only on the real graph — `Sim_launch.py` and a CLI launch without the
+argument expose exactly the v1.0 interface, so the asymmetry is deliberate (operator
+plumbing, not a sensor interface; superproject §4.1 / CM-2). The JSON contracts:
+
+```
+run_command  {"cmd":"configure","controller_type":"PID|LoS|MPC","use_pinger":b,"note":s,"mission":s,"seq":n}
+             {"cmd":"start","seq":n}   {"cmd":"stop","seq":n}
+run_state    {"seq":n,"ok":b,"detail":s,"state":"idle|loading|running|error","controller_type":s,
+              "use_pinger":b,"note":s,"mission":s,"run":n,"npy":path}
+run_log      {"run":n|null,"logging":b,"csv":path,"layout":"no_pinger|pinger",
+              "bag_enabled":b,"bag_recording":b,"bag":path}          # bag_*: v1.1, additive
+```
+
+`seq` echoes the last command handled; `configure` is refused during a run (and MPC with the
+pinger), `start` unless `state == idle`. All four topics use the default profile (depth 10,
+reliable, volatile) at both ends (CM-4); the two states are heartbeated at 1 Hz for the
+same reason `controller_ready` is.
+
+**Bag replay (v1.1, 2026-10-13, ordered by the user).** `Replay_launch.py` runs `bag_replay`
+against one run's bag (§6) — a playback of a real run, not a simulation (superproject CM-2):
+
+| Topic | Type | Direction | Contract |
+|---|---|---|---|
+| `/replay/state` | `std_msgs/String` (JSON) | out, TRANSIENT_LOCAL depth 1, 2 Hz | `{bag, t, duration, rate, paused, finished, frame: empty\|anchored, world, world_offset, pose_source, gazebo}` |
+| `/replay/command` | `std_msgs/String` (JSON) | in | `{"cmd":"pause"\|"resume"}`, `{"cmd":"rate","rate":x}` |
+| `/blueboat/odom` | `nav_msgs/Odometry` | out | rebuilt from the recorded `/mavros/local_position/odom`: **full** attitude (the recorded `/blueboat/odom` is yaw-only), body twist, world frame |
+| `/monitoring_data`, `/set_path` | as live | out | target columns shifted into the world frame; the path from the run's `-path.yaml` |
+| live names | as recorded | out | every other `/mavros/*` but `rc/override`, `/thruster_input`, `/controller_target`, `/blueboat/pinger_coordinates`, `/uw_gps_data` |
+| `/replay/<name>` | as recorded | out | everything else (commands, session plumbing, the raw odom) — never on a live name |
+
+Every `header.stamp` is rewritten to the replay's time; the bag's receive times drive the
+schedule (`BagClock`: wall clock × rate, pausable). Frames: the empty world IS the run's
+launch frame; a built world's frame is placed by the median of (recorded fix in the world
+anchor's EN − boat in the launch frame) over the bag's fixes (`frame_math.latlon_to_local_en`,
+the shared equirectangular formula). The mavros→launch-frame shift is measured from paired
+`/mavros/local_position/odom` and `/blueboat/odom` samples. Heave: the EKF z detrended over
+10 s, clipped ±0.5 m (`heave:=false` pins the waterline). Measured on a synthetic 60 s bag:
+pose error 1 mm, attitude 0.01°, and under the simulator's `very_strong` current + `rough`
+waves 0.8 mm of drift over 2 s paused.
 
 ### 2.4 MAVROS boundary
 
@@ -319,8 +369,15 @@ ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: <value>"
 `enable` · `stop` · `override` · `default` · `arm` · `disarm` ·
 `move <left> <right> <seconds>`
 
+In a run session the runs themselves are driven on their own topic (the station does this):
+
+```bash
+ros2 topic pub --once /blueboat/run_command std_msgs/msg/String '{data: "{\"cmd\": \"start\", \"seq\": 1}"}'
+ros2 topic pub --once /blueboat/run_command std_msgs/msg/String '{data: "{\"cmd\": \"stop\", \"seq\": 2}"}'
+```
+
 Any **unrecognised** first token falls through to `move_callback`
-(`robot_interface.py:418`), which is handed the *whole* split string and still requires exactly
+(`robot_interface.py:592`), which is handed the *whole* split string and still requires exactly
 four fields — so `x 1.0 1.0 5` is accepted as a move without the `move` keyword, while
 `1.0 1.0 5` (three fields) is not. Anything that is not exactly four fields is rejected with a
 log line and no action.
@@ -343,8 +400,23 @@ Launch arguments and defaults: the launch files. What they do not make obvious:
 
 - **`BlueBoat_launch.py`** always starts `mavros`, `robot_interface`, `uwgps_log`,
   `param_set`; `master_control` only when `controller_type` is non-empty, `path_generation`
-  only when `use_pinger` is **False**. `use_pinger` reaches `robot_interface` as the parameter
-  **`use_UWgps`**, which also selects the CSV layout (§6). `fcu_url` see §2.4.
+  only when `use_pinger` is **False** — or when `session_mode` is true. `use_pinger` reaches
+  `robot_interface` as the parameter **`use_UWgps`**, which also selects the CSV layout (§6).
+  `fcu_url` see §2.4.
+- **`session_mode`** (default `False`; the Mission Control Station always passes `true`)
+  makes the launch a **run session**: connect, go into override, then **idle** — no path or
+  pinger following, no CSV, no `.npy` — until `start` on `/blueboat/run_command`; `stop`
+  returns to idle in override. Each run gets its own CSV + sidecar + report (`robot_interface`)
+  and `.npy` (`master_control`); between runs `configure` may switch controller, follow mode
+  and log note. Needs a `controller_type`. `path_generation` then watches the station's
+  session file (`trajectories/.session/run.yaml`), rewritten before every start (§7).
+- **`record_bag`** (default `True`, acts only with `session_mode`; v1.1): one ros2bag per run
+  (§6). `robot_interface` also receives `trajectory`, to snapshot a `from_yaml` run's path.
+- **`Replay_launch.py`** (v1.1): `bag` (a run folder or its bag), `world_dir` (empty = stock
+  `ocean` world), `rate`, `heave`, `start_paused`, `gui`. Gazebo + clock bridge + the
+  `/world/<w>/set_pose` service bridge + the boat with `replay:=true` (§8) + `bag_replay` —
+  no controller, no `simulation_interface`, no sea state, no `/current` bridge. A built world
+  is only read (`world.sdf`, `metadata.yaml` `geo_anchor`); no `blueboat_sss_sim` import.
 - **`Sim_launch.py`** defaults `controller_type` to **`'MPC'`** and always launches a
   controller; it never starts `robot_interface`. `spawn_yaw` is **radians ENU** (spawn
   position stays (0, 0)); the Mission Control Station passes a random one for GPS-anchored
@@ -391,15 +463,26 @@ and can pick a different checkout (this machine has two).
 
 ## 4. Control architecture
 
-Three controllers share one control callback. Branch priority: **manual target** → **path
-following** → **pinger** → nothing. `MPC` is unsupported in pinger mode. Evidence and
+Three controllers share one control callback. Branch priority: **arrow keys** → **manual
+target** → **path following** → **pinger** → nothing. `MPC` is unsupported in pinger mode.
+In a run session path and pinger following run only between `start` and `stop`. Evidence and
 derivations for everything below: `blueboat_control/src/CLAUDE.md`; every tuning knob with its
 real/sim default and the symptom→knob table: `FIELD_TUNING.md`; reference generation:
 `blueboat_control/src/TRAJECTORY_SYSTEM.md`.
 
 - **The controller object is built in `__init__`, not on the first tick** — MPC's acados
   build in `timer_callback` froze the single-threaded executor. `Controller node initiated`
-  marks construction; `Controller ready` marks the readiness handshake.
+  marks construction; `Controller ready` marks the readiness handshake. A run session's
+  `configure` rebuilds between runs through the same code (`_apply_controller_setup` +
+  `_make_controller`): PID/LoS on the executor thread, **MPC on a worker thread** whose result
+  is swapped in by `timer_callback` (`_poll_controller_build`), so the loop — manual target,
+  arrow keys, `/thruster_input` — never stops during a build; `run_state` reads `loading`
+  meanwhile and `start` is refused.
+- **Arrow keys override everything** (`/blueboat/arrow_thrust`, every mode): the command goes
+  out through `publish_thrust` (uniform `thrust_limit` saturation, this node stays the only
+  `/thruster_input` producer), `tau` is frozen as for a manual target and the logged target
+  holds the last one registered. A stream older than `arrow_timeout` (0.5 s) commands zero
+  and **stays** in arrow control. Released by `[]`, by any manual target, by a run `start`.
 - **The acados solver is cached in `$ROS_HOME/blueboat_control/mpc`**
   (`ur_mpc.acados_build_dir()`), deliberately **not** under `cf.data_root()` (write-once
   field record). Any change to the MPC model coefficients, horizon, weights, `thrust_limit` or
@@ -489,7 +572,10 @@ Evidence (tables, measurements, proofs) for each item: `blueboat_control/src/CLA
   sysid 255. Which of the two sysid parameter names exists is resolved once at runtime by
   querying both. Every write is read back and verified before `param_ready` goes true.
 - Readiness handshakes survive DDS discovery races. `robot_interface` re-publishes
-  `/blueboat/controller_ready` on a 1 s timer, and `robot_interface` **re-requests** the
+  `/blueboat/controller_ready` on a 1 s timer — and so, since 2026-10-09, does
+  `simulation_interface` (its latched one-shot alone let a late-matching `master_control`
+  miss readiness and leave the simulated boat at the start; `ready_republish_period`, the
+  same hard-coded 1.0 s) — and `robot_interface` **re-requests** the
   mode every second until `param_set` confirms it, which `param_set` handles
   idempotently. Editing either side means keeping that pairing intact.
 - **`param_set` never blocks forever, and always reports.** Three rules, none may be removed:
@@ -511,6 +597,36 @@ Evidence (tables, measurements, proofs) for each item: `blueboat_control/src/CLA
 |---|---|---|
 | Position/pinger CSV | `<root>/data/Robot_data/{date}-{note}-poslog.csv` | **Raw field record — never overwrite or regenerate.** Written by `robot_interface` in a real-robot run and by `simulation_interface` in Gazebo |
 | Controller monitoring | `<root>/data/{ctrl}_data/{date}-{ctrl}_{sim}_data.npy` | Per-run result |
+| Run bag (v1.1) | `<root>/data/Robot_data/<csv stem>/{date}-{note}-bag/` (mcap) | **Raw field record**, run sessions only: every topic except `/side_scan_sonar/*`, `/sss_processor/*`, `/sss_ai/*` (the `.svlog` is the sonar's record) |
+| Path snapshot (v1.1) | `<root>/data/Robot_data/<csv stem>/{date}-{note}-path.yaml` | Copy of a path run's `from_yaml` mission (`blueboat_trajectory/1`) |
+
+**One file per run in a run session.** Outside a session both files are claimed at node
+construction, one per launch. In a session (`session_mode:=true`) nothing is claimed until a
+run starts: `master_control` reserves the `.npy` at `start` (`{date}` = run start, `{ctrl}` =
+the controller of that run) and `robot_interface` opens the CSV when `run_state` reports the
+run (`{date}` = run start, `{note}` = the note configured for that run, layout from that run's
+follow mode). At `stop` the `.npy` is written and the CSV closed and filed by
+`poslog_report.py` **in a subprocess** (its own session — a launch teardown cannot kill it
+half-way, and the PNG render never holds the GIL against the 20 Hz RC stream). Every run's
+sidecar carries the same session origin: the world frame is latched once per launch.
+
+**The run's bag (v1.1).** Written by a separate `ros2 bag record` process (`run_bag.py`) —
+never through `robot_interface`'s interpreter, so the RC stream cannot be slowed by it; it
+subscribes on the laptop to topics already arriving there, so it adds nothing to the Base
+Station link. It is **pre-armed paused** while the session idles (into a hidden
+`Robot_data/.run-bag-<pid>-<k>/`) and resumed through its `~/resume` service when
+`run_state` reports the run — measured: first message within 1 ms of the run start, where a
+cold start loses 1–2 s to discovery. At `stop` a worker thread SIGINTs it (10 s, then SIGTERM,
+then SIGKILL), and only then starts `poslog_report.py <csv> --bag <staging>`, which moves the
+closed bag in as `{date}-{note}-bag/` — the folder must not exist before (write-once guard),
+which is why the bag is staged. The recorder shares `robot_interface`'s process group, so a
+launch teardown SIGINTs it too; the shutdown hook waits for it (bounded) and files the open
+run with its bag. A recorder that never recorded is deleted; one that died mid-run keeps its
+partial bag (`ros2 bag reindex` rebuilds a missing `metadata.yaml`). Services are not
+recorded: arming, mode and parameter outcomes show in `/mavros/state` and
+`/blueboat/param_mode`. ⚠ simple_launch gives mavros, `param_set` and `path_generation`
+`use_sim_time:=True` on the real launch (`SimpleLauncher(use_sim_time=True)`), so their
+header stamps may be 0 in a bag — use the bag's receive timestamps.
 
 `<root>` = `custom_functions.data_root`, first match wins: `data_dir` parameter →
 `$BLUEBOAT_DATA_DIR` → the sourced workspace (parent of the first `$COLCON_PREFIX_PATH` entry,
@@ -618,7 +734,9 @@ and known defects (`square`'s 4 m discontinuity): `TRAJECTORY_SYSTEM.md`.
   order. **Speed is baked into each formula** (`x = 0.5*t` = 0.5 m/s).
 - **Frame:** every shape and YAML row is in `/blueboat/odom`'s local ENU — a shape starting at
   `(0, 0)`, `yaw = 0` starts at the launch point heading **East**, real and sim alike.
-  GPS-anchored missions arrive pre-translated by the MCS deploy step; `path_generation`
+  GPS-anchored missions arrive pre-translated by the MCS deploy step, and in a run session a
+  non-anchored mission arrives **placed at the boat** by the station (first sample on the
+  boat, first heading along its heading, written just before `start`); `path_generation`
   applies no transform.
 - The hard-coded shapes are the reference conditions for existing field data: changing one
   silently invalidates comparison with earlier runs.
@@ -632,7 +750,8 @@ and known defects (`square`'s 4 m discontinuity): `TRAJECTORY_SYSTEM.md`.
   dedicated `yaml_path` parameter wins when set but **no launch file passes it**. It is
   **file-watched** (`_maybe_reload_yaml` on every request, reload on mtime change) and serves
   a station-keeping pose at the origin **until the file appears** — load-bearing: it lets the
-  Mission Control Station deploy a GPS-anchored mission only once the odom↔GPS fit exists.
+  Mission Control Station deploy a GPS-anchored mission only once the odom↔GPS fit exists,
+  and, in a run session, rewrite one file (`trajectories/.session/run.yaml`) before every run.
 
 ---
 
@@ -645,7 +764,8 @@ MPC's internal model share the rigid body and nothing else** (`hydrodynamics.xac
 the BlueROV2 table), so an MPC result in simulation is not a solver-against-its-own-model
 result; and in simulation `/blueboat/odom` comes from `upload_rov_launch.py`'s Gazebo bridge
 (20 Hz, `odom_frame: world`), in a real-robot run from `robot_interface` — same topic, same
-type, different origin.
+type, different origin. **v1.1:** a `replay` xacro argument (default `false`, the default
+description byte-identical) builds the force-free boat a bag replay moves by `set_pose`.
 
 ---
 

@@ -9,6 +9,10 @@ sl.declare_arg('camera', True)
 sl.declare_arg('gazebo_world_name', 'none')
 
 sl.declare_arg('thr','thrusters_ur')
+# Kinematic replay of a recorded run (blueboat_control Replay_launch.py): the
+# force-free description, no odometry bridge (bag_replay publishes
+# /blueboat/odom from the recording) and no thruster bridges.
+sl.declare_arg('replay', False)
 
 sl.declare_gazebo_axes(x=0., y=0., z=-0.15, roll=0.,pitch=0., yaw=0.)
 
@@ -16,6 +20,7 @@ def launch_setup():
     
     ns = sl.arg('namespace')
     thr = sl.arg('thr')
+    replay = sl.arg('replay')
 
     if sl.arg('gazebo_world_name') != 'none':
         GazeboBridge.set_world_name(sl.arg('gazebo_world_name'))
@@ -23,7 +28,7 @@ def launch_setup():
     # robot state publisher
     sl.include('blueboat_description', 'state_publisher_launch.py',
                launch_arguments={'namespace': ns, 'use_sim_time': sl.sim_time, 'jsp': False,
-                                 'thr': thr})
+                                 'thr': thr, 'replay': replay})
                
     with sl.group(ns=ns):
                     
@@ -40,7 +45,9 @@ def launch_setup():
                                      'pose_gt', 'geometry_msgs/Pose', GazeboBridge.gz2ros))
         
         # ground truth if requested
-        if sl.arg('ground_truth'):
+        if replay:
+            sl.node('pose_to_tf',parameters={'child_frame': ns + '/base_link'})
+        elif sl.arg('ground_truth'):
             bridges.append(GazeboBridge(f'/model/{ns}/odometry',
                                      'odom', 'nav_msgs/Odometry', GazeboBridge.gz2ros,
                                      'gz.msgs.Odometry'))
@@ -50,7 +57,9 @@ def launch_setup():
             sl.node('pose_to_tf',parameters={'child_frame': ns+'/base_link_gt'})
         
         # thrusters and steering
-        if thr == 'thrusters_ur':
+        if replay:
+            pass
+        elif thr == 'thrusters_ur':
             for t in range(1, 3):
                 thruster = f'thruster{t}'
                 gz_thr_topic = f'/{ns}/{thruster}/cmd'

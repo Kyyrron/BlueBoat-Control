@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 # ============================================================================
-# Gazebo thrust bridge, sim-side readiness handshake, and the position CSV.
+# Gazebo thrust bridge, sim-side readiness handshake (latched AND re-published
+# every second, like robot_interface's), and the position CSV.
 #
 # This node is robot_interface's simulation counterpart: same topics, same
 # watchdog, same thrust saturation, and -- since this revision -- the SAME
@@ -139,6 +140,12 @@ class Controller(Node):
         self.thr_watchdog_tripped = False
 
         self.sent_ready = False
+        # Readiness is re-published, not only latched: master_control subscribes
+        # VOLATILE (CM-4), so a controller that matched after the one latched
+        # sample never heard it and the boat sat at the start for the whole run
+        # (seen 2026-10-09). Same name and period as robot_interface's.
+        self.last_ready_tx = 0.0
+        self.ready_republish_period = 1.0
 
         ################## Logged state ##################
         # Filled by the callbacks in section 3; every one of them has a value
@@ -229,6 +236,12 @@ class Controller(Node):
             self.ready_publisher.publish(msg)
             self.get_logger().info(f'Ready publishing: {msg.data}')
             self.sent_ready = True
+            self.last_ready_tx = time.time()
+        elif time.time() - self.last_ready_tx > self.ready_republish_period:
+            # Periodic re-publish so a controller node that finished starting
+            # late still receives it (logged once, above, to avoid spam).
+            self.last_ready_tx = time.time()
+            self.ready_publisher.publish(Bool(data=True))
 
         if self.thruster_input_stale(time.time()):
             if not self.thr_watchdog_tripped:

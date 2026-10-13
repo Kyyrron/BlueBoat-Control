@@ -16,6 +16,33 @@ Python object and are unaffected either way. One consequence to know: the log li
 `Controller node initiated` now marks *construction*, and no longer implies
 `/blueboat/controller_ready` has arrived — `Controller ready` is the line for that.
 
+**Run sessions (2026-10-09): rebuilding between runs without stopping the loop.** With
+`session_mode:=true` the node idles between runs and a `configure` on
+`/blueboat/run_command` may switch `controller_type`. The construction code was split so the
+very same steps serve both: `_apply_controller_setup(ctype)` (reference window, `B_matrix`,
+LoS allocator — cheap, executor thread) and `_make_controller(ctype)` (returns the object,
+assigns nothing). PID and LoS are rebuilt inside the callback. MPC is submitted to a
+one-thread `ThreadPoolExecutor`: the worker only *constructs* the solver (acados codegen and
+compile release the GIL in the `make` subprocess), and `timer_callback` swaps it in on the
+executor thread (`_poll_controller_build`) together with its setup, so the control loop —
+manual target, arrow keys, `/thruster_input` — keeps its 20 Hz throughout. Measured in the
+offline session harness: 27 `/thruster_input` messages during a cached MPC build (~1.3 s).
+A failed build leaves the previous controller loaded and reports `state: error`, which keeps
+`start` refused until the station reconfigures. At `start` the controller's memory is cleared
+— `PIDLoS.reset()`, and for MPC `solver.reset()` (the reset the C6 failure path uses, i.e.
+the state a freshly built solver starts from) — so nothing of the previous run leaks in.
+
+**Arrow keys: why through this node, and why the dead-man stays engaged.** The station's
+arrow thrust could have gone straight to `/thruster_input`, but two producers on that topic
+fight tick by tick; routed here it is one more branch ahead of the manual target, and it
+inherits `publish_thrust`'s uniform saturation and the "never silent" rule. A stream older
+than `arrow_timeout` commands **zero and stays in arrow control**: falling back to the run's
+path or pinger on a lost station would hand the boat to autonomous control nobody asked for.
+Only an explicit `[]`, a manual target or a run `start` releases it. While engaged, `tau` is
+frozen exactly as for a manual target and `/monitoring_data[4:6]` holds the last world target
+registered (`last_world_target`, refreshed after every other branch), so the CSV's target
+columns keep meaning "the reference the run was on".
+
 **The generated acados solver is cached outside the working directory**, in
 `$ROS_HOME/blueboat_control/mpc` (default `~/.ros/blueboat_control/mpc`), resolved by
 `ur_mpc.acados_build_dir()`. acados defaults its json and `code_export_directory` to
@@ -182,6 +209,7 @@ launch argument rather than an edit and a rebuild. Values are read once, at cons
 | Point following | `point_k_v` / `point_k_psi` (2.0 / 60.0 in simulation, 0.15 / 100.0 on the real boat), `safety_distance` (−1.0, which disables the arrival check — **pinger branch only** since the manual branch got its own hold) |
 | Manual keep-location | `manual_hold_radius` (1.0 m, `<= 0` disables the whole hold), `manual_reacquire_radius` (2.0 m), `manual_hold_kx` (15.0 simulation / 8.0 real, **Newtons per metre**, not the m/s that `los_hold_kx` is), `manual_hold_umax` (defaults to `kx × (reacquire − hold)`, so retuning a radius cannot silently break the handover), `manual_brake_time` (1.0 s) |
 | Thrust | `thrust_limit` (20.0 N) — feeds the allocator clamp, the MPC input bounds **and, since 2026-08-31, `publish_thrust`'s own uniform saturation**. `robot_interface` and `simulation_interface` each declare a parameter of the same name and default (§5) |
+| Arrow control | `arrow_timeout` (0.5 s) — dead-man on `/blueboat/arrow_thrust`: an older command is not applied (zero thrust, arrow control stays engaged). Session plumbing adds `session_mode` (False), not a tuning knob |
 | Dead zone | `min_thrust` (2.0 N) — the propeller-breakaway floor on `solve_LoS`'s surge term **and on the manual keep-location surge**. `0.0` disables both and restores the pre-2026-08-31 law exactly (§5) |
 
 ROS 2 has no dict or tuple parameter type, so gain triples and the MPC weight diagonals are

@@ -9,6 +9,8 @@ sl_trajectory = sl.declare_arg('trajectory', default_value = 'station_keeping') 
 sl_pinger = sl.declare_arg('use_pinger', default_value = False)                 # Tell the controller to rely on pinger coordinates or computed trajectory
 sl_fcu = sl.declare_arg('fcu_url', default_value = 'udp://:14550@192.168.2.2:14550') # MAVROS <-> autopilot endpoint. Port 14550 is also QGroundControl's default listen port: a running QGC takes it first and mavros fails to bind, which shows up as an intermittent launch failure. Close QGC, or move this launch to another port.
 sl_data = sl.declare_arg('data_dir', default_value = '')                       # Root for run artifacts (position CSV, controller .npy). Empty resolves to $BLUEBOAT_DATA_DIR, else the sourced workspace root.
+sl_session = sl.declare_arg('session_mode', default_value = False)             # Run session (the Mission Control Station passes true): connect and idle; path/pinger following and logging only between run start/stop on /blueboat/run_command, one CSV + .npy per run. Needs a controller_type. False = the classic one-launch-one-mission behaviour.
+sl_bag = sl.declare_arg('record_bag', default_value = True)                     # Run sessions only (v1.1): record one ros2bag per run (every topic except the side-scan sonar) into the run's Robot_data/<stem>/ folder. A separate `ros2 bag record` process, pre-armed paused between runs.
 
 def launch_setup():
 
@@ -31,6 +33,9 @@ def launch_setup():
                         'controller_type' : sl_controller,
                         'use_UWgps': sl_pinger,
                         'data_dir': sl_data,
+                        'session_mode': sl_session,
+                        'record_bag': sl_bag,
+                        'trajectory': sl_trajectory,
                         'use_sim_time': False})
 
     # Connect to the pinger and log data
@@ -52,9 +57,13 @@ def launch_setup():
                             'simulation' : False,
                             'use_pinger': sl_pinger,
                             'data_dir': sl_data,
+                            'session_mode': sl_session,
                             'use_sim_time': False})
 
-        if sl.arg('use_pinger') == False:
+        # A run session can switch between path and pinger following between
+        # runs, so its path server always runs (it watches the station's
+        # session trajectory file).
+        if sl.arg('use_pinger') == False or sl.arg('session_mode') == True:
                 # Compute trajectory and target
                 sl.node('blueboat_control', 
                         'path_generation.py', 

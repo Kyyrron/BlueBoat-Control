@@ -16,6 +16,14 @@
 # The world-frame monitoring target is marked throughout with
 # "# --- world-frame monitoring target ---" (CLAUDE.md N9): /monitoring_data
 # carries world-frame x_d/y_d/psi_d in EVERY branch.
+#
+# RUN SESSIONS (session_mode:=true, real-robot launches from the Mission
+# Control Station only). The node starts IDLE: manual target and arrow control
+# work, but no path or pinger is followed and no .npy row is recorded until a
+# 'start' arrives on /blueboat/run_command; 'stop' returns to idle. Between
+# runs a 'configure' may switch controller_type / use_pinger, the MPC solver
+# being built on a worker thread so the loop keeps running. With session_mode
+# false (simulation, CLI) none of this exists and the node behaves as before.
 # ============================================================================
 
 # ----------------------------------------------------------------------------
@@ -28,7 +36,11 @@
 #                                 path_progress_errors, advance_governor,
 #                                 los_guidance, solve_LoS, manual_keep_location
 #   5. CALLBACKS / HELPERS        odom_, pinger_, ready_, manual_target_,
-#                                 publish_thrust, save_monitoring, get_time
+#                                 arrow_thrust_, publish_thrust,
+#                                 save_monitoring, get_time
+#   6. RUN SESSION                run_command_callback, _configure, _start_run,
+#                                 _stop_run, _poll_controller_build,
+#                                 _publish_run_state     (session_mode only)
 #
 # Moved out of this file:
 #   inRobotFrame()  ->  _custom_libraries/frame_math.py   (pure geometry, ROS-free)
@@ -41,16 +53,18 @@ import rclpy
 
 # Common python libraries
 import contextlib
+import json
 import os
 import sys
 import time
 import math
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 from scipy.spatial.transform import Rotation as R
 from datetime import datetime
 
 # ROS2 msg libraries
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, String
 from nav_msgs.msg import Odometry, Path
 from visualization_msgs.msg import Marker
 
@@ -102,8 +116,14 @@ class Controller(Node):
         self.declare_parameter('simulation', True) 
         self.isSimulation = self.get_parameter('simulation').get_parameter_value().bool_value
 
-        self.declare_parameter('use_pinger', False) 
+        self.declare_parameter('use_pinger', False)
         self.use_pinger = self.get_parameter('use_pinger').get_parameter_value().bool_value
+
+        # Run sessions (section 6). False everywhere except a real-robot launch
+        # started by the Mission Control Station (BlueBoat_launch.py
+        # session_mode:=true): there the node idles until a run is started.
+        self.declare_parameter('session_mode', False)
+        self.session_mode = self.get_parameter('session_mode').get_parameter_value().bool_value
 
         # Empty means "resolve it" - see custom_functions.data_root for the order.
         self.declare_parameter('data_dir', '')
@@ -118,14 +138,26 @@ class Controller(Node):
         self.ready_subscriber = self.create_subscription(Bool, '/blueboat/controller_ready', self.ready_callback, 10)
    
         self.manual_target_subscriber = self.create_subscription(Float32MultiArray, '/blueboat/manual_target', self.manual_target_callback, 10)
+        # Arrow-key thrust from the station: [right, left] N streamed while the
+        # operator drives with the keyboard, [] to release. Inert unless someone
+        # publishes, so it exists in every mode (simulation included).
+        self.arrow_subscriber = self.create_subscription(Float32MultiArray, '/blueboat/arrow_thrust', self.arrow_thrust_callback, 10)
 
         self.data_publisher = self.create_publisher(Float32MultiArray, "/monitoring_data", 10)
         self.target_publisher = self.create_publisher(Float32MultiArray,'/controller_target', 10)
         self.thruster_input_publisher = self.create_publisher(Float32MultiArray, "/thruster_input", 10)
         self.pose_arrow_publisher = self.create_publisher(Marker, "/pose_arrow", 10)
 
-        # Create a client for path request
-        if not self.use_pinger:
+        # Run-session plumbing (section 6): commands in, state out (published on
+        # every change and heartbeated at 1 Hz - a one-shot status races DDS
+        # discovery exactly like controller_ready did).
+        if self.session_mode:
+            self.run_command_subscriber = self.create_subscription(String, '/blueboat/run_command', self.run_command_callback, 10)
+            self.run_state_publisher = self.create_publisher(String, '/blueboat/run_state', 10)
+
+        # Create a client for path request. In a session path_generation always
+        # runs (the follow mode can change between runs), so the client does too.
+        if not self.use_pinger or self.session_mode:
             self.client = self.create_client(RequestPath, '/path_request')
 
             while not self.client.wait_for_service(timeout_sec=1.0):
@@ -171,53 +203,12 @@ class Controller(Node):
         # _declare_tuning_parameters.
         # ---------------------------------------------------------------------
 
-        # MPC Parameters
-        if self.controller_type == 'MPC':
-            # mpc_horizon, mpc_time, Q_weight, R_weight and input_bounds are
-            # declared parameters, set by _declare_tuning_parameters.
-
-            # Initialize MPC solver
-            self.controller = None # Updated at the start of spin
-
-            # Derived from the horizon, never declared separately: the reference
-            # window and the solver's horizon must not be able to disagree.
-            #
-            # N + 1, not N. MPCController.solve reads N+1 poses --
-            # N stages plus the terminal one -- so requesting N made it pad by
-            # duplicating the last pose, giving a zero-velocity terminal
-            # reference. It also desynchronised the two spacings: this window's
-            # dtau was path_time/(path_steps-1) while the solver divides by
-            # time/horizon, inflating every reference velocity by 7.1 %. With
-            # N+1 poses the two are identically time/horizon.
-            self.path_time = self.mpc_time
-            self.path_steps = self.mpc_horizon + 1
-
-        # PID Parameters
-        if self.controller_type == 'PID':
-            self.path_time = self.dt
-            self.path_steps = 2
-
-            # outer_gains, inner_gains, pid_lookahead and thruster_limits are
-            # declared parameters, set by _declare_tuning_parameters.
-
-            radius = 0.59/2
-            self.B_matrix = B = np.array([[1.        ,1.],
-                                          [0.        ,0.],
-                                          [radius,-radius]])
-
-        # LoS Parameters
-        if self.controller_type ==  'LoS':
-            self.path_time = self.dt
-            self.path_steps = 2
-
-            radius = 0.59/2
-            self.B_matrix = np.array([[1.        ,1.],
-                                      [0.        ,0.],
-                                      [radius,-radius]])
-            # The kinematic Fossen-LoS gains (los_lookahead, los_ku, los_kpsi,
-            # los_kd, los_speed_scale) and thruster_limits are declared
-            # parameters, set by _declare_tuning_parameters.
-            self.los_allocator = PID.ThrustAllocator(self.B_matrix, limits=self.thruster_limits)
+        # Per-controller reference window, allocation matrix and allocator.
+        # Moved into a method so a run session can switch controller between
+        # runs through the very same code (section 6); here it runs exactly as
+        # it always did, once, for the launched controller_type.
+        self.controller = None # Updated by _build_controller at the end of __init__
+        self._apply_controller_setup(self.controller_type)
 
         # k_v, k_psi (point following) and safety_distance are declared
         # parameters, set by _declare_tuning_parameters. Their defaults still
@@ -248,12 +239,45 @@ class Controller(Node):
 
         self.t_record = self.get_time()
 
-        ctrl = self.controller_type
-        date = datetime.today().strftime('%Y_%m_%d-%H_%M_%S')
-        sim = 'simulation' if self.isSimulation else 'real'
-        run_dir = cf.ensure_data_dir(self, self.data_root, 'data', f'{ctrl}_data')
-        self.title = cf.reserve_run_file(run_dir, f'{date}-{ctrl}_{sim}_data', '.npy')
-        self.get_logger().info(f"Controller log: {self.title}.npy")
+        # Arrow-key control state (arrow_thrust_callback). Highest priority of
+        # every branch while active; a stale stream commands zero, it never
+        # falls through to autonomous control.
+        #   arrow_active      - engaged by any [right, left] message, released
+        #                       by [], by a manual target, or by a run start
+        #   last_world_target - the most recent world-frame target of any
+        #                       branch, held as the logged target meanwhile
+        self.arrow_active = False
+        self.arrow_cmd = [0.0, 0.0]
+        self.arrow_rx = None
+        self.last_world_target = None
+
+        # Run-session state (section 6). Outside a session a run is simply
+        # always active, which is what makes every gate below a no-op there.
+        self.run_active = not self.session_mode
+        self.run_status = 'idle'        # idle | loading | running | error
+        self.run_number = 0
+        self.run_t0 = None              # time.time() at the current run's start
+        self.run_note = ''
+        self.run_mission = ''
+        self.cmd_seq = None             # last /blueboat/run_command handled
+        self.cmd_ok = True
+        self.cmd_detail = ''
+        self._build_pool = None         # worker thread for an MPC rebuild
+        self._build_future = None
+        self._build_pinger = None       # follow mode requested with that build
+
+        if not self.session_mode:
+            ctrl = self.controller_type
+            date = datetime.today().strftime('%Y_%m_%d-%H_%M_%S')
+            sim = 'simulation' if self.isSimulation else 'real'
+            run_dir = cf.ensure_data_dir(self, self.data_root, 'data', f'{ctrl}_data')
+            self.title = cf.reserve_run_file(run_dir, f'{date}-{ctrl}_{sim}_data', '.npy')
+            self.get_logger().info(f"Controller log: {self.title}.npy")
+        else:
+            # One .npy per RUN, reserved at its start (_start_run): nothing is
+            # recorded, and no empty file is claimed, while the session idles.
+            self.title = None
+            self.run_state_timer = self.create_timer(1.0, self._publish_run_state)
 
         # Build the controller HERE, not on the first tick. The MPC branch runs
         # acados code generation and a C compile, which takes tens of seconds
@@ -314,14 +338,69 @@ class Controller(Node):
                 f"{get_acados_path()} so this path stops being a guess.")
             raise RuntimeError(f"acados Tera renderer not found at {tera}")
 
-    def _build_controller(self):
-        """Construct the controller named by controller_type.
+    def _apply_controller_setup(self, controller_type):
+        """Reference window, allocation matrix and allocator for one controller.
 
-        PID and LoS build a plain Python object in microseconds. MPC runs acados
-        code generation and a C compile, so it gets a preflight check and an
-        explicit progress line.
+        Everything here is cheap and depends only on declared parameters, so it
+        runs on the executor thread: once from __init__, and in a run session
+        again whenever a 'configure' switches controller (section 6).
         """
-        if self.controller_type == 'MPC':
+        # MPC Parameters
+        if controller_type == 'MPC':
+            # mpc_horizon, mpc_time, Q_weight, R_weight and input_bounds are
+            # declared parameters, set by _declare_tuning_parameters.
+
+            # Derived from the horizon, never declared separately: the reference
+            # window and the solver's horizon must not be able to disagree.
+            #
+            # N + 1, not N. MPCController.solve reads N+1 poses --
+            # N stages plus the terminal one -- so requesting N made it pad by
+            # duplicating the last pose, giving a zero-velocity terminal
+            # reference. It also desynchronised the two spacings: this window's
+            # dtau was path_time/(path_steps-1) while the solver divides by
+            # time/horizon, inflating every reference velocity by 7.1 %. With
+            # N+1 poses the two are identically time/horizon.
+            self.path_time = self.mpc_time
+            self.path_steps = self.mpc_horizon + 1
+
+        # PID Parameters
+        if controller_type == 'PID':
+            self.path_time = self.dt
+            self.path_steps = 2
+
+            # outer_gains, inner_gains, pid_lookahead and thruster_limits are
+            # declared parameters, set by _declare_tuning_parameters.
+
+            radius = 0.59/2
+            self.B_matrix = np.array([[1.        ,1.],
+                                      [0.        ,0.],
+                                      [radius,-radius]])
+
+        # LoS Parameters
+        if controller_type ==  'LoS':
+            self.path_time = self.dt
+            self.path_steps = 2
+
+            radius = 0.59/2
+            self.B_matrix = np.array([[1.        ,1.],
+                                      [0.        ,0.],
+                                      [radius,-radius]])
+            # The kinematic Fossen-LoS gains (los_lookahead, los_ku, los_kpsi,
+            # los_kd, los_speed_scale) and thruster_limits are declared
+            # parameters, set by _declare_tuning_parameters.
+            self.los_allocator = PID.ThrustAllocator(self.B_matrix, limits=self.thruster_limits)
+
+    def _make_controller(self, controller_type):
+        """Construct and RETURN the controller object for controller_type.
+
+        PID builds a plain Python object in microseconds; LoS has none (its
+        laws are methods of this node), so None. MPC runs acados code
+        generation and a C compile, so it gets a preflight check and an
+        explicit progress line. Assigns nothing: a run session calls this for
+        MPC from a worker thread and swaps the result in on the executor thread
+        (_poll_controller_build), so it must touch no node state.
+        """
+        if controller_type == 'MPC':
             self._check_acados_ready()
             build_dir = ur_mpc.acados_build_dir()
             self.get_logger().info(
@@ -329,7 +408,7 @@ class Controller(Node):
                 "run compiles C and can take about a minute; later runs reuse it.")
             try:
                 with self._no_stdin():
-                    self.controller = ur_mpc.MPCController(**self.mpc_model,
+                    controller = ur_mpc.MPCController(**self.mpc_model,
                                                 horizon = self.mpc_horizon,
                                                 time = self.mpc_time,
                                                 Q_weight = self.Q_weight,
@@ -348,16 +427,29 @@ class Controller(Node):
                 raise
             self.get_logger().info(
                 "acados MPC solver "
-                f"{'reused' if self.controller.reused_solver else 'generated and compiled'}.")
+                f"{'reused' if controller.reused_solver else 'generated and compiled'}.")
+            return controller
 
-        if self.controller_type == 'PID':
-            self.controller = PID.PIDLoS(dt = self.dt,
-                                         B = self.B_matrix,
-                                         outer_gains = self.outer_gains,
-                                         inner_gains = self.inner_gains,
-                                         lookahead = self.pid_lookahead,
-                                         thruster_limits = self.thruster_limits
-                                         )
+        if controller_type == 'PID':
+            radius = 0.59/2
+            B = np.array([[1.        ,1.],
+                          [0.        ,0.],
+                          [radius,-radius]])
+            return PID.PIDLoS(dt = self.dt,
+                              B = B,
+                              outer_gains = self.outer_gains,
+                              inner_gains = self.inner_gains,
+                              lookahead = self.pid_lookahead,
+                              thruster_limits = self.thruster_limits
+                              )
+
+        return None
+
+    def _build_controller(self):
+        """Construct the controller named by controller_type (see _make_controller)."""
+        controller = self._make_controller(self.controller_type)
+        if controller is not None:
+            self.controller = controller
 
         self.get_logger().info('Controller node initiated')
 
@@ -664,6 +756,14 @@ class Controller(Node):
         self.path_request_timeout = dbl('path_request_timeout', 1.0)
         self.path_stale_timeout   = dbl('path_stale_timeout', 1.0)
 
+        # -- arrow-key control dead-man ---------------------------------------
+        # The station streams /blueboat/arrow_thrust at 20 Hz while arrow
+        # control is on. A command older than this is not applied: thrust goes
+        # to zero and arrow control STAYS engaged (it never hands back to
+        # autonomous control by itself). Ten missed station ticks, the same
+        # margin as robot_interface's thruster_input_timeout.
+        self.arrow_timeout = dbl('arrow_timeout', 0.5)
+
     # ======================================================================
     #  3. THE CONTROL LOOP
     #  Runs at 1/self.dt (20 Hz). This is the entry point.
@@ -674,6 +774,11 @@ class Controller(Node):
         # silent: a consumer that hears nothing keeps streaming the last value
         # it did hear. The interface-side watchdog is the outer guard for the
         # case this cannot cover - this node crashing or hanging.
+
+        # A run session's MPC rebuild finishes on a worker thread; its result
+        # is swapped in HERE, on the executor thread (no-op otherwise).
+        self._poll_controller_build()
+
         if not self.ready:
             self.publish_thrust([0.0, 0.0])
             return
@@ -703,9 +808,14 @@ class Controller(Node):
         current_state = np.array(current_state).reshape(-1)
 
         manual_active = (list(self.manual_target) != [0.0, 0.0])
+        # Arrow control pauses the mission exactly as a manual target does:
+        # the governor holds tau, requests keep the window fresh.
+        arrow_active = self.arrow_active
 
         ## Update path (parameter-governed, NOT wall-clock)
-        if not self.use_pinger:
+        # Only during a run: an idle session neither requests nor advances the
+        # path (always true outside a session, where a run is always active).
+        if not self.use_pinger and self.run_active:
             # Collect a completed request
             if self.future is not None and self.future.done():
                 try:
@@ -735,7 +845,8 @@ class Controller(Node):
                 self.request_sent = None
 
             # Advance the governor using the boat's progress along the current
-            # window (frozen while a manual target overrides path following).
+            # window (frozen while a manual target or arrow control overrides
+            # path following).
             #
             # Gated on the window being FRESH. Advancing against a stale window
             # is open loop: once the boat reaches that frozen target e_along
@@ -746,7 +857,7 @@ class Controller(Node):
             # last good target until the path server answers again.
             window_age = current_time - self.path_rx_time if self.path_rx_time is not None else None
             window_fresh = window_age is not None and window_age <= self.path_stale_timeout
-            if self.controller_path.poses and not manual_active:
+            if self.controller_path.poses and not (manual_active or arrow_active):
                 if window_fresh:
                     e_along, e_y, _, _ = self.path_progress_errors(self.controller_path, current_state)
                     self.advance_governor(e_along, e_y)
@@ -771,14 +882,37 @@ class Controller(Node):
 
         ## Compute thrust
         u = [0]*2
+        world_target = None
 
-        if manual_active: # Manual target overrides: point LoS (unchanged)
+        if arrow_active: # Arrow keys override everything, manual target included
+            age = time.time() - self.arrow_rx if self.arrow_rx is not None else math.inf
+            if age <= self.arrow_timeout:
+                u = list(self.arrow_cmd)
+            else:
+                # Dead-man: the station went quiet. Zero, and STAY in arrow
+                # control - never resume autonomous control on a lost stream.
+                u = [0.0, 0.0]
+                self.get_logger().warning(
+                    f"Arrow control: no command for {age:.2f} s "
+                    f"(arrow_timeout {self.arrow_timeout:.2f} s) - zero thrust.",
+                    throttle_duration_sec=2.0)
+            # --- world-frame monitoring target ---
+            # The logged target stays the last one registered before the keys
+            # took over (the pose at that moment if nothing was registered yet).
+            if self.last_world_target is None:
+                self.last_world_target = [float(current_state[0]),
+                                          float(current_state[1]),
+                                          float(current_state[2])]
+            world_target = list(self.last_world_target)
+            target = list(world_target)
+
+        elif manual_active: # Manual target overrides: point LoS (unchanged)
             target = [*self.manual_target[:2], 0, 0, 0, 0] # yaw unused for LoS
             world_target = list(target[:3])  # --- world-frame monitoring target ---
             target = fm.inRobotFrame(current_state, target)
             u = self.solve_LoS(target, current_time)
 
-        elif self.controller_path.poses: # Path following
+        elif self.run_active and self.controller_path.poses: # Path following
             # Display the current desired pose if using gazebo
             if self.isSimulation:
                 desired_pose = self.controller_path.poses[0].pose
@@ -864,7 +998,7 @@ class Controller(Node):
                 world_target = _reference_pose(self.controller_path)
                 u = self.los_guidance(target, current_state)
         
-        elif self.use_pinger and self.pinger_target is not None: # MPC is not supported for this
+        elif self.run_active and self.use_pinger and self.pinger_target is not None: # MPC is not supported for this
             # --- world-frame monitoring target ---
             px, py = float(self.pinger_target[0]), float(self.pinger_target[1])
             c_m, s_m = np.cos(current_state[2]), np.sin(current_state[2])
@@ -887,9 +1021,23 @@ class Controller(Node):
             self.target_publisher.publish(msg)
 
         else:
-            self.get_logger().info('Nothing to target yet.')
+            if not self.session_mode:
+                self.get_logger().info('Nothing to target yet.')
+            elif self.run_active:
+                self.get_logger().info('Nothing to target yet.', throttle_duration_sec=5.0)
+            else:
+                # An idle session: the normal state between runs, not news.
+                self.get_logger().info(
+                    'Session idle - no run active, holding zero thrust '
+                    '(manual target or arrow keys to move).',
+                    throttle_duration_sec=30.0)
             self.publish_thrust([0.0, 0.0])
             return
+
+        # Remembered for arrow control, which keeps logging the last target
+        # registered before the keys took over.
+        if world_target is not None and not arrow_active:
+            self.last_world_target = [float(v) for v in list(world_target)[:3]]
 
         target_str = ", ".join(f"{float(x):.2f}" for x in target)
         try:
@@ -916,25 +1064,30 @@ class Controller(Node):
             self.get_logger().info(f'\nManual target coordinates: \n{target_str}')
 
         # Update and save monitoring metrics to be graphed later
-        if self.controller_path.poses or (self.use_pinger and self.pinger_target is not None) or manual_active:
+        if (self.controller_path.poses or (self.use_pinger and self.pinger_target is not None)
+                or manual_active or arrow_active):
             x_m   = current_state[0]
             y_m   = current_state[1]
             psi_m = current_state[2]
 
             # --- world-frame monitoring target ---
-            try:
-                monitored = world_target
-            except NameError:
-                monitored = target
+            monitored = world_target if world_target is not None else target
             x_d_m   = monitored[0]
             y_d_m   = monitored[1]
             psi_d_m = monitored[2] if len(monitored) > 2 else 0.0
             # --------------------------------------
 
-            data_array = [current_time, x_m, y_m, psi_m,
+            # In a session, t counts from the start of the run being recorded.
+            t_m = current_time
+            if self.session_mode and self.run_t0 is not None:
+                t_m = time.time() - self.run_t0
+
+            data_array = [t_m, x_m, y_m, psi_m,
                         x_d_m, y_d_m, psi_d_m, u[0], u[1]]
 
-            self.monitoring.append(data_array)
+            # Recorded only during a run; an idle session logs nothing.
+            if self.run_active:
+                self.monitoring.append(data_array)
 
             publisher_msg = Float32MultiArray()
             publisher_msg.data = [float(v) for v in data_array]
@@ -1393,8 +1546,9 @@ class Controller(Node):
         self.pinger_target = msg.data
 
     def ready_callback(self, msg: Bool):
-        # robot_interface now re-publishes readiness periodically (so this node can
-        # never miss it); only log the transition to avoid spam
+        # robot_interface and simulation_interface both re-publish readiness
+        # periodically (so this node can never miss it); only log the transition
+        # to avoid spam
         if msg.data and not self.ready:
             self.get_logger().info(f'Controller ready')
         self.ready = msg.data
@@ -1402,6 +1556,13 @@ class Controller(Node):
     def manual_target_callback(self, msg: Float32MultiArray):
         self.manual_target = msg.data # [x,y] in world frame
         self.stopping_sequence = False
+
+        # A manual target is a newer operator intent than the arrow keys: it
+        # releases arrow control (the station's "hold where released" publishes
+        # exactly this, the boat's own position, when the keys are let go).
+        if self.arrow_active:
+            self.arrow_active = False
+            self.get_logger().info("Arrow control released by a manual target.")
 
         # Reset the keep-location state only when the target actually MOVES.
         # Re-publishing the same coordinates must not re-arm the arrival brake
@@ -1413,6 +1574,36 @@ class Controller(Node):
             self.manual_hold_target = target
             self.manual_hold = False
             self.manual_brake_t0 = None
+
+    def arrow_thrust_callback(self, msg: Float32MultiArray):
+        """
+        Arrow-key thrust from the station: [right, left] in Newtons, streamed
+        at 20 Hz while the operator drives with the keyboard ([0, 0] while no
+        key is held); an EMPTY array releases arrow control.
+
+        While engaged it overrides every other branch (timer_callback) and
+        pauses a run exactly as a manual target does. The command goes out
+        through publish_thrust like any other, so the uniform thrust_limit
+        saturation applies and this node stays the only /thruster_input
+        producer. Released by [], by a manual target, and by a run start.
+        """
+        data = list(msg.data)
+        if not data:
+            if self.arrow_active:
+                self.get_logger().info("Arrow control released.")
+            self.arrow_active = False
+            self.arrow_cmd = [0.0, 0.0]
+            return
+        if len(data) != 2:
+            self.get_logger().warning(
+                f"/blueboat/arrow_thrust expects [right, left] or [], got "
+                f"{len(data)} values - ignored.", throttle_duration_sec=5.0)
+            return
+        if not self.arrow_active:
+            self.get_logger().info("Arrow control engaged - autonomous control paused.")
+        self.arrow_active = True
+        self.arrow_cmd = [float(data[0]), float(data[1])]
+        self.arrow_rx = time.time()
 
     # inRobotFrame() moved to _custom_libraries/frame_math.py -- it used no
     # node state at all, so it is pure geometry and now unit-testable without
@@ -1470,6 +1661,8 @@ class Controller(Node):
         has arrived. The on-disk schema is byte-identical, so existing logs,
         every analysis script and the log reviewer are unaffected (CM-7).
         """
+        if self.title is None:
+            return                      # a session before its first run: no file
         rows = len(self.monitoring)
         if rows == self.monitoring_saved_rows:
             return                      # nothing new since the last write
@@ -1483,7 +1676,250 @@ class Controller(Node):
     def get_time(self):
         s,ns = self.get_clock().now().seconds_nanoseconds()
         return s + ns*1e-9
-        
+
+    # ======================================================================
+    #  6. RUN SESSION  (session_mode only)
+    #  A real-robot launch from the Mission Control Station connects and then
+    #  IDLES: manual target and arrow keys drive the boat, nothing follows a
+    #  path or pinger, nothing is recorded. /blueboat/run_command (JSON):
+    #
+    #    {"cmd": "configure", "controller_type": "PID"|"LoS"|"MPC",
+    #     "use_pinger": bool, "note": str, "mission": str, "seq": n}
+    #    {"cmd": "start", "seq": n}      {"cmd": "stop", "seq": n}
+    #
+    #  /blueboat/run_state (JSON) answers every command and is heartbeated at
+    #  1 Hz; robot_interface opens and closes the run's position CSV from it.
+    # ======================================================================
+
+    def run_command_callback(self, msg: String):
+        try:
+            cmd = json.loads(msg.data)
+            if not isinstance(cmd, dict):
+                raise ValueError("not a JSON object")
+        except ValueError as exc:
+            self.get_logger().error(f"/blueboat/run_command: unreadable ({exc}) - ignored.")
+            return
+
+        name = cmd.get('cmd')
+        handlers = {'configure': self._configure,
+                    'start': self._start_run,
+                    'stop': self._stop_run}
+        handler = handlers.get(name)
+        if handler is None:
+            self._answer(cmd, False, f"unknown command '{name}'")
+            return
+        try:
+            handler(cmd)
+        except Exception as exc:                       # noqa: BLE001 - reported, never fatal
+            self.get_logger().error(f"Run command '{name}' failed: {type(exc).__name__}: {exc}")
+            self._answer(cmd, False, f"'{name}' failed: {exc}")
+
+    def _answer(self, cmd, ok, detail=''):
+        """Record the outcome of one command and publish it at once."""
+        self.cmd_seq = cmd.get('seq')
+        self.cmd_ok = bool(ok)
+        self.cmd_detail = str(detail)
+        if not ok:
+            self.get_logger().warning(f"Run command refused: {detail}")
+        self._publish_run_state()
+
+    def _configure(self, cmd):
+        """Choose controller, follow mode, log note and mission for the NEXT run.
+
+        Refused during a run. PID and LoS are rebuilt here (microseconds); MPC
+        builds its acados solver on a worker thread -- seconds when cached,
+        about a minute after an MPC tuning change -- while this node keeps
+        serving manual target and arrow control, and is swapped in by
+        _poll_controller_build. Until then the state reads 'loading'.
+        """
+        if self.run_active:
+            self._answer(cmd, False, "a run is active - stop it before changing the mission")
+            return
+        if self._build_future is not None:
+            self._answer(cmd, False, "a controller build is still in progress")
+            return
+
+        ctype = str(cmd.get('controller_type', self.controller_type))
+        use_pinger = bool(cmd.get('use_pinger', self.use_pinger))
+        if ctype not in ('PID', 'LoS', 'MPC'):
+            self._answer(cmd, False, f"unknown controller_type '{ctype}'")
+            return
+        if ctype == 'MPC' and use_pinger:
+            self._answer(cmd, False, "MPC does not support pinger following - choose PID or LoS")
+            return
+
+        self.run_note = str(cmd.get('note', self.run_note))
+        self.run_mission = str(cmd.get('mission', self.run_mission))
+
+        if ctype == self.controller_type and self.run_status != 'error':
+            self.use_pinger = use_pinger
+            self.run_status = 'idle'
+            self._answer(cmd, True, f"{ctype} ready")
+            return
+
+        if ctype == 'MPC':
+            self.run_status = 'loading'
+            self._build_pinger = use_pinger
+            if self._build_pool is None:
+                self._build_pool = ThreadPoolExecutor(max_workers=1,
+                                                      thread_name_prefix='mpc_build')
+            self._build_future = self._build_pool.submit(self._make_controller, 'MPC')
+            self.get_logger().info("Loading MPC for the next run (built off the control loop).")
+            self._answer(cmd, True, "MPC loading")
+            return
+
+        # PID / LoS: immediate, on this thread.
+        self._apply_controller_setup(ctype)
+        self.controller = self._make_controller(ctype)
+        self.controller_type = ctype
+        self.use_pinger = use_pinger
+        self.run_status = 'idle'
+        self.get_logger().info(f"Controller switched to {ctype} for the next run.")
+        self._answer(cmd, True, f"{ctype} ready")
+
+    def _poll_controller_build(self):
+        """Swap a finished MPC build in, on the executor thread."""
+        future = self._build_future
+        if future is None or not future.done():
+            return
+        self._build_future = None
+        try:
+            controller = future.result()
+        except Exception as exc:                       # noqa: BLE001 - reported
+            # The previous controller stays loaded, but the station asked for
+            # MPC: 'error' keeps Start Run disabled until it reconfigures.
+            self.run_status = 'error'
+            self.cmd_ok = False
+            self.cmd_detail = f"MPC build failed: {type(exc).__name__}: {exc}"
+            self.get_logger().error(self.cmd_detail)
+            self._publish_run_state()
+            return
+        self._apply_controller_setup('MPC')
+        self.controller = controller
+        self.controller_type = 'MPC'
+        self.use_pinger = bool(self._build_pinger)
+        self.run_status = 'idle'
+        self.cmd_ok = True
+        self.cmd_detail = "MPC ready"
+        self.get_logger().info("MPC loaded for the next run.")
+        self._publish_run_state()
+
+    def _start_run(self, cmd):
+        """Start following the configured path or pinger, from a clean slate.
+
+        Everything the previous run or the idle period left behind is reset:
+        tau back to 0 (the station has just written the run's path, placed at
+        the boat or GPS-deployed, into the file path_generation watches), the
+        reference window, the controller's internal state, any manual target or
+        arrow control. A fresh .npy is reserved for this run alone.
+        """
+        if self.run_active:
+            self._answer(cmd, False, "a run is already active")
+            return
+        if self.run_status != 'idle':
+            self._answer(cmd, False, f"controller not ready ({self.run_status})")
+            return
+
+        # Reserve this run's controller log first: if it cannot be written the
+        # run must not start (a run that cannot record is worse than none).
+        ctrl = self.controller_type
+        date = datetime.today().strftime('%Y_%m_%d-%H_%M_%S')
+        sim = 'simulation' if self.isSimulation else 'real'
+        try:
+            run_dir = cf.ensure_data_dir(self, self.data_root, 'data', f'{ctrl}_data')
+            title = cf.reserve_run_file(run_dir, f'{date}-{ctrl}_{sim}_data', '.npy')
+        except OSError as exc:
+            self._answer(cmd, False, f"cannot create the controller log: {exc}")
+            return
+        self.title = title
+        self.monitoring = [['t','x','y','psi','x_d','y_d','psi_d','u1','u2']]
+        self.monitoring_saved_rows = 0
+
+        # Operator overrides end: the run starts following now.
+        self.manual_target = [0.0, 0.0]
+        self.manual_hold = False
+        self.manual_brake_t0 = None
+        self.manual_hold_target = None
+        self.arrow_active = False
+        self.arrow_cmd = [0.0, 0.0]
+        self.stopping_sequence = False
+        self.stopping_time = None
+
+        # Reference from the top of the (freshly written) path.
+        self.tau = 0.0
+        self.controller_path = Path()
+        self.future = None
+        self.request_sent = None
+        self.tau_requested = None
+        self.path_rx_time = None
+        self.last_world_target = None
+
+        # Controller memory from the previous run must not leak into this one.
+        if ctrl == 'PID' and self.controller is not None:
+            self.controller.reset()
+        if ctrl == 'MPC' and self.controller is not None:
+            # The same reset the failure path uses: zero iterate and QP memory,
+            # i.e. the state a freshly built solver starts from.
+            self.controller.solver.reset()
+            self.controller.fail_count = 0
+
+        self.run_number += 1
+        self.run_t0 = time.time()
+        self.run_active = True
+        self.run_status = 'running'
+        follow = 'pinger' if self.use_pinger else 'path'
+        self.get_logger().info(
+            f"RUN {self.run_number} STARTED - {ctrl}, {follow} following"
+            f"{' (' + self.run_mission + ')' if self.run_mission else ''}. "
+            f"Controller log: {self.title}.npy")
+        self._answer(cmd, True, f"run {self.run_number} started")
+
+    def _stop_run(self, cmd):
+        """End the run: stop following, write the log, zero thrust, stay in override."""
+        if not self.run_active:
+            self._answer(cmd, True, "no run active")
+            return
+        self.run_active = False
+        self.run_status = 'idle'
+        self.save_monitoring()
+
+        # The boat stops: no manual target survives the run (arrow control, an
+        # operator toggle on the station, is left alone).
+        self.manual_target = [0.0, 0.0]
+        self.manual_hold = False
+        self.manual_brake_t0 = None
+        self.manual_hold_target = None
+        self.stopping_sequence = False
+        self.controller_path = Path()
+        self.future = None
+        self.request_sent = None
+        self.path_rx_time = None
+
+        self.get_logger().info(
+            f"RUN {self.run_number} STOPPED - controller log {self.title}.npy written; "
+            "holding zero thrust (still in override).")
+        self._answer(cmd, True, f"run {self.run_number} stopped")
+        self.publish_thrust([0.0, 0.0])
+
+    def _publish_run_state(self):
+        if not self.session_mode:
+            return
+        state = {
+            'seq': self.cmd_seq,
+            'ok': self.cmd_ok,
+            'detail': self.cmd_detail,
+            'state': self.run_status,
+            'controller_type': self.controller_type,
+            'use_pinger': bool(self.use_pinger),
+            'note': self.run_note,
+            'mission': self.run_mission,
+            'run': self.run_number,
+            'npy': f"{self.title}.npy" if self.title else '',
+        }
+        msg = String()
+        msg.data = json.dumps(state)
+        self.run_state_publisher.publish(msg)
+
 
 rclpy.init()
 node = Controller()

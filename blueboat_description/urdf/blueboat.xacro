@@ -6,6 +6,12 @@
   <xacro:arg name="simulation" default="true"/>
   
   <xacro:arg name="density" default="1000"/>
+  <!-- Kinematic replay of a recorded run (v1.1, blueboat_control Replay_launch.py):
+       no hydrodynamics, no thruster plugins, no collision geometry (the world's
+       Buoyancy acts on collision volumes) and no gravity, so NO force can act on
+       the boat - sea state, wind and current cannot move it, and the replay's
+       /world/<w>/set_pose calls are clean teleports. -->
+  <xacro:arg name="replay" default="false"/>
   
   <xacro:property name="ns" value="$(arg namespace)"/>
   <xacro:property name="density" value="$(arg density)"/>
@@ -52,6 +58,7 @@
         </material>
     </visual>
     
+    <xacro:unless value="$(arg replay)">
     <collision>
         <origin xyz="0 0 0.05"/>
         <!-- Box adjusted for buoyancy -->
@@ -59,6 +66,7 @@
             <box size="${x_size*buoyant_correction} ${y_size*buoyant_correction} ${z_size*buoyant_correction}"/>
         </geometry>
     </collision>
+    </xacro:unless>
 
 <!--    <gazebo>
         <velocity_decay>
@@ -69,8 +77,25 @@
         
     </link>
   
+<xacro:unless value="$(arg replay)">
 <xacro:include filename="hydrodynamics.xacro"/>
+</xacro:unless>
 <xacro:include filename="$(arg thrusters).xacro"/>
+
+<xacro:if value="$(arg replay)">
+    <!-- Velocity pinned to zero every physics step (VelocityControl with no
+         command holds 0): a force that still reaches the hull - the simulator's
+         sea-state wrench (ApplyLinkWrench) - cannot build up a velocity between
+         two set_pose calls, which do not reset velocity themselves. A static
+         model is not an option: set_pose does not hold one. -->
+    <gazebo>
+        <plugin filename="gz-sim-velocity-control-system" name="gz::sim::systems::VelocityControl"/>
+    </gazebo>
+    <gazebo reference="${ns}/base_link"><gravity>0</gravity></gazebo>
+    <gazebo reference="${ns}/thruster1"><gravity>0</gravity></gazebo>
+    <gazebo reference="${ns}/thruster2"><gravity>0</gravity></gazebo>
+    <gazebo reference="${ns}/thruster3"><gravity>0</gravity></gazebo>
+</xacro:if>
 
   
 <!-- other Gazebo plugins -->

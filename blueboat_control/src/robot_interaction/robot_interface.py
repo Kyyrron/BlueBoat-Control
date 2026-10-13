@@ -12,6 +12,14 @@
 #   * ONE CSV WRITER, BOTH LAYOUTS (section 8). The pinger layout used to be
 #     written from uw_gps_callback, so a Water Linked dropout stopped recording
 #     the robot too. That callback now only caches; the timer owns the file.
+#   * RUN SESSIONS (session_mode:=true, section 10). No CSV is opened at
+#     launch: one is opened per RUN, when master_control's /blueboat/run_state
+#     says a run started, and closed + filed when it ends. Outside a session
+#     the single launch-long CSV is exactly as before.
+#   * RUN BAGS (v1.1, section 11). Each run also gets a ros2bag of every
+#     non-SSS topic, written by a SEPARATE `ros2 bag record` process
+#     (run_bag.py) pre-armed paused between runs and resumed at run start.
+#     This node only starts, resumes and stops it -- never a byte of bag data.
 #
 # Column layout, its revision history and the actuation_state encoding live in
 # _custom_libraries/robot_log_schema.py. Rows are filled BY COLUMN NAME so the
@@ -32,6 +40,11 @@
 #   7. MAVROS PLUMBING            set_servo, send_rc_override, setArmedStatus,
 #                                 SetMode, set_motors, publish
 #   8. CSV LOGGING                log_timer_callback
+#   9. SHUTDOWN                   shutdown
+#  10. RUN SESSION                run_state_callback, open_run_log,
+#                                 close_run_log, publish_run_log
+#  11. RUN BAG                    bag_timer_callback, _bag_begin_run,
+#                                 _bag_end_run, _bag_teardown
 #
 # Moved out of this file:
 #   CSV column layout  ->  _custom_libraries/robot_log_schema.py  (data only,
@@ -39,8 +52,12 @@
 # ----------------------------------------------------------------------------
 
 # Common libraries import
+import json
 import os
 import re
+import shutil
+import subprocess
+import sys
 import time
 from datetime import datetime
 import numpy as np
@@ -59,11 +76,13 @@ from mavros_msgs.msg import State, OverrideRCIn
 # srv import
 from mavros_msgs.srv import CommandBool, SetMode
 from mavros_msgs.srv import CommandLong
+from rosbag2_interfaces.srv import Resume
 
 # Custom imports
 import custom_functions as cf
 import robot_log_schema as rls   # CSV column layout (ROS-free, _custom_libraries/)
 import thrust_limits as tl       # uniform thrust saturation (ROS-free)
+import run_bag                   # per-run ros2bag recorder process (ROS-free)
 
 # RC override channel conventions (MAVLink / mavros)
 CHAN_RELEASE = 0        # give the channel back to the RC receiver
@@ -117,6 +136,22 @@ class BlueBoatController(Node):
         self.data_root = cf.data_root(
             self.get_parameter('data_dir').get_parameter_value().string_value)
 
+        # Run sessions (section 10): the position CSV is per RUN, opened and
+        # closed by master_control's /blueboat/run_state, never at launch.
+        self.declare_parameter('session_mode', False)
+        self.session_mode = self.get_parameter('session_mode').get_parameter_value().bool_value
+
+        # Run bags (v1.1, section 11): one ros2bag per run, run sessions only.
+        self.declare_parameter('record_bag', True)
+        self.record_bag = (self.session_mode and
+                           self.get_parameter('record_bag').get_parameter_value().bool_value)
+
+        # The path server's trajectory argument, read only to snapshot a
+        # from_yaml run's mission file beside its CSV (`-path.yaml`), so a
+        # replay can draw the path the run followed.
+        self.declare_parameter('trajectory', '')
+        self.trajectory = self.get_parameter('trajectory').get_parameter_value().string_value
+
         ################## ROS2 Communication ##################
         ## Publishers
         self.param_publisher = self.create_publisher(String, '/blueboat/param_str',10)
@@ -156,6 +191,11 @@ class BlueBoatController(Node):
         self.uw_gps_sub = self.create_subscription(Float32MultiArray,'/uw_gps_data', self.uw_gps_callback,10)
         self.target_sub = self.create_subscription(Float32MultiArray,'/controller_target', self.target_callback,10)
         self.thruster_input_sub = self.create_subscription(Float32MultiArray, "/thruster_input", self.thr_input_callback,10)
+
+        # Run sessions: follow master_control's run state, report the log's.
+        if self.session_mode:
+            self.run_state_sub = self.create_subscription(String, '/blueboat/run_state', self.run_state_callback, 10)
+            self.run_log_publisher = self.create_publisher(String, '/blueboat/run_log', 10)
 
         ## Service clients
         self.arming_client = self.create_client(CommandBool, '/mavros/cmd/arming')
@@ -247,9 +287,52 @@ class BlueBoatController(Node):
         # caches, and log_timer_callback is the single writer for both layouts.
         self.uw_gps_log = [0.0] * 19
 
+        # The position CSV. Outside a session: one per launch, opened right
+        # here as it always was. In a session: none until a run starts
+        # (section 10) -- an idle session records nothing.
+        self.log_file = None
+        self.path = None
+        self.origin_path = None
+        self.origin_written = False
+        self.log_run = None             # session: the run whose CSV is open
+        self.last_csv = ''              # session: the previous run's CSV
+        self.report_procs = []          # session: report subprocesses spawned
+        if not self.session_mode:
+            self.open_position_log(self.note)
+        else:
+            self.get_logger().info(
+                "Run session: no position log until a run is started "
+                "(one CSV per run).")
+            self.run_log_timer = self.create_timer(1.0, self.publish_run_log)
+
+        # Run bags (section 11). bag_armed: the NEXT run's recorder, started
+        # paused while the session idles; bag_run: the current run's.
+        self.bag_k = 0
+        self.bag_armed = None
+        self.bag_armed_client = None
+        self.bag_run = None
+        self.bag_run_client = None
+        self.bag_resume_pending = False
+        self.bag_recording = False
+        self.bag_last = ''              # the previous run's bag, final path
+        self.bag_closers = []           # worker threads closing finished bags
+        self.bag_next_arm = 0.0         # earliest time to (re-)arm a recorder
+        self.bag_shutting_down = False
+        if self.record_bag:
+            self.get_logger().info(
+                "Run bags: one ros2bag per run (all topics except the "
+                "side-scan sonar), filed into the run's folder.")
+            self.bag_timer = self.create_timer(0.2, self.bag_timer_callback)
+
+    def open_position_log(self, note):
+        """
+        Create a new position CSV (+ sidecar name) and write its legend and
+        header. Called once from __init__ outside a session, and at the start
+        of every run inside one (open_run_log).
+        """
         self.date = datetime.today().strftime('%Y_%m_%d-%H_%M_%S')
         log_dir = cf.ensure_data_dir(self, self.data_root, 'data', 'Robot_data')
-        stem = f'{self.date}-{self.note}-poslog' if self.note else f'{self.date}-poslog'
+        stem = f'{self.date}-{note}-poslog' if note else f'{self.date}-poslog'
         self.path = cf.reserve_run_file(log_dir, stem, '.csv') + '.csv'
         # Sidecar name derived by pattern, not by a fixed-length slice: when
         # reserve_run_file breaks a same-second collision the CSV is
@@ -724,7 +807,10 @@ class BlueBoatController(Node):
         /uw_gps_data layout, 19 values:
             [date x7, aco xyz, ant xyz, lat, lon, dep, filaco xyz]
         """
-        if not self.use_UWgps:
+        # In a run session the follow mode can change between runs, so the
+        # pinger is tracked whatever this launch started with: a pinger run can
+        # begin at any time, and the station shows the pinger meanwhile.
+        if not (self.use_UWgps or self.session_mode):
             return
 
         self.uw_gps_log = list(msg.data)
@@ -1049,6 +1135,8 @@ class BlueBoatController(Node):
         """
         Append one row to the position CSV. The single writer, both layouts.
         """
+        if self.log_file is None or self.log_file.closed:
+            return              # an idle run session: nothing is recorded
         try:
             row = self.build_log_row()
         except (AttributeError, TypeError, IndexError) as exc:
@@ -1107,27 +1195,366 @@ class BlueBoatController(Node):
         except Exception as exc:                       # noqa: BLE001 - teardown
             self.get_logger().error(f"Shutdown: 'default' request failed: {exc}")
 
-        # 4. Close the CSV BEFORE anything moves it.
+        # 4. Close the CSV BEFORE anything moves it. In an idle run session no
+        #    CSV is open: every run was closed and filed when it stopped.
+        had_open_log = False
         try:
             if getattr(self, 'log_file', None) and not self.log_file.closed:
+                had_open_log = True
                 self.log_file.flush()
                 self.log_file.close()
                 self.get_logger().info(f"Position log closed: {self.path}")
         except Exception as exc:                       # noqa: BLE001 - teardown
             self.get_logger().error(f"Shutdown: closing the log failed: {exc}")
 
+        # 4b. Close the bags BEFORE anything moves them (section 11). The
+        #     recorder shares this process group, so a launch teardown has
+        #     already SIGINTed it; this waits for it, bounded.
+        run_bag_dir = None
+        try:
+            run_bag_dir = self._bag_teardown()
+        except Exception as exc:                       # noqa: BLE001 - teardown
+            self.get_logger().error(f"Shutdown: closing the run bag failed: {exc}")
+
+        if not had_open_log:
+            return
+
         # 5. Mission report. Imported HERE, not at module scope: matplotlib is
         #    not declared in package.xml and must never be able to stop this
-        #    flight node from starting.
+        #    flight node from starting. Synchronous here (the node is going
+        #    away anyway); a run that ends mid-session is filed in a subprocess
+        #    instead, see close_run_log.
         try:
             import poslog_report
-            folder = poslog_report.finalise_run(self.path)
+            folder = poslog_report.finalise_run(self.path, bag=run_bag_dir)
             self.get_logger().info(f"Mission report: {folder}")
         except Exception as exc:                       # noqa: BLE001 - teardown
             self.get_logger().error(
                 f"Shutdown: mission report failed ({exc}). The CSV is intact; "
                 f"run `ros2 run blueboat_control poslog_report.py {self.path}` "
                 "to produce it later.")
+
+    # ======================================================================
+    #  10. RUN SESSION  (session_mode only)
+    #  One position CSV per run. master_control owns the run (it is where the
+    #  operator's start/stop lands); this node follows its /blueboat/run_state
+    #  and reports what it is writing on /blueboat/run_log, so the station can
+    #  confirm that a run is actually being recorded.
+    # ======================================================================
+
+    def run_state_callback(self, msg: String):
+        try:
+            state = json.loads(msg.data)
+            if not isinstance(state, dict):
+                raise ValueError("not a JSON object")
+        except ValueError as exc:
+            self.get_logger().error(f"/blueboat/run_state: unreadable ({exc}) - ignored.",
+                                    throttle_duration_sec=10.0)
+            return
+
+        running = state.get('state') == 'running'
+        run = state.get('run')
+        if running and self.log_run != run:
+            # A run we are not recording yet (normally the one that just
+            # started; also a new run whose stop we missed).
+            if self.log_run is not None:
+                self.close_run_log()
+            self.open_run_log(run, bool(state.get('use_pinger', False)),
+                              str(state.get('note', '')))
+        elif not running and self.log_run is not None:
+            self.close_run_log()
+
+    def open_run_log(self, run, use_pinger, note):
+        """Open this run's CSV in the layout of its follow mode."""
+        self.use_UWgps = use_pinger
+        self.data_columns = rls.columns_for(self.use_UWgps)
+        self.target_cols, self.target_gps_cols = rls.target_columns_for(self.use_UWgps)
+        # The pinger layout's target is the dead-reckoned pinger, cached all
+        # session long (uw_gps_callback); the no-pinger one reads
+        # /monitoring_data, whose last value may predate this run.
+        self.monitoring_data = []
+        # The note lands in a file name. The station already sanitises it with
+        # this exact rule (mcs launch_manager.sanitize_note), so a station note
+        # passes through unchanged; anything else is made safe the same way.
+        safe_note = re.sub(r'-{2,}', '-', ''.join(
+            c if (c.isalnum() or c in '._') else '-' for c in note)).strip('-')
+        try:
+            self.open_position_log(safe_note)
+        except OSError as exc:
+            self.log_file = None
+            self.get_logger().error(f"Run {run}: cannot open the position log: {exc}")
+            return
+        self.log_run = run
+        self.get_logger().info(
+            f"Run {run}: logging ({'pinger' if use_pinger else 'no-pinger'} layout).")
+        if self.record_bag:
+            self._bag_begin_run(run)
+        if not use_pinger:
+            self._snapshot_trajectory(run)
+        self.publish_run_log()
+
+    def _snapshot_trajectory(self, run):
+        """Copy the run's mission file beside its CSV as `-path.yaml`.
+
+        The station rewrites one session file before every start, so without
+        a copy a run's path is lost at the next start. A pinger run has none
+        (its target, the pinger, is in the bag). Never fatal: the CSV and the
+        bag are the record, this is a convenience for replay."""
+        traj = self.trajectory
+        if not traj.startswith('from_yaml:'):
+            return
+        src = os.path.expanduser(traj.partition(':')[2])
+        dst = re.sub(r'-poslog(-\d+)?\.csv$', r'-path\1.yaml', self.path)
+        try:
+            shutil.copyfile(src, dst)
+        except OSError as exc:
+            self.get_logger().warning(f"Run {run}: path not snapshotted ({exc}).")
+
+    def close_run_log(self):
+        """Close the run's CSV and file its report, without stalling this node.
+
+        poslog_report renders a PNG with matplotlib, which takes seconds of
+        mostly-Python work: in-process it would hold the GIL against the 20 Hz
+        RC override stream. It runs as its own process instead, in its own
+        session so a launch teardown does not kill it half-way. The report is
+        identical to the one the shutdown hook writes (same function, CLI entry).
+        """
+        run = self.log_run
+        self.log_run = None
+        path = self.path
+        try:
+            if self.log_file is not None and not self.log_file.closed:
+                self.log_file.flush()
+                self.log_file.close()
+                self.get_logger().info(f"Run {run}: position log closed: {path}")
+        except Exception as exc:                       # noqa: BLE001 - reported
+            self.get_logger().error(f"Run {run}: closing the log failed: {exc}")
+        self.log_file = None
+        self.last_csv = path or ''
+
+        if path:
+            if self.bag_run is not None:
+                # The report waits for the bag: it MOVES the bag into the run
+                # folder, so the recorder must have closed it first. Closing
+                # happens on a worker thread (run_bag.stop_async), which then
+                # starts the report itself.
+                self._bag_end_run(run, path)
+            else:
+                self._spawn_report(run, path)
+        self.publish_run_log()
+
+    def _spawn_report(self, run, path, bag=None):
+        """poslog_report.py <csv> [--bag <dir>] as its own process and session.
+
+        Called from the executor, or from a bag-closing worker thread."""
+        try:
+            import poslog_report
+            cmd = [sys.executable, poslog_report.__file__, path]
+            if bag:
+                cmd += ['--bag', bag]
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True)
+            self.report_procs = [p for p in self.report_procs if p.poll() is None]
+            self.report_procs.append(proc)
+            self.get_logger().info(
+                f"Run {run}: filing the report in the background "
+                f"(Robot_data/{os.path.splitext(os.path.basename(path))[0]}/).")
+        except Exception as exc:                       # noqa: BLE001 - reported
+            extra = f" --bag {bag}" if bag else ""
+            self.get_logger().error(
+                f"Run {run}: report not started ({exc}). The CSV is intact; run "
+                f"`ros2 run blueboat_control poslog_report.py {path}{extra}` later.")
+
+    def publish_run_log(self):
+        if not self.session_mode:
+            return
+        logging = self.log_file is not None and not self.log_file.closed
+        state = {
+            'run': self.log_run,
+            'logging': logging,
+            'csv': self.path if logging else self.last_csv,
+            'layout': 'pinger' if self.use_UWgps else 'no_pinger',
+            # v1.1, additive: the run's ros2bag (section 11). `bag` is the
+            # staging directory while recording, else the previous run's
+            # final path inside its folder.
+            'bag_enabled': self.record_bag,
+            'bag_recording': self.bag_recording,
+            'bag': (self.bag_run.output_dir if self.bag_run is not None
+                    else self.bag_last),
+        }
+        msg = String()
+        msg.data = json.dumps(state)
+        self.run_log_publisher.publish(msg)
+
+    # ======================================================================
+    #  11. RUN BAG  (session_mode and record_bag only)
+    #  One ros2bag per run, written by a separate `ros2 bag record` process
+    #  (run_bag.py). This node never touches bag data: it pre-arms the next
+    #  run's recorder PAUSED while idle, resumes it at run start (no
+    #  discovery gap) and closes it at stop on a worker thread, whose
+    #  callback starts poslog_report to MOVE the bag into the run's folder.
+    # ======================================================================
+
+    def bag_timer_callback(self):
+        if self.bag_shutting_down:
+            return
+        # A run whose recorder could not be resumed yet (pre-armed too late
+        # to be discoverable): resume as soon as its service answers.
+        if self.bag_run is not None:
+            if self.bag_resume_pending:
+                if self.bag_run.alive():
+                    self._bag_try_resume()
+                else:
+                    self.get_logger().error(
+                        f"Run bag: recorder {self.bag_run.node_name} died before "
+                        "recording; starting an unpaused one.")
+                    self._bag_start_unpaused(self.log_run)
+            elif not self.bag_run.alive() and self.bag_recording:
+                self.bag_recording = False
+                self.get_logger().error(
+                    f"Run bag: recorder {self.bag_run.node_name} exited mid-run "
+                    f"(code {self.bag_run.proc.returncode}); the bag so far is "
+                    "kept and filed at stop.", throttle_duration_sec=10.0)
+            return
+
+        now = time.monotonic()
+        if self.bag_armed is not None and not self.bag_armed.alive():
+            self.get_logger().warning(
+                f"Run bag: pre-armed recorder exited (code "
+                f"{self.bag_armed.proc.returncode}); re-arming.")
+            self._bag_drop_armed()
+            self.bag_next_arm = now + 5.0
+        if self.bag_armed is None and self.log_run is None and now >= self.bag_next_arm:
+            try:
+                self.bag_armed, self.bag_armed_client = self._bag_new(paused=True)
+            except OSError as exc:
+                self.bag_next_arm = now + 10.0
+                self.get_logger().error(f"Run bag: cannot start the recorder ({exc}).",
+                                        throttle_duration_sec=30.0)
+
+    def _bag_new(self, paused):
+        """Spawn a recorder into a fresh staging directory (+ its resume client)."""
+        log_dir = cf.ensure_data_dir(self, self.data_root, 'data', 'Robot_data')
+        self.bag_k += 1
+        name = f'blueboat_run_bag_{os.getpid()}_{self.bag_k}'
+        rec = run_bag.RunBagRecorder(run_bag.staging_dir(log_dir, self.bag_k), name)
+        rec.start(paused=paused)
+        client = self.create_client(Resume, rec.resume_service) if paused else None
+        return rec, client
+
+    def _bag_drop_armed(self):
+        rec, client = self.bag_armed, self.bag_armed_client
+        self.bag_armed, self.bag_armed_client = None, None
+        if client is not None:
+            self.destroy_client(client)
+        if rec is not None:
+            rec.stop_async(on_closed=lambda r: shutil.rmtree(r.output_dir, ignore_errors=True))
+
+    def _bag_begin_run(self, run):
+        rec, client = self.bag_armed, self.bag_armed_client
+        self.bag_armed, self.bag_armed_client = None, None
+        if rec is not None and rec.alive():
+            self.bag_run, self.bag_run_client = rec, client
+            self.bag_resume_pending = True
+            self._bag_try_resume()
+            return
+        if rec is not None:
+            if client is not None:
+                self.destroy_client(client)
+            rec.stop_async(on_closed=lambda r: shutil.rmtree(r.output_dir, ignore_errors=True))
+        self.get_logger().warning(
+            f"Run {run}: no pre-armed bag recorder; starting one now - the first "
+            "one to two seconds of the run may be missing from the bag.")
+        self._bag_start_unpaused(run)
+
+    def _bag_start_unpaused(self, run):
+        if self.bag_run_client is not None:
+            self.destroy_client(self.bag_run_client)
+        self.bag_run_client = None
+        if self.bag_run is not None:
+            # A recorder that never got resumed recorded nothing: drop it.
+            self.bag_run.stop_async(
+                on_closed=lambda r: shutil.rmtree(r.output_dir, ignore_errors=True))
+            self.bag_run = None
+        self.bag_resume_pending = False
+        try:
+            self.bag_run, _ = self._bag_new(paused=False)
+            self.bag_recording = True
+        except OSError as exc:
+            self.bag_run = None
+            self.bag_recording = False
+            self.get_logger().error(f"Run {run}: no bag for this run ({exc}).")
+
+    def _bag_try_resume(self):
+        client = self.bag_run_client
+        if client is None or not client.service_is_ready():
+            return
+        self.bag_resume_pending = False
+        rec = self.bag_run
+        future = client.call_async(Resume.Request())
+
+        def done(fut, rec=rec):
+            if rec is not self.bag_run:
+                return
+            if fut.exception() is not None:
+                self.get_logger().error(f"Run bag: resume failed ({fut.exception()}); "
+                                        "starting an unpaused recorder.")
+                self._bag_start_unpaused(self.log_run)
+                return
+            self.bag_recording = True
+            self.get_logger().info(f"Run {self.log_run}: bag recording -> {rec.output_dir}")
+            self.publish_run_log()
+        future.add_done_callback(done)
+
+    def _bag_end_run(self, run, csv_path):
+        """Close this run's recorder off-thread, then file the report with it."""
+        import poslog_report
+        rec, client = self.bag_run, self.bag_run_client
+        self.bag_run, self.bag_run_client = None, None
+        self.bag_resume_pending = False
+        self.bag_recording = False
+        if client is not None:
+            self.destroy_client(client)
+        stem = os.path.splitext(os.path.basename(csv_path))[0]
+        self.bag_last = os.path.join(os.path.dirname(csv_path), stem,
+                                     poslog_report.bag_name(csv_path))
+        # Re-arming waits a moment: the closing recorder and a new one would
+        # otherwise both subscribe to everything at once.
+        self.bag_next_arm = time.monotonic() + 1.0
+
+        def closed(r):
+            self.get_logger().info(
+                f"Run {run}: bag closed (code {r.returncode}"
+                f"{'' if r.has_data() else ', no metadata.yaml - ros2 bag reindex it'}).")
+            self._spawn_report(run, csv_path, bag=r.output_dir)
+
+        def failed(r, exc):
+            self.get_logger().error(f"Run {run}: closing the bag failed ({exc}); "
+                                    f"filing the CSV without it ({r.output_dir}).")
+            self._spawn_report(run, csv_path)
+
+        self.bag_closers = [t for t in self.bag_closers if t.is_alive()]
+        self.bag_closers.append(rec.stop_async(on_closed=closed, on_error=failed))
+
+    def _bag_teardown(self):
+        """Shutdown half of section 11. Returns the open run's bag directory
+        (closed, ready to be filed with its CSV), or None."""
+        self.bag_shutting_down = True
+        run_dir = None
+        if self.bag_run is not None:
+            self.bag_run.stop()
+            run_dir = self.bag_run.output_dir
+            self.bag_run = None
+            self.bag_recording = False
+        if self.bag_armed is not None:
+            self.bag_armed.discard()
+            self.bag_armed = None
+        # Bags of runs already stopped: let their closers finish and start
+        # their reports (own session, so they survive this process).
+        for thread in self.bag_closers:
+            thread.join(timeout=run_bag.SIGINT_WAIT_S + run_bag.SIGTERM_WAIT_S)
+        return run_dir
 
 
 def main():

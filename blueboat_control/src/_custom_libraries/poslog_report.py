@@ -10,6 +10,11 @@ from the header; with or without the two legend rows CSVs carry since
     Robot_data/<csv stem>/
         <csv stem>.csv          the poslog, MOVED here
         <date>-<note>-origin.yaml   its world-frame origin sidecar, MOVED here
+        <date>-<note>-path.yaml     the run's trajectory snapshot, MOVED here
+                                    (run sessions, path runs only - v1.1)
+        <date>-<note>-bag/          the run's ros2bag, MOVED here from its
+                                    hidden staging name (run sessions - v1.1,
+                                    run_bag.py; replay it with bag_replay.py)
         <csv stem>.png          the report
 
 ROS-FREE. numpy is required; matplotlib is imported lazily inside the renderer
@@ -28,6 +33,8 @@ Run it by hand over anything already on disk:
     ros2 run blueboat_control poslog_report.py ~/ros2_ws/data/Robot_data/2026_09_04-14_18_19-poslog.csv
     ros2 run blueboat_control poslog_report.py ~/ros2_ws/data/Robot_data --all
     ... --no-archive     render the PNG beside the CSV, move nothing
+    ... --bag <dir>      also move this ros2bag directory into the run folder
+                         (robot_interface passes the run's staging bag)
 """
 
 import argparse
@@ -113,6 +120,18 @@ def sidecar_path(csv_path):
     characters lands mid-name.
     """
     return re.sub(r"-poslog(-\d+)?\.csv$", r"-origin\1.yaml", str(csv_path))
+
+
+def path_snapshot_path(csv_path):
+    """The `-path.yaml` trajectory snapshot robot_interface copies beside a
+    run-session poslog (same naming rule as the sidecar)."""
+    return re.sub(r"-poslog(-\d+)?\.csv$", r"-path\1.yaml", str(csv_path))
+
+
+def bag_name(csv_path):
+    """The run's bag directory name inside its folder: `<date>-<note>-bag[-N]`."""
+    return re.sub(r"-poslog(-\d+)?\.csv$", r"-bag\1",
+                  os.path.basename(str(csv_path)))
 
 
 def read_origin(csv_path):
@@ -757,14 +776,19 @@ def _plot_table(ax, run, m):
 # Archiving
 # ---------------------------------------------------------------------------
 
-def finalise_run(csv_path, archive=True):
+def finalise_run(csv_path, archive=True, bag=None):
     """Render the report and file the run away. Returns the folder (or the PNG
     path when archiving is off).
 
     Ordering matters and is deliberate:
       1. create the folder            stdlib, cannot fail for a plotting reason
       2. render the PNG into it       optional; a failure here is reported, not raised
-      3. move the CSV and its sidecar so the record is filed even with no picture
+      3. move the CSV, its sidecar and its trajectory snapshot
+                                      so the record is filed even with no picture
+      4. move the run's bag (`bag`, a directory) in as `<date>-<note>-bag`.
+         It is a record like the CSV: moved, never rewritten. A bag whose
+         recorder was killed has no metadata.yaml and is moved all the same
+         (`ros2 bag reindex <dir>` rebuilds it).
 
     The caller may be a `finally` block on a node that is being killed, so
     nothing here may raise for a cosmetic reason.
@@ -790,13 +814,19 @@ def finalise_run(csv_path, archive=True):
     out_png = os.path.join(folder, stem + ".png")
     _render_guarded(csv_path, out_png)
 
-    for source in (csv_path, sidecar_path(csv_path)):
+    for source in (csv_path, sidecar_path(csv_path), path_snapshot_path(csv_path)):
         if not os.path.isfile(source):
             continue
         destination = os.path.join(folder, os.path.basename(source))
         if os.path.exists(destination):
             continue
         shutil.move(source, destination)
+
+    if bag:
+        bag = os.path.abspath(os.path.expanduser(str(bag)))
+        destination = os.path.join(folder, bag_name(csv_path))
+        if os.path.isdir(bag) and not os.path.exists(destination):
+            shutil.move(bag, destination)
 
     return folder
 
@@ -827,6 +857,9 @@ def main(argv=None):
                         help="with a directory: process every *-poslog.csv in it")
     parser.add_argument("--no-archive", action="store_true",
                         help="render the picture beside the CSV; move nothing")
+    parser.add_argument("--bag", default=None,
+                        help="with a single CSV: a ros2bag directory to move "
+                             "into the run folder as <date>-<note>-bag")
     args = parser.parse_args(argv)
 
     target = os.path.abspath(os.path.expanduser(args.target))
@@ -841,11 +874,13 @@ def main(argv=None):
             return 1
     else:
         paths = [target]
+    if args.bag and len(paths) != 1:
+        parser.error("--bag goes with a single CSV, not --all")
 
     failures = 0
     for path in paths:
         try:
-            result = finalise_run(path, archive=not args.no_archive)
+            result = finalise_run(path, archive=not args.no_archive, bag=args.bag)
             print(f"{os.path.basename(path)} -> {result}")
         except (PoslogError, OSError) as exc:
             failures += 1

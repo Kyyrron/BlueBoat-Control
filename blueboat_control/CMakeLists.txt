@@ -50,6 +50,12 @@ install(PROGRAMS src/_custom_libraries/path_stamp.py
 
 install(PROGRAMS src/_custom_libraries/thrust_limits.py
         DESTINATION lib/${PROJECT_NAME})
+# v1.1: the per-run ros2bag recorder process (imported by robot_interface)
+# and the bag replay node (Replay_launch.py).
+install(PROGRAMS src/_custom_libraries/run_bag.py
+        DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS src/bag_replay.py
+        DESTINATION lib/${PROJECT_NAME})
 
 install(PROGRAMS src/robot_interaction/robot_interface.py
         DESTINATION lib/${PROJECT_NAME})
