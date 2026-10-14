@@ -366,8 +366,13 @@ sufficient alone:
 ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: <value>"
 ```
 
-`enable` · `stop` · `override` · `default` · `arm` · `disarm` ·
+`enable` · `stop` · `override` · `default` · `arm` · `disarm` · `rearm` (session only, v1.1) ·
 `move <left> <right> <seconds>`
+
+`arm` only works in `default`: ArduPilot refuses to arm while SERVO1/3 are on RC passthrough
+(Rover pre-arm "no motor, sail or scripting outputs defined"). `rearm` is the session's
+way round it — `default` mapping → arm → `override` again — refused during a run or while the
+E-STOP is latched.
 
 In a run session the runs themselves are driven on their own topic (the station does this):
 
@@ -410,6 +415,20 @@ Launch arguments and defaults: the launch files. What they do not make obvious:
   and `.npy` (`master_control`); between runs `configure` may switch controller, follow mode
   and log note. Needs a `controller_type`. `path_generation` then watches the station's
   session file (`trajectories/.session/run.yaml`), rewritten before every start (§7).
+- **Arm before override** (session only, 2026-10-14, ordered by the user for the superproject's
+  link guardian — an ArduPilot Lua script that drives the boat HOME by itself when the laptop
+  goes silent, which needs the autopilot armed): at connection `robot_interface` goes MANUAL →
+  requests `default` (normal 73/74 mapping, so Rover's pre-arm motor check passes) → arms,
+  retrying every 2 s → requests `override`, then continues exactly as before
+  (`arm_sequence_step`). Our thrust path does not need the autopilot armed (passthrough ignores
+  arming); a failed arm is logged and never blocks the session — after `arm_timeout` (15 s) it
+  proceeds to override, the on-boat script arms the boat itself if it ever has to take over,
+  and the `rearm` token retries. Parameters (additive, interface baseline re-taken):
+  `arm_on_connect` (True; acts only with `session_mode`), `arm_timeout` (15.0 s),
+  `arm_default_timeout` (25.0 s, the bound on `param_set` confirming `default`). The E-STOP
+  still disarms (`full_stop`). Measured against a fake autopilot that refuses to arm on
+  passthrough: connect → default → ARMED → override; `disarm` then `rearm` → the same; an arm
+  always refused → override after `arm_timeout`.
 - **`record_bag`** (default `True`, acts only with `session_mode`; v1.1): one ros2bag per run
   (§6). `robot_interface` also receives `trajectory`, to snapshot a `from_yaml` run's path.
 - **`Replay_launch.py`** (v1.1): `bag` (a run folder or its bag), `world_dir` (empty = stock

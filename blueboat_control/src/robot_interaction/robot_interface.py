@@ -141,6 +141,26 @@ class BlueBoatController(Node):
         self.declare_parameter('session_mode', False)
         self.session_mode = self.get_parameter('session_mode').get_parameter_value().bool_value
 
+        # Link guardian (2026-10-14, run sessions only): arm the autopilot at
+        # connection, BEFORE going to override. ArduPilot refuses to arm while
+        # SERVO1/3 sit on RC passthrough (Rover pre-arm: "no motor, sail or
+        # scripting outputs defined"), so the sequence is MANUAL -> 'default'
+        # (normal 73/74 mapping) -> arm -> 'override'. Our thrust path does not
+        # need the autopilot armed (passthrough ignores arming); the on-boat
+        # guardian script (superproject link_guardian/) does, to drive the boat
+        # home on its own if this laptop goes silent. A failed arm never blocks
+        # the session: the script arms the boat itself when it takes over, and
+        # the 'rearm' token retries between runs.
+        self.declare_parameter('arm_on_connect', True)
+        self.arm_on_connect = (self.session_mode and
+                               self.get_parameter('arm_on_connect').get_parameter_value().bool_value)
+        self.declare_parameter('arm_timeout', 15.0)
+        self.arm_timeout = self.get_parameter('arm_timeout').get_parameter_value().double_value
+        # Bound on param_set confirming 'default' (a cold parameter pull over
+        # WiFi is slow; matches param_set's own param_sequence_timeout_s).
+        self.declare_parameter('arm_default_timeout', 25.0)
+        self.arm_default_timeout = self.get_parameter('arm_default_timeout').get_parameter_value().double_value
+
         # Run bags (v1.1, section 11): one ros2bag per run, run sessions only.
         self.declare_parameter('record_bag', True)
         self.record_bag = (self.session_mode and
@@ -232,6 +252,13 @@ class BlueBoatController(Node):
         # dropping out of override.
         self.estopped = False
         self.motors_disabled_logged = False
+
+        # Arm-before-override sequence state (session only, see arm_on_connect):
+        # None (idle) / 'default' (waiting for the normal mapping) / 'arming'.
+        self.arm_seq = None
+        self.arm_seq_t0 = 0.0
+        self.last_arm_tx = 0.0
+        self.run_running = False        # session: master_control reports a run
 
         self.timer = self.create_timer(0.05, self.timer_callback)
         self.log_timer = self.create_timer(0.33, self.log_timer_callback) # 3 times per seconds 
@@ -381,19 +408,16 @@ class BlueBoatController(Node):
                 self.SetMode('MANUAL')
                 return
 
+            # Session: arm the autopilot first (link guardian), then override.
+            if self.arm_on_connect and not self.arm_sequence_step():
+                self.maintain_param_handshake()
+                return
+
             self.request_param_mode('override')
 
             self.init = True
 
-        ################## Handshake maintenance ##################
-        # Re-send the mode request until param_set confirms it. This closes the
-        # discovery race that used to make the launch hang at random.
-        if (self.desired_param_mode is not None
-                and self.mode != self.desired_param_mode
-                and time.time() - self.last_param_tx > self.param_retry_period):
-            self.get_logger().info(f"Waiting for param mode '{self.desired_param_mode}' (current: '{self.mode}'), re-requesting...")
-            self.last_param_tx = time.time()
-            self.publish(String(), self.desired_param_mode, self.param_publisher)
+        self.maintain_param_handshake()
 
         # Wait for direct control to be enabled
         if self.mode != 'override':
@@ -462,6 +486,96 @@ class BlueBoatController(Node):
                 self.thr_watchdog_tripped = False
                 self.get_logger().info("/thruster_input resumed - releasing watchdog.")
             self.manualMove(self.thruster_input)        
+
+    def maintain_param_handshake(self):
+        """Re-send the mode request until param_set confirms it. This closes the
+        discovery race that used to make the launch hang at random."""
+        if (self.desired_param_mode is not None
+                and self.mode != self.desired_param_mode
+                and time.time() - self.last_param_tx > self.param_retry_period):
+            self.get_logger().info(f"Waiting for param mode '{self.desired_param_mode}' (current: '{self.mode}'), re-requesting...")
+            self.last_param_tx = time.time()
+            self.publish(String(), self.desired_param_mode, self.param_publisher)
+
+    def arm_sequence_step(self):
+        """One tick of the session's arm-before-override sequence.
+
+        MANUAL is already set. Request the 'default' mapping (73/74, so Rover's
+        pre-arm motor check can pass), arm, and report True once done - armed,
+        or given up after a bounded wait. Giving up is not fatal: the session
+        proceeds to override as before, and the on-boat guardian arms the boat
+        itself if it ever has to take over.
+        """
+        now = time.time()
+        log = self.get_logger()
+        if self.arm_seq is None:
+            if self.robot_state.armed:
+                log.info("Autopilot already armed - going to override.")
+                return True
+            self.arm_seq = 'default'
+            self.arm_seq_t0 = now
+            log.info("Link guardian: arming the autopilot before override "
+                     "(normal thruster mapping first, ArduPilot refuses to arm on passthrough).")
+            self.request_param_mode('default')
+            return False
+
+        if self.arm_seq == 'default':
+            if self.mode == 'default':
+                self.arm_seq = 'arming'
+                self.arm_seq_t0 = now
+                self.last_arm_tx = 0.0
+            elif now - self.arm_seq_t0 > self.arm_default_timeout:
+                log.error(f"param_set did not confirm 'default' within {self.arm_default_timeout:.0f} s - "
+                          "continuing to override WITHOUT arming. The link guardian will arm "
+                          "the boat itself if it has to take over; 'rearm' retries.")
+                self.arm_seq = None
+                return True
+            return False
+
+        # 'arming'
+        if self.robot_state.armed:
+            log.info("Autopilot ARMED (HOME = here) - going to override.")
+            self.arm_seq = None
+            return True
+        if now - self.arm_seq_t0 > self.arm_timeout:
+            log.error(f"Autopilot did not arm within {self.arm_timeout:.0f} s (pre-arm checks: GPS fix, "
+                      "EKF, battery - see the PreArm messages). Continuing to override; the link "
+                      "guardian arms the boat itself if it has to take over, and 'rearm' retries "
+                      "between runs.")
+            self.arm_seq = None
+            return True
+        if now - self.last_arm_tx > 2.0:
+            self.last_arm_tx = now
+            self.setArmedStatus(True)
+        return False
+
+    def request_rearm(self):
+        """'rearm': run the arm-before-override sequence again (session only).
+
+        Needed after an E-STOP (which disarms) or a failed arm at connection: in
+        override ArduPilot cannot be armed, so the boat briefly returns to the
+        'default' mapping. Refused during a run (the boat would stop following
+        it) and while the E-STOP is latched.
+        """
+        log = self.get_logger()
+        if not self.session_mode:
+            log.warn("'rearm' is a run-session command; use 'arm' outside a session.")
+            return
+        if self.estopped:
+            log.warn("'rearm' refused: E-STOP latched - release it first.")
+            return
+        if self.run_running or self.log_run is not None:
+            log.warn("'rearm' refused: a run is active - stop it first.")
+            return
+        if self.robot_state.armed:
+            log.info("'rearm': autopilot already armed.")
+            return
+        if not self.init or self.arm_seq is not None:
+            log.info("'rearm': an arm sequence is already in progress.")
+            return
+        log.info("'rearm': re-running the arm-before-override sequence.")
+        self.init = False
+        self.arm_on_connect = True
 
     def thruster_input_stale(self, now):
         """
@@ -601,7 +715,7 @@ class BlueBoatController(Node):
 
     # ======================================================================
     #  4. OPERATOR COMMAND SURFACE
-    #  /blueboat/input_str: enable, stop, override, default, arm, disarm, move.
+    #  /blueboat/input_str: enable, stop, override, default, arm, disarm, rearm, move.
     # ======================================================================
 
     def str_input_callback(self, msg: String):
@@ -625,7 +739,8 @@ class BlueBoatController(Node):
                     'default': lambda: self.request_param_mode('default'),
                     'move': lambda: self.move_callback(input_string),
                     'arm': lambda: self.setArmedStatus(True),
-                    'disarm': lambda: self.setArmedStatus(False)
+                    'disarm': lambda: self.setArmedStatus(False),
+                    'rearm': self.request_rearm
         }
 
         action = dispatch.get(command, lambda: self.move_callback(input_string))
@@ -1253,6 +1368,7 @@ class BlueBoatController(Node):
             return
 
         running = state.get('state') == 'running'
+        self.run_running = running
         run = state.get('run')
         if running and self.log_run != run:
             # A run we are not recording yet (normally the one that just
