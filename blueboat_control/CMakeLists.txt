@@ -54,6 +54,10 @@ install(PROGRAMS src/_custom_libraries/thrust_limits.py
 # and the bag replay node (Replay_launch.py).
 install(PROGRAMS src/_custom_libraries/run_bag.py
         DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS src/_custom_libraries/path_update.py
+        DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS src/_custom_libraries/path_update_log.py
+        DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS src/bag_replay.py
         DESTINATION lib/${PROJECT_NAME})
 

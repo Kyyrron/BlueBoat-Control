@@ -46,6 +46,29 @@ class YamlTrajectory:
         self._y = points[:, 2]
         self._yaw = points[:, 3]
 
+    @classmethod
+    def from_points(cls, points, name: str = "", loop: bool = False) -> "YamlTrajectory":
+        """Build a trajectory from ``[t, x, y, yaw]`` rows already in memory.
+
+        Additive (2026-10-15, live path update): the samples of a
+        ``/blueboat/update_path`` request are evaluated by THIS class, so an
+        updated path is followed exactly as a designer file holding the same
+        samples would be. ``__init__`` is untouched; the attributes set here are
+        the ones it sets, from the same array slices.
+        """
+        points = np.asarray(points, dtype=float)
+        if points.ndim != 2 or points.shape[1] != 4 or len(points) == 0:
+            raise ValueError("No valid points")
+        self = cls.__new__(cls)
+        self.name = str(name)
+        self.loop = bool(loop)
+        self.duration = float(points[-1, 0])
+        self._t = points[:, 0]
+        self._x = points[:, 1]
+        self._y = points[:, 2]
+        self._yaw = points[:, 3]
+        return self
+
     def pose(self, t: float) -> tuple[float, float, float, float, float, float]:
         """Return ``(x, y, z, roll, pitch, yaw)`` at time ``t`` seconds."""
         if self.loop and self.duration > 0:

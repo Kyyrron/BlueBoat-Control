@@ -24,6 +24,14 @@
 # runs a 'configure' may switch controller_type / use_pinger, the MPC solver
 # being built on a worker thread so the loop keeps running. With session_mode
 # false (simulation, CLI) none of this exists and the node behaves as before.
+#
+# LIVE PATH UPDATE (path_source:=replanner, section 7; docs/PATH_UPDATE_*.md).
+# A replanner-owned run holds its path HERE instead of asking /path_request:
+# it starts holding at the boat, takes its first path and every later change
+# through /blueboat/update_path, and composes each reference window locally
+# from that plan -- the governor and the three controllers run unchanged on
+# it. With path_source:=mission (the default, i.e. every fixed mission) the
+# only trace of the feature is /blueboat/path_progress reporting tau.
 # ============================================================================
 
 # ----------------------------------------------------------------------------
@@ -41,6 +49,9 @@
 #   6. RUN SESSION                run_command_callback, _configure, _start_run,
 #                                 _stop_run, _poll_controller_build,
 #                                 _publish_run_state     (session_mode only)
+#   7. LIVE PATH UPDATE           _init_path_update, update_path_callback,
+#                                 _replanner_reference_step, publish_path_progress
+#                                 (path logic itself: _custom_libraries/path_update.py)
 #
 # Moved out of this file:
 #   inRobotFrame()  ->  _custom_libraries/frame_math.py   (pure geometry, ROS-free)
@@ -72,10 +83,13 @@ from visualization_msgs.msg import Marker
 import ur_mpc
 import PID
 from blueboat_interfaces.srv import RequestPath
+from blueboat_interfaces.srv import UpdatePath
+from geometry_msgs.msg import PoseStamped
 import custom_functions as cf
 import frame_math as fm         # pure world<->body geometry (ROS-free)
 import path_stamp as ps         # /path_request response tag (ROS-free)
 import thrust_limits as tl     # uniform thrust saturation (ROS-free)
+import path_update as pu        # live path update core (ROS-free)
 
 
 def _wrap(a):
@@ -288,6 +302,10 @@ class Controller(Node):
         # paid once, visibly, at launch, and a failure kills the node where the
         # operator can see it instead of hanging the control loop.
         self._build_controller()
+
+        # Live path update (section 7). Last, so every piece of state it reads
+        # exists. Inert in a fixed-mission run apart from the progress topic.
+        self._init_path_update()
 
     # ------------------------------------------------------------------ #
     #  Controller construction                                           #
@@ -815,7 +833,12 @@ class Controller(Node):
         ## Update path (parameter-governed, NOT wall-clock)
         # Only during a run: an idle session neither requests nor advances the
         # path (always true outside a session, where a run is always active).
-        if not self.use_pinger and self.run_active:
+        # A replanner-owned run (section 7) composes its window from its own
+        # plan instead of /path_request; everything else is the block below.
+        if self.path_source == 'replanner' and not self.use_pinger and self.run_active:
+            self._replanner_reference_step(current_time, current_state,
+                                           manual_active, arrow_active)
+        elif not self.use_pinger and self.run_active:
             # Collect a completed request
             if self.future is not None and self.future.done():
                 try:
@@ -998,6 +1021,17 @@ class Controller(Node):
                 world_target = _reference_pose(self.controller_path)
                 u = self.los_guidance(target, current_state)
         
+        elif self.run_active and self._awaiting_hold_active():
+            # A replanner-owned run before its first path (section 7): hold the
+            # pose captured at the start with the manual-target keep-location
+            # law -- the station's field-used "hold where released" -- until
+            # /blueboat/update_path loads a path. Arrows and a manual target
+            # still come first (branches above).
+            hx, hy, hyaw = self.path_updater.hold
+            world_target = [hx, hy, hyaw]  # --- world-frame monitoring target ---
+            target = fm.inRobotFrame(current_state, [hx, hy, 0, 0, 0, 0])
+            u = self.solve_LoS(target, current_time, keep_location=True)
+
         elif self.run_active and self.use_pinger and self.pinger_target is not None: # MPC is not supported for this
             # --- world-frame monitoring target ---
             px, py = float(self.pinger_target[0]), float(self.pinger_target[1])
@@ -1065,7 +1099,7 @@ class Controller(Node):
 
         # Update and save monitoring metrics to be graphed later
         if (self.controller_path.poses or (self.use_pinger and self.pinger_target is not None)
-                or manual_active or arrow_active):
+                or manual_active or arrow_active or self._awaiting_hold_active()):
             x_m   = current_state[0]
             y_m   = current_state[1]
             psi_m = current_state[2]
@@ -1344,9 +1378,14 @@ class Controller(Node):
         thrusts = self.los_allocator.allocate(np.array([X, 0.0, N]))
         return thrusts
 
-    def solve_LoS(self, target, current_time):
+    def solve_LoS(self, target, current_time, keep_location=None):
         # POINT line-of-sight (used for pinger / manual targets, body frame).
         # Unchanged from the working version.
+        #
+        # keep_location: None (every existing call) derives the manual-target
+        # variant from self.manual_target exactly as before; True selects it
+        # explicitly -- the awaiting-path hold of a replanner run (section 7),
+        # which reuses the manual-target law without being an operator target.
         x,y,z = target
 
         bearing = np.arctan2(y, x)
@@ -1355,7 +1394,10 @@ class Controller(Node):
         v = self.k_v * d
         v = 5*np.log(v+1)
 
-        manual = list(self.manual_target) != [0.0,0.0]
+        if keep_location is None:
+            manual = list(self.manual_target) != [0.0,0.0]
+        else:
+            manual = bool(keep_location)
         if manual:
             v = 10*np.log(v+1) if not self.isSimulation else 7*np.log(v+1)  # If manual target, go faster. Don't need to be that precise here.
 
@@ -1747,6 +1789,17 @@ class Controller(Node):
         if ctype == 'MPC' and use_pinger:
             self._answer(cmd, False, "MPC does not support pinger following - choose PID or LoS")
             return
+        # Live path update (section 7), additive: absent = unchanged.
+        path_source = str(cmd.get('path_source', self.path_source))
+        if path_source not in pu.PATH_SOURCES:
+            self._answer(cmd, False, f"unknown path_source '{path_source}' "
+                                     f"(one of {', '.join(pu.PATH_SOURCES)})")
+            return
+        if path_source == 'replanner' and use_pinger:
+            self._answer(cmd, False, "a replanner run follows paths, not the pinger - "
+                                     "set use_pinger false or path_source 'mission'")
+            return
+        self.path_source = path_source
 
         self.run_note = str(cmd.get('note', self.run_note))
         self.run_mission = str(cmd.get('mission', self.run_mission))
@@ -1867,6 +1920,9 @@ class Controller(Node):
         self.run_t0 = time.time()
         self.run_active = True
         self.run_status = 'running'
+        # Live path update (section 7): a new run never inherits a path; a
+        # replanner run starts holding at the boat, awaiting its first path.
+        self._path_update_reset('run_started')
         follow = 'pinger' if self.use_pinger else 'path'
         self.get_logger().info(
             f"RUN {self.run_number} STARTED - {ctrl}, {follow} following"
@@ -1894,6 +1950,8 @@ class Controller(Node):
         self.future = None
         self.request_sent = None
         self.path_rx_time = None
+        # Live path update (section 7): the run's path ends with the run.
+        self._path_update_reset('run_stopped')
 
         self.get_logger().info(
             f"RUN {self.run_number} STOPPED - controller log {self.title}.npy written; "
@@ -1915,10 +1973,266 @@ class Controller(Node):
             'mission': self.run_mission,
             'run': self.run_number,
             'npy': f"{self.title}.npy" if self.title else '',
+            # Live path update (section 7), additive: robot_interface skips the
+            # -path.yaml snapshot of a replanner run (it follows no file).
+            'path_source': self.path_source,
         }
         msg = String()
         msg.data = json.dumps(state)
         self.run_state_publisher.publish(msg)
+
+    # ======================================================================
+    #  7. LIVE PATH UPDATE  (BlueBoat-Replanner entry point)
+    #  docs/PATH_UPDATE_DESIGN.md (why) / docs/PATH_UPDATE_INTERFACE.md (the
+    #  contract). Every decision is taken by _custom_libraries/path_update.py
+    #  from a snapshot of this node's state; this section only wires it:
+    #
+    #    /blueboat/update_path        (UpdatePath.srv)   in   every launch
+    #    /blueboat/path_progress      (String JSON)      out  10 Hz + on change
+    #    /blueboat/path_update_event  (String JSON)      out  one per event
+    #
+    #  A run is either a FIXED MISSION (path_source 'mission', the default:
+    #  /path_request as ever, every request refused 'mission_owned') or
+    #  REPLANNER-OWNED ('replanner'): it starts holding at the boat, its first
+    #  path and every change come through the service, and its reference
+    #  window is composed here from that plan. Run boundaries (launch, start,
+    #  stop) discard the plan. Safety and operator controls are never touched:
+    #  a request is refused while they are engaged.
+    # ======================================================================
+
+    def _init_path_update(self):
+        """Declare the feature's parameters and interfaces (all additive)."""
+        self.declare_parameter('path_source', 'mission')
+        self.path_source = self.get_parameter('path_source').get_parameter_value().string_value
+        if self.path_source not in pu.PATH_SOURCES:
+            msg = (f"unknown path_source '{self.path_source}' "
+                   f"(one of {', '.join(pu.PATH_SOURCES)})")
+            self.get_logger().fatal(msg)
+            raise ValueError(msg)
+        if self.path_source == 'replanner' and self.use_pinger:
+            msg = ("path_source:=replanner follows paths, not the pinger: launch "
+                   "with use_pinger:=false or path_source:=mission")
+            self.get_logger().fatal(msg)
+            raise ValueError(msg)
+
+        def dbl(name, default):
+            self.declare_parameter(name, float(default))
+            return self.get_parameter(name).get_parameter_value().double_value
+
+        def integer(name, default):
+            self.declare_parameter(name, int(default))
+            return self.get_parameter(name).get_parameter_value().integer_value
+
+        # Thresholds and their derivations: docs/PATH_UPDATE_DESIGN.md D-4.
+        cfg = pu.Config(
+            gov_Lmax=self.gov_Lmax,
+            hold_speed=self.hold_speed,
+            lead_factor=dbl('path_update_lead_factor', 1.0),
+            pos_tol=dbl('path_update_pos_tol', 0.20),
+            heading_tol=dbl('path_update_heading_tol', math.radians(10.0)),
+            heading_coherence=dbl('path_update_heading_coherence', math.radians(45.0)),
+            max_speed=dbl('path_update_max_speed', 2.0),
+            # Worst-case handling measured at 2.2 ms for 20 000 samples
+            # (design doc, real-time safety) -- 10 % of the 20 Hz tick budget at
+            # most, and 2.8 h of path at 0.5 s sample spacing.
+            max_points=integer('path_update_max_points', 20000))
+        period = dbl('path_progress_period', 0.1)
+
+        self.path_updater = pu.PathUpdater(cfg)
+        self.path_progress_publisher = self.create_publisher(String, '/blueboat/path_progress', 10)
+        self.path_event_publisher = self.create_publisher(String, '/blueboat/path_update_event',
+                                                          QoSProfile(depth=50))
+        self.update_path_service = self.create_service(UpdatePath, '/blueboat/update_path',
+                                                       self.update_path_callback)
+        self.path_progress_timer = self.create_timer(period, self.publish_path_progress)
+
+        # Outside a session the launch is the run.
+        self._path_update_reset('launch')
+        self.get_logger().info(
+            f"Live path update: path_source={self.path_source}"
+            + (" - holding at the start pose until /blueboat/update_path loads "
+               "the first path." if self.path_source == 'replanner' else
+               " (fixed mission; /blueboat/update_path answers 'mission_owned')."))
+
+    def _path_update_context(self):
+        """A snapshot of the state a path-update decision depends on."""
+        if self.arrow_active:
+            override = 'arrow'
+        elif list(self.manual_target) != [0.0, 0.0]:
+            override = 'manual'
+        else:
+            override = 'none'
+        boat = None
+        if self.current_pose is not None:
+            boat = (float(self.current_pose[0]), float(self.current_pose[1]),
+                    float(self.current_pose[5]))
+        now = time.time()
+        if self.session_mode:
+            run_time = now - self.run_t0 if self.run_t0 is not None else None
+        else:
+            run_time = now - self.initial_time if self.initial_time is not None else None
+        return pu.Context(
+            # Not ready until the first ready tick has run: that tick sets
+            # tau = 0 (timer_callback, time_set), which must never overwrite
+            # the t[0] a first path has just set.
+            ready=bool(self.ready and self.time_set), session_mode=bool(self.session_mode),
+            run_active=bool(self.run_active), path_source=self.path_source,
+            use_pinger=bool(self.use_pinger), override=override,
+            tau=float(self.tau),
+            path_time=float(getattr(self, 'path_time', self.dt)),
+            path_steps=int(getattr(self, 'path_steps', 2)),
+            dt=float(self.dt), run=int(self.run_number), boat=boat,
+            ros_time=self.get_time(), wall_time=now, run_time=run_time)
+
+    def _awaiting_hold_active(self):
+        """A replanner run holding at its start pose, before its first path."""
+        return (self.path_source == 'replanner' and not self.use_pinger
+                and self.path_updater.awaiting and self.path_updater.hold is not None)
+
+    def _capture_hold(self):
+        x, y, yaw = (float(self.current_pose[0]), float(self.current_pose[1]),
+                     float(self.current_pose[5]))
+        self.path_updater.set_hold((x, y, yaw))
+        if list(self.manual_target) == [0.0, 0.0]:
+            # The keep-location state is shared with the manual-target branch;
+            # start the hold from a clean slate (an operator target, which
+            # outranks this hold, keeps its own).
+            self.manual_hold = False
+            self.manual_brake_t0 = None
+        self.get_logger().info(
+            f"Awaiting the first path: holding at ({x:.2f}, {y:.2f}), "
+            f"yaw {yaw:.3f} rad.")
+        self.publish_path_progress()
+
+    def _path_update_reset(self, reason):
+        """Discard the plan at a run boundary (launch / start / stop)."""
+        event = self.path_updater.reset(self._path_update_context(), reason)
+        if self.path_updater.awaiting and self.current_pose is not None:
+            self._capture_hold()
+        if event is not None:
+            self._publish_path_event(event)
+        self.publish_path_progress()
+
+    def update_path_callback(self, request, response):
+        """/blueboat/update_path: answer every request, change nothing on a refusal."""
+        started = time.perf_counter()
+        req = pu.Request(id=request.id, change_point=request.change_point,
+                         frame=request.frame, t=np.asarray(request.t, dtype=float),
+                         x=np.asarray(request.x, dtype=float),
+                         y=np.asarray(request.y, dtype=float),
+                         yaw=np.asarray(request.yaw, dtype=float))
+        try:
+            answer, event, new_tau = self.path_updater.handle(req, self._path_update_context())
+        except Exception as exc:                       # noqa: BLE001 - reported, never fatal
+            # A defect here must not take the controller down: refuse, keep
+            # everything as it was, and say so loudly.
+            self.get_logger().error(f"/blueboat/update_path: internal error "
+                                    f"{type(exc).__name__}: {exc} - request refused.")
+            response.accepted = False
+            response.reason = pu.BAD_REQUEST
+            response.message = f"internal error: {type(exc).__name__}: {exc}"
+            response.active_id = self.path_updater.active_id or ''
+            response.tau = float(self.tau)
+            response.min_change_point = float('nan')
+            return response
+
+        if new_tau is not None:
+            # First path: tau jumps to its first sample (the hold pose, D-5);
+            # the awaiting hold ends and path following takes over next tick.
+            self.tau = float(new_tau)
+            if list(self.manual_target) == [0.0, 0.0]:
+                self.manual_hold = False
+                self.manual_brake_t0 = None
+
+        handling_ms = (time.perf_counter() - started) * 1e3
+        event['handling_ms'] = handling_ms
+        response.accepted = bool(answer['accepted'])
+        response.reason = str(answer['reason'])
+        response.message = str(answer['message'])
+        response.active_id = str(answer['active_id'])
+        response.tau = float(answer['tau'])
+        response.min_change_point = float(answer['min_change_point'])
+
+        if response.accepted:
+            self.get_logger().info(
+                f"Path update '{request.id}' ACCEPTED: {response.message} "
+                f"[{handling_ms:.2f} ms]")
+        else:
+            self.get_logger().warning(
+                f"Path update '{request.id}' refused ({response.reason}): "
+                f"{response.message}")
+        self._publish_path_event(event)
+        self.publish_path_progress()
+        return response
+
+    def _replanner_reference_step(self, current_time, current_state, manual_active, arrow_active):
+        """The replanner-run counterpart of the /path_request block in
+        timer_callback: compose the window at tau from the plan, advance the
+        governor on it exactly as that block does, report transitions."""
+        updater = self.path_updater
+        if updater.awaiting or not updater.plan:
+            if updater.awaiting and updater.hold is None and self.current_pose is not None:
+                self._capture_hold()
+            self.controller_path = Path()       # the awaiting-hold branch drives
+            return
+
+        ctx = self._path_update_context()
+        params, xs, ys, yaws = updater.window(ctx)
+        self.controller_path = self._compose_window(params, xs, ys, yaws)
+        self.path_rx_time = current_time        # composed now: always fresh
+
+        # The governor, as in the request block: frozen while a manual target
+        # or arrow control overrides path following.
+        if not (manual_active or arrow_active):
+            e_along, e_y, _, _ = self.path_progress_errors(self.controller_path, current_state)
+            self.advance_governor(e_along, e_y)
+
+        events = updater.tick(self._path_update_context())
+        for event in events:
+            self._publish_path_event(event)
+            self.get_logger().info(f"Path update: {event['message']}")
+        if events:
+            self.publish_path_progress()
+
+    @staticmethod
+    def _compose_window(params, xs, ys, yaws):
+        """A nav_msgs/Path exactly as path_generation would answer it: frame
+        'world', yaw-only quaternion, each pose stamped with its parameter."""
+        path = Path()
+        path.header.frame_id = 'world'
+        quats = R.from_euler('zyx', np.column_stack(
+            [yaws, np.zeros_like(yaws), np.zeros_like(yaws)])).as_quat()
+        for t, x, y, q in zip(params, xs, ys, quats):
+            pose = PoseStamped()
+            pose.header.frame_id = 'world'
+            sec, nanosec = ps.encode(t)
+            pose.header.stamp.sec = sec
+            pose.header.stamp.nanosec = nanosec
+            pose.pose.position.x = float(x)
+            pose.pose.position.y = float(y)
+            pose.pose.position.z = 0.0
+            pose.pose.orientation.x = float(q[0])
+            pose.pose.orientation.y = float(q[1])
+            pose.pose.orientation.z = float(q[2])
+            pose.pose.orientation.w = float(q[3])
+            path.poses.append(pose)
+        return path
+
+    def publish_path_progress(self):
+        try:
+            payload = self.path_updater.progress(self._path_update_context())
+        except Exception as exc:                       # noqa: BLE001 - reported
+            self.get_logger().error(f"/blueboat/path_progress: {type(exc).__name__}: {exc}",
+                                    throttle_duration_sec=10.0)
+            return
+        msg = String()
+        msg.data = json.dumps(payload)
+        self.path_progress_publisher.publish(msg)
+
+    def _publish_path_event(self, event):
+        msg = String()
+        msg.data = json.dumps(event)
+        self.path_event_publisher.publish(msg)
 
 
 rclpy.init()

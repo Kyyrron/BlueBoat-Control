@@ -128,6 +128,13 @@ def path_snapshot_path(csv_path):
     return re.sub(r"-poslog(-\d+)?\.csv$", r"-path\1.yaml", str(csv_path))
 
 
+def pathlog_path(csv_path):
+    """The `-pathlog.csv` live-path-update log written beside a poslog
+    (path_update_log.py; same naming rule as the sidecar). Absent for any run
+    that never received a path update request."""
+    return re.sub(r"-poslog(-\d+)?\.csv$", r"-pathlog\1.csv", str(csv_path))
+
+
 def bag_name(csv_path):
     """The run's bag directory name inside its folder: `<date>-<note>-bag[-N]`."""
     return re.sub(r"-poslog(-\d+)?\.csv$", r"-bag\1",
@@ -783,7 +790,8 @@ def finalise_run(csv_path, archive=True, bag=None):
     Ordering matters and is deliberate:
       1. create the folder            stdlib, cannot fail for a plotting reason
       2. render the PNG into it       optional; a failure here is reported, not raised
-      3. move the CSV, its sidecar and its trajectory snapshot
+      3. move the CSV, its sidecar, its trajectory snapshot and its
+         path-update log (when they exist)
                                       so the record is filed even with no picture
       4. move the run's bag (`bag`, a directory) in as `<date>-<note>-bag`.
          It is a record like the CSV: moved, never rewritten. A bag whose
@@ -814,7 +822,8 @@ def finalise_run(csv_path, archive=True, bag=None):
     out_png = os.path.join(folder, stem + ".png")
     _render_guarded(csv_path, out_png)
 
-    for source in (csv_path, sidecar_path(csv_path), path_snapshot_path(csv_path)):
+    for source in (csv_path, sidecar_path(csv_path), path_snapshot_path(csv_path),
+                   pathlog_path(csv_path)):
         if not os.path.isfile(source):
             continue
         destination = os.path.join(folder, os.path.basename(source))

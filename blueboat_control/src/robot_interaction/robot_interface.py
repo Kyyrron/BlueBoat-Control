@@ -83,6 +83,7 @@ import custom_functions as cf
 import robot_log_schema as rls   # CSV column layout (ROS-free, _custom_libraries/)
 import thrust_limits as tl       # uniform thrust saturation (ROS-free)
 import run_bag                   # per-run ros2bag recorder process (ROS-free)
+import path_update_log as pul    # the run's -pathlog.csv (live path update, ROS-free)
 
 # RC override channel conventions (MAVLink / mavros)
 CHAN_RELEASE = 0        # give the channel back to the RC receiver
@@ -211,6 +212,11 @@ class BlueBoatController(Node):
         self.uw_gps_sub = self.create_subscription(Float32MultiArray,'/uw_gps_data', self.uw_gps_callback,10)
         self.target_sub = self.create_subscription(Float32MultiArray,'/controller_target', self.target_callback,10)
         self.thruster_input_sub = self.create_subscription(Float32MultiArray, "/thruster_input", self.thr_input_callback,10)
+        # Live path update (master_control section 7): every request, answer
+        # and path transition becomes a row of the run's -pathlog.csv. Inert
+        # unless master_control publishes an event.
+        self.path_event_sub = self.create_subscription(
+            String, '/blueboat/path_update_event', self.path_event_callback, QoSProfile(depth=50))
 
         # Run sessions: follow master_control's run state, report the log's.
         if self.session_mode:
@@ -324,8 +330,15 @@ class BlueBoatController(Node):
         self.log_run = None             # session: the run whose CSV is open
         self.last_csv = ''              # session: the previous run's CSV
         self.report_procs = []          # session: report subprocesses spawned
+        # Live path update log: one per run, beside the CSV, created only when
+        # the run receives a request (path_update_log.PathLog), never for the
+        # pinger layout.
+        self.pathlog = None
+        self.pathlog_pending = []       # session: events of a run not opened yet
+        self.run_path_source = 'mission'
         if not self.session_mode:
             self.open_position_log(self.note)
+            self._open_pathlog()
         else:
             self.get_logger().info(
                 "Run session: no position log until a run is started "
@@ -1321,6 +1334,10 @@ class BlueBoatController(Node):
                 self.get_logger().info(f"Position log closed: {self.path}")
         except Exception as exc:                       # noqa: BLE001 - teardown
             self.get_logger().error(f"Shutdown: closing the log failed: {exc}")
+        try:
+            self._close_pathlog()
+        except Exception as exc:                       # noqa: BLE001 - teardown
+            self.get_logger().error(f"Shutdown: closing the path-update log failed: {exc}")
 
         # 4b. Close the bags BEFORE anything moves them (section 11). The
         #     recorder shares this process group, so a launch teardown has
@@ -1357,6 +1374,60 @@ class BlueBoatController(Node):
     #  confirm that a run is actually being recorded.
     # ======================================================================
 
+    # ------------------------------------------------------------------ #
+    #  Live path update log (master_control section 7)                    #
+    # ------------------------------------------------------------------ #
+    def _open_pathlog(self, run=None):
+        """Attach this run's -pathlog.csv writer (the file itself is created
+        lazily, at the first request event). None for the pinger layout."""
+        self._close_pathlog()
+        if self.use_UWgps or not self.path:
+            self.pathlog = None
+            self.pathlog_pending = [e for e in self.pathlog_pending if e.get('run') != run]
+            return
+        self.pathlog = pul.PathLog(pul.pathlog_path(self.path))
+        if run is not None:
+            # Events of this run that arrived before its run_state did.
+            held = [e for e in self.pathlog_pending if e.get('run') == run]
+            self.pathlog_pending = [e for e in self.pathlog_pending if e.get('run') != run]
+            for event in held:
+                self._write_path_event(event)
+
+    def _close_pathlog(self):
+        if self.pathlog is None:
+            return
+        log, self.pathlog = self.pathlog, None
+        log.close()
+        if log.rows:
+            self.get_logger().info(f"Path-update log closed ({log.rows} rows): {log.path}")
+
+    def _write_path_event(self, event):
+        if self.pathlog is None:
+            return
+        try:
+            self.pathlog.write_event(event)
+        except OSError as exc:
+            self.get_logger().error(f"Path-update log not written: {exc}",
+                                    throttle_duration_sec=10.0)
+
+    def path_event_callback(self, msg: String):
+        try:
+            event = json.loads(msg.data)
+            if not isinstance(event, dict):
+                raise ValueError("not a JSON object")
+        except ValueError as exc:
+            self.get_logger().error(f"/blueboat/path_update_event: unreadable ({exc}) - ignored.",
+                                    throttle_duration_sec=10.0)
+            return
+        if not self.session_mode:
+            self._write_path_event(event)
+        elif self.log_run is not None and event.get('run') == self.log_run:
+            self._write_path_event(event)
+        else:
+            # A run whose log is not open (yet): its run_state has not arrived.
+            self.pathlog_pending.append(event)
+            del self.pathlog_pending[:-100]
+
     def run_state_callback(self, msg: String):
         try:
             state = json.loads(msg.data)
@@ -1370,6 +1441,8 @@ class BlueBoatController(Node):
         running = state.get('state') == 'running'
         self.run_running = running
         run = state.get('run')
+        # Additive key (live path update): a replanner run follows no file.
+        self.run_path_source = str(state.get('path_source', 'mission'))
         if running and self.log_run != run:
             # A run we are not recording yet (normally the one that just
             # started; also a new run whose stop we missed).
@@ -1401,6 +1474,7 @@ class BlueBoatController(Node):
             self.get_logger().error(f"Run {run}: cannot open the position log: {exc}")
             return
         self.log_run = run
+        self._open_pathlog(run)
         self.get_logger().info(
             f"Run {run}: logging ({'pinger' if use_pinger else 'no-pinger'} layout).")
         if self.record_bag:
@@ -1416,6 +1490,11 @@ class BlueBoatController(Node):
         a copy a run's path is lost at the next start. A pinger run has none
         (its target, the pinger, is in the bag). Never fatal: the CSV and the
         bag are the record, this is a convenience for replay."""
+        if self.run_path_source == 'replanner':
+            # Its path comes from /blueboat/update_path, not from the station
+            # file: a copy of that file would misstate what was followed. The
+            # run's -pathlog.csv and its bag record the actual path changes.
+            return
         traj = self.trajectory
         if not traj.startswith('from_yaml:'):
             return
@@ -1447,6 +1526,7 @@ class BlueBoatController(Node):
             self.get_logger().error(f"Run {run}: closing the log failed: {exc}")
         self.log_file = None
         self.last_csv = path or ''
+        self._close_pathlog()
 
         if path:
             if self.bag_run is not None:

@@ -374,6 +374,18 @@ at the boat for a non-anchored mission, GPS-deployed otherwise — §4), so the 
 is the new path's start. `stop` returns to idle. Outside a session a run is always active and
 none of this exists.
 
+**Live path update** (`path_source:=replanner`, 2026-10-15; `docs/PATH_UPDATE_DESIGN.md`).
+A *replanner-owned* run replaces the map: it does not call `/path_request` at all. Its path
+is a list of segments of `[t, x, y, yaw]` samples sent on `/blueboat/update_path` (each
+evaluated by `YamlTrajectory.from_points`, i.e. exactly the `from_yaml` rule of §4), and
+`master_control` composes the window `linspace(τ, τ+path_time, path_steps)` from it locally,
+every tick. Everything from §5 on -- τ, the governor, the controllers -- is unchanged. Before
+its first path the run holds at the boat with the manual-target keep-location law. An update
+may only replace the path from a change point at least `max(path_time + 2·dt,
+gov_Lmax/U_d)` ahead of τ, and only if it starts on the current path (0.20 m, 10°); progress
+is τ itself, published on `/blueboat/path_progress`. Fixed missions (`path_source:=mission`,
+the default) are bit-identical to before (`test/mc_harness.py --compare`).
+
 ---
 
 ## 7. One complete tick, start to finish

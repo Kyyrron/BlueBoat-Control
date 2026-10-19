@@ -10,6 +10,7 @@ sl_pinger = sl.declare_arg('use_pinger', default_value = False)                 
 sl_fcu = sl.declare_arg('fcu_url', default_value = 'udp://:14550@192.168.2.2:14550') # MAVROS <-> autopilot endpoint. Port 14550 is also QGroundControl's default listen port: a running QGC takes it first and mavros fails to bind, which shows up as an intermittent launch failure. Close QGC, or move this launch to another port.
 sl_data = sl.declare_arg('data_dir', default_value = '')                       # Root for run artifacts (position CSV, controller .npy). Empty resolves to $BLUEBOAT_DATA_DIR, else the sourced workspace root.
 sl_session = sl.declare_arg('session_mode', default_value = False)             # Run session (the Mission Control Station passes true): connect and idle; path/pinger following and logging only between run start/stop on /blueboat/run_command, one CSV + .npy per run. Needs a controller_type. False = the classic one-launch-one-mission behaviour.
+sl_path_source = sl.declare_arg('path_source', default_value = 'mission')       # 'mission' = follow `trajectory` (today's behaviour). 'replanner' = live path update: each run holds at the boat until /blueboat/update_path loads its first path. In a run session `configure` may switch it per run (docs/PATH_UPDATE_INTERFACE.md).
 sl_bag = sl.declare_arg('record_bag', default_value = True)                     # Run sessions only (v1.1): record one ros2bag per run (every topic except the side-scan sonar) into the run's Robot_data/<stem>/ folder. A separate `ros2 bag record` process, pre-armed paused between runs.
 
 def launch_setup():
@@ -58,6 +59,7 @@ def launch_setup():
                             'use_pinger': sl_pinger,
                             'data_dir': sl_data,
                             'session_mode': sl_session,
+                            'path_source': sl_path_source,
                             'use_sim_time': False})
 
         # A run session can switch between path and pinger following between

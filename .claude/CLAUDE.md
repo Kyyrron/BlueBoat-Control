@@ -8,8 +8,12 @@ trajectory library, τ and the governor) and `FIELD_TUNING.md` (what each contro
 that target in practice: every tuning knob, real/sim defaults, symptom→knob index).
 `log_reviewer/README.md` covers the desktop log-reading app (§9). Nested `CLAUDE.md` files
 load when working in their directory: `blueboat_control/src/CLAUDE.md` (controller and thrust-path
-evidence behind §4–§5), `blueboat_description/CLAUDE.md` (§8), `log_reviewer/CLAUDE.md` (§9). The module carries no open
-backlog; §6 records the data caveats that survive it.
+evidence behind §4–§5), `blueboat_description/CLAUDE.md` (§8), `log_reviewer/CLAUDE.md` (§9).
+The **live path update** (2026-10-15, the BlueBoat-Replanner entry point, §4) has its own
+documents in `docs/`: `PATH_UPDATE_DESIGN.md` (why), `PATH_UPDATE_INTERFACE.md` (the
+contract a client codes against), `REFERENCES.md`, `REQUESTS.md` (what other modules need),
+`PATH_UPDATE_REAL_WATER_TEST.md`. Open items: `.claude/TODO.md` (re-opened 2026-10-15 for
+this feature's follow-ups); §6 records the data caveats.
 
 ---
 
@@ -156,6 +160,19 @@ right for the control law (the velocities come from differencing the two) and wr
 log, and using it made `x_d`/`y_d` the pose at `tau + path_time` on `PID`/`LoS` and the pose
 at `tau` on `MPC`.
 
+**N10 — A path update never touches safety or operator state.** `/blueboat/update_path`
+(§4) changes only the reference of a **replanner-owned** run. It never re-enables motors,
+releases an E-STOP, starts/restarts a run or releases a manual target / arrow control, and it
+is **refused** while any of them is engaged (`not_ready`, `no_run`, `operator_override`). A
+refusal changes nothing. Any new code path that lets an update act on readiness, the motor
+gate, `run_active`, `manual_target` or `arrow_active` violates this.
+
+**N11 — Fixed missions stay bit-identical.** `path_source=mission` (the default, every MCS
+launch today) must behave exactly as before the live path update existed. The proof is
+`test/mc_harness.py --compare <rev>`: /thruster_input, /monitoring_data and tau bit-identical
+tick by tick for PID/LoS/MPC on fixed missions, manual target, arrows and run sessions (21/21
+on 2026-10-15). Run it after any change to `master_control.py`.
+
 ---
 
 ## 2. Interface — the authoritative contract
@@ -180,7 +197,7 @@ which is why the sources import each other as bare modules (`import custom_funct
 
 | Executable | Source path under `blueboat_control/` | Node name | Purpose |
 |---|---|---|---|
-| `master_control.py` | `src/` | `master_control` (ns `blueboat`) | The controller: MPC / PID / LoS |
+| `master_control.py` | `src/` | `master_control` (ns `blueboat`) | The controller: MPC / PID / LoS; serves `/blueboat/update_path` (live path update, §4) |
 | `simulation_interface.py` | `src/` | `pid_sim` (ns `blueboat`) | Gazebo thrust bridge via `ROV`; sim-side readiness; the position CSV (no-pinger layout) |
 | `robot_interface.py` | `src/robot_interaction/` | `blueboat_controller` | MAVROS bridge, thrust→PWM, odom republish, CSV logging |
 | `param_set.py` | `src/robot_interaction/` | `blueboat_parameter_control` | SERVO function + GCS sysid remapping; watchdogged so it can never latch busy |
@@ -193,7 +210,8 @@ which is why the sources import each other as bare modules (`import custom_funct
 
 `custom_functions.py` (shared helpers incl. `data_root`, `compute_target`) imports ROS;
 `frame_math.py`, `robot_log_schema.py`, `thrust_limits.py`, `path_stamp.py`,
-`poslog_report.py` and `run_bag.py` (all `src/_custom_libraries/`) are **ROS-free by construction** — numpy
+`poslog_report.py`, `run_bag.py`, `path_update.py` (the live path update's every decision) and
+`path_update_log.py` (the run's `-pathlog.csv`) (all `src/_custom_libraries/`) are **ROS-free by construction** — numpy
 only, or no imports at all — so the geometry and the CSV format are debuggable from a plain
 Python prompt with no sourced workspace. Keep them that way; anything needing `rclpy` belongs
 in `custom_functions.py` instead.
@@ -266,6 +284,9 @@ superproject `.claude/CLAUDE.md` §4.1, which loads in every session here.
 | `/blueboat/run_command` | `std_msgs/String` (JSON) | in | `master_control` — run session only | Mission Control Station: `configure` / `start` / `stop` |
 | `/blueboat/run_state` | `std_msgs/String` (JSON) | out | `master_control` — run session only | Mission Control Station (ack + 1 Hz heartbeat) |
 | `/blueboat/run_log` | `std_msgs/String` (JSON) | out | `robot_interface` — run session only | Mission Control Station (the run's CSV, 1 Hz heartbeat) |
+| `/blueboat/update_path` | service `blueboat_interfaces/srv/UpdatePath` | in | `master_control` — every launch | BlueBoat-Replanner, MCS (future), `test/path_update_demo.py`: live path update (§4) |
+| `/blueboat/path_progress` | `std_msgs/String` (JSON `blueboat_path_progress/1`) | out | `master_control` — every launch, 10 Hz + on change | Replanner, MCS: tau, state, following/active ids, `min_change_point` |
+| `/blueboat/path_update_event` | `std_msgs/String` (JSON `blueboat_path_update_event/1`), reliable depth 50 | out | `master_control` | `robot_interface` / `simulation_interface` (the run's `-pathlog.csv`), the bag |
 
 **Run sessions (2026-10-09, ordered by the user).** A real-robot launch from the Mission
 Control Station passes `session_mode:=true`: the four rows above marked "run session only"
@@ -274,10 +295,12 @@ argument expose exactly the v1.0 interface, so the asymmetry is deliberate (oper
 plumbing, not a sensor interface; superproject §4.1 / CM-2). The JSON contracts:
 
 ```
-run_command  {"cmd":"configure","controller_type":"PID|LoS|MPC","use_pinger":b,"note":s,"mission":s,"seq":n}
+run_command  {"cmd":"configure","controller_type":"PID|LoS|MPC","use_pinger":b,"note":s,"mission":s,"seq":n,
+              "path_source":"mission|replanner"}                     # path_source: 2026-10-15, optional, additive
              {"cmd":"start","seq":n}   {"cmd":"stop","seq":n}
 run_state    {"seq":n,"ok":b,"detail":s,"state":"idle|loading|running|error","controller_type":s,
-              "use_pinger":b,"note":s,"mission":s,"run":n,"npy":path}
+              "use_pinger":b,"note":s,"mission":s,"run":n,"npy":path,
+              "path_source":s}                                       # 2026-10-15, additive
 run_log      {"run":n|null,"logging":b,"csv":path,"layout":"no_pinger|pinger",
               "bag_enabled":b,"bag_recording":b,"bag":path}          # bag_*: v1.1, additive
 ```
@@ -330,6 +353,10 @@ FCU endpoint: `BlueBoat_launch.py`'s `fcu_url` (default `udp://:14550@192.168.2.
 **port 14550 collides with a running QGroundControl** — superproject §4.4).
 
 ### 2.5 Service
+
+`/blueboat/update_path` — `blueboat_interfaces/srv/UpdatePath` (2026-10-15, additive): the
+live path update, served by `master_control`; contract in `docs/PATH_UPDATE_INTERFACE.md`,
+summary in §4.
 
 `/path_request` — `blueboat_interfaces/srv/RequestPath`.
 Request: `std_msgs/Float32MultiArray path_request`, an array of **path-parameter values**.
@@ -429,6 +456,9 @@ Launch arguments and defaults: the launch files. What they do not make obvious:
   still disarms (`full_stop`). Measured against a fake autopilot that refuses to arm on
   passthrough: connect → default → ARMED → override; `disarm` then `rearm` → the same; an arm
   always refused → override after `arm_timeout`.
+- **`path_source`** (default `mission`; 2026-10-15): `replanner` makes runs **replanner-owned**
+  (live path update, §4) — in both launch files, and per run through `configure` in a
+  session. `replanner` with `use_pinger` is a FATAL at launch and refused at `configure`.
 - **`record_bag`** (default `True`, acts only with `session_mode`; v1.1): one ros2bag per run
   (§6). `robot_interface` also receives `trajectory`, to snapshot a `from_yaml` run's path.
 - **`Replay_launch.py`** (v1.1): `bag` (a run folder or its bag), `world_dir` (empty = stock
@@ -449,6 +479,19 @@ Launch arguments and defaults: the launch files. What they do not make obvious:
 ```bash
 python3 .claude/tools/interface_inventory.py --check .claude/tools/interface_baseline.json  # 0 = unchanged, 2 = moved
 QT_QPA_PLATFORM=offscreen python3 log_reviewer/smoke_test.py                                # 121 checks, ~25 s
+```
+
+Since 2026-10-15, `test/` (module root, outside the guard's scan) also holds the live path
+update's gates -- house pattern, plain scripts with exit codes, pytest-compatible:
+
+```bash
+/usr/bin/python3 test/test_path_update.py         # ROS-free core: every code, junctions, determinism (102 checks)
+/usr/bin/python3 test/test_path_update_log.py     # ROS-free pathlog + filing (24 checks)
+# deterministic tick-level harness (ROS sourced + install + venv for MPC):
+python3 test/mc_harness.py --compare HEAD         # N11: fixed missions bit-identical vs HEAD (21 runs)
+python3 test/mc_harness.py --replanner            # offline replanner scenarios, all controllers
+python3 test/gazebo_path_update.py --replanner --out-dir /tmp/gz   # Gazebo, headless
+python3 temp/quick_mpc_path_change.py             # TEMPORARY: one MPC sim, one good + one refused change (temp/README.md)
 ```
 
 The interface guard (stdlib only, ~0.15 s, also a `PostToolUse` hook) statically extracts
@@ -512,6 +555,18 @@ real/sim default and the symptom→knob table: `FIELD_TUNING.md`; reference gene
   without an early return so `/thruster_input` and the `.npy` keep flowing.
   `mpc_qp_iter_max` 0 derives the qpOASES working-set budget as `max(50, 4·nu·N)` — acados'
   default 50 sits below the simulation horizon's 60 variables.
+- **Live path update (2026-10-15, ordered by the user; `docs/PATH_UPDATE_*.md`).** A run is
+  **fixed-mission** (`path_source=mission`, today) or **replanner-owned** (`replanner`). A
+  replanner run holds its own path (`path_update.PathPlan`, segments evaluated by
+  `YamlTrajectory.from_points`) and never calls `/path_request`: it starts holding at the boat
+  (manual-target keep-location law, `solve_LoS(keep_location=True)`), takes its first path and
+  every change through `/blueboat/update_path`, and composes each window locally
+  (`_replanner_reference_step`) — governor and controllers unchanged. Acceptance, in order:
+  state gate (`not_ready`, `no_run`, `mission_owned`, `operator_override`), request validity,
+  change-point range, lead `c ≥ τ + max(path_time + 2·dt, gov_Lmax/U_d)`, continuity at c
+  (0.20 m, 10°; heading skipped where the reference is stationary). Run boundaries clear the
+  plan. Thresholds: `path_update_*` parameters. Measured (offline, 20 000-sample cap): request
+  handling ≤ 2.2 ms worst case, window composition ~0.13 ms per tick. N10, N11.
 - **Reference generation** advances `tau` from the boat's measured progress (N8): the
   governor's factors are clipped to `[0, 1]` and multiplied, so `tau` is monotonic and never
   faster than authored speed — nothing may scale `tau_dot` above unity. `fac_cross` is **off by
@@ -617,7 +672,8 @@ Evidence (tables, measurements, proofs) for each item: `blueboat_control/src/CLA
 | Position/pinger CSV | `<root>/data/Robot_data/{date}-{note}-poslog.csv` | **Raw field record — never overwrite or regenerate.** Written by `robot_interface` in a real-robot run and by `simulation_interface` in Gazebo |
 | Controller monitoring | `<root>/data/{ctrl}_data/{date}-{ctrl}_{sim}_data.npy` | Per-run result |
 | Run bag (v1.1) | `<root>/data/Robot_data/<csv stem>/{date}-{note}-bag/` (mcap) | **Raw field record**, run sessions only: every topic except `/side_scan_sonar/*`, `/sss_processor/*`, `/sss_ai/*` (the `.svlog` is the sonar's record) |
-| Path snapshot (v1.1) | `<root>/data/Robot_data/<csv stem>/{date}-{note}-path.yaml` | Copy of a path run's `from_yaml` mission (`blueboat_trajectory/1`) |
+| Path snapshot (v1.1) | `<root>/data/Robot_data/<csv stem>/{date}-{note}-path.yaml` | Copy of a path run's `from_yaml` mission (`blueboat_trajectory/1`); **not** written for a replanner run (it follows no file) |
+| Path-update log (2026-10-15) | `<root>/data/Robot_data/<csv stem>/{date}-{note}-pathlog.csv` | **Raw field record.** One row per `/blueboat/path_update_event` (request + answer, activation, end, clear); 3 header rows like the poslog (`path_update_log.LEGEND`); written by `robot_interface` / `simulation_interface`, filed by `poslog_report`. Exists only if the run received a request; never for the pinger layout |
 
 **One file per run in a run session.** Outside a session both files are claimed at node
 construction, one per launch. In a session (`session_mode:=true`) nothing is claimed until a

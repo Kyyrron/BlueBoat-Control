@@ -1,0 +1,20 @@
+# Live path update -- replace the rest of a replanner-owned run's path, or load
+# its first path. Served by master_control on /blueboat/update_path, identically
+# in simulation and on the real boat. Contract: BlueBoat-Control
+# docs/PATH_UPDATE_INTERFACE.md.
+
+string id                 # unique among this run's ACCEPTED updates, [A-Za-z0-9._:-]{1,64}
+float64 change_point      # path seconds from which the new samples replace the path;
+                          # NaN (or t[0]) for the first path of a run
+string frame              # must be "world": /blueboat/odom local ENU
+float64[] t               # path seconds (tau axis), strictly increasing (>= 1 ms steps), >= 0
+float64[] x               # m, East
+float64[] y               # m, North
+float64[] yaw             # rad, ENU (CCW from East), the path tangent
+---
+bool accepted
+string reason             # "ok", or a refusal code
+string message            # human-readable detail (measured gap, required lead, ...)
+string active_id          # id owning the remainder of the path after this call ('' = none)
+float64 tau               # path parameter at decision time (after a first path: t[0])
+float64 min_change_point  # earliest change point that would be accepted now (NaN if none)

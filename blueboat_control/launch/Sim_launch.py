@@ -11,6 +11,7 @@ sl_controller = sl.declare_arg('controller_type', default_value = 'MPC')        
 sl_data = sl.declare_arg('data_dir', default_value = '')                        # Root for the position CSV and the controller .npy log. Empty resolves to $BLUEBOAT_DATA_DIR, else the sourced workspace root.
 sl_note = sl.declare_arg('note', default_value = 'sim')                         # Goes into the position-log file name, exactly as on the real boat.
 sl_spawn_yaw = sl.declare_arg('spawn_yaw', default_value = 0.)                  # Boat spawn heading, RADIANS ENU (0 = East). Spawn stays at (0,0).
+sl_path_source = sl.declare_arg('path_source', default_value = 'mission')       # 'mission' = follow `trajectory` (today's behaviour). 'replanner' = live path update: hold at the spawn pose until /blueboat/update_path loads the first path (docs/PATH_UPDATE_INTERFACE.md).
 
 
 def _path_window(trajectory):
@@ -83,7 +84,8 @@ def launch_setup():
                 'master_control.py',
                 parameters={'controller_type' : sl_controller,
                             'simulation' : True,
-                            'data_dir': sl_data})
+                            'data_dir': sl_data,
+                            'path_source': sl_path_source})
 
         return sl.launch_description()
 

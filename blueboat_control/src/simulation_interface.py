@@ -45,6 +45,7 @@ from rclpy.executors import ExternalShutdownException
 import rclpy
 
 # Common python libraries
+import json
 import os
 import re
 import time
@@ -53,6 +54,7 @@ import numpy as np
 
 # ROS2 msg libraries
 from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import String
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import NavSatFix
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy, ReliabilityPolicy
@@ -62,6 +64,7 @@ from blueboat_control import ROV
 import custom_functions as cf
 import robot_log_schema as rls   # CSV column layout (ROS-free, _custom_libraries/)
 import thrust_limits as tl       # uniform thrust saturation (ROS-free)
+import path_update_log as pul    # the run's -pathlog.csv (live path update, ROS-free)
 
 class Controller(Node):
 
@@ -123,6 +126,12 @@ class Controller(Node):
         gps_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.gps_sub = self.create_subscription(
             NavSatFix, '/mavros/global_position/global', self.gps_callback, gps_qos)
+        # Live path update (master_control section 7): the same -pathlog.csv
+        # robot_interface writes on the real boat (N2 / CM-2). Inert unless
+        # master_control publishes an event.
+        self.path_event_sub = self.create_subscription(
+            String, '/blueboat/path_update_event', self.path_event_callback,
+            QoSProfile(depth=50))
 
         latched = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.ready_publisher = self.create_publisher(Bool, '/blueboat/controller_ready', latched)
@@ -206,6 +215,10 @@ class Controller(Node):
         self.log_file.flush()
         self.origin_written = False
         self.get_logger().info(f"Position log: {self.path}")
+        # The run's path-update log, beside the CSV; the file only comes into
+        # existence with the first path update request (lazy, see
+        # path_update_log.PathLog). Simulation is never the pinger layout.
+        self.pathlog = pul.PathLog(pul.pathlog_path(self.path))
 
     # ======================================================================
     #  2. MAIN LOOP
@@ -522,6 +535,22 @@ class Controller(Node):
     #  failure in one cannot skip the ones after it.
     # ======================================================================
 
+    def path_event_callback(self, msg: String):
+        """One /blueboat/path_update_event -> one row of the -pathlog.csv."""
+        try:
+            event = json.loads(msg.data)
+            if not isinstance(event, dict):
+                raise ValueError("not a JSON object")
+        except ValueError as exc:
+            self.get_logger().error(f"/blueboat/path_update_event: unreadable ({exc}) - ignored.",
+                                    throttle_duration_sec=10.0)
+            return
+        try:
+            self.pathlog.write_event(event)
+        except OSError as exc:
+            self.get_logger().error(f"Path-update log not written: {exc}",
+                                    throttle_duration_sec=10.0)
+
     def shutdown(self):
         # 1. Thrusters first, always. rov.parsed() is False until the URDF has
         #    arrived on robot_description, and ROV.move indexes its (empty)
@@ -548,6 +577,14 @@ class Controller(Node):
                 self.get_logger().info(f"Position log closed: {self.path}")
         except Exception as exc:                       # noqa: BLE001 - teardown
             self.get_logger().error(f"Shutdown: closing the log failed: {exc}")
+        try:
+            if getattr(self, 'pathlog', None) is not None:
+                self.pathlog.close()
+                if self.pathlog.rows:
+                    self.get_logger().info(
+                        f"Path-update log closed ({self.pathlog.rows} rows): {self.pathlog.path}")
+        except Exception as exc:                       # noqa: BLE001 - teardown
+            self.get_logger().error(f"Shutdown: closing the path-update log failed: {exc}")
 
         # 4. Mission report. Imported HERE, not at module scope: matplotlib is
         #    not declared in package.xml and must never be able to stop this
