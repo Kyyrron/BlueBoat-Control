@@ -14,8 +14,8 @@ module had no backlog since the v1.0 freeze.
   started from the CLI, without the station's safety UI.
 - [ ] **BlueBoat-SSS-Sim `full_mission_launch.py`** should pass `path_source` (R-3).
   Built-world simulations cannot run replanner-owned runs yet.
-- [ ] **Superproject root CLAUDE.md**: apply the rows and the D8 entry in `docs/REQUESTS.md`
-  R-4. The user applies it; sessions do not edit the root interface tables.
+- [x] **Superproject root CLAUDE.md**: the rows and the D8 entry of `docs/REQUESTS.md` R-4
+  were applied on 2026-10-19 by the user's order.
 - [ ] **Optional plan visualisation topic** (R-5), only if MCS/GCS ask. Nothing draws an
   updated path's geometry today. `/set_path` and bag replay show the run-start path.
 - [ ] **Real-boat MPC with path updates.** Not to be tried until the real-boat MPC solve time

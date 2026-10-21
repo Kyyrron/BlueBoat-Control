@@ -31,13 +31,13 @@ Fortress names (loaded through Harmonic's deprecated-name shim — superproject 
 |---|---|---|
 | `blueboat_control` | ament_cmake (+ `ament_python_install_package`) | All nodes, controllers, trajectories, launch files |
 | `blueboat_description` | ament_cmake | URDF/xacro, meshes, Gazebo world and spawn launch (§8) |
-| `blueboat_interfaces` | ament_cmake (rosidl) | `srv/RequestPath.srv`, `msg/OmniscanProfile.msg`, `msg/ProcessedSSSPing.msg` |
+| `blueboat_interfaces` | ament_cmake (rosidl) | `srv/RequestPath.srv`, `srv/UpdatePath.srv` (2026-10-15, additive), `msg/OmniscanProfile.msg`, `msg/ProcessedSSSPing.msg` |
 
 A fourth top-level directory, **`log_reviewer/`**, is not a package at all — a standalone
 PySide6 desktop app for reading recorded missions, carrying a `COLCON_IGNORE` so a workspace
 build skips it. See §9.
 
-All three `blueboat_interfaces` definitions are registered in one `rosidl_generate_interfaces`
+All four `blueboat_interfaces` definitions are registered in one `rosidl_generate_interfaces`
 call. `OmniscanProfile.pwr_results` is `uint16[]`; the two `.msg` files serve the sonar
 project and no node in this module publishes or subscribes them.
 
@@ -445,7 +445,9 @@ Launch arguments and defaults: the launch files. What they do not make obvious:
 - **Arm before override** (session only, 2026-10-14, ordered by the user for the superproject's
   link guardian — an ArduPilot Lua script that drives the boat HOME by itself when the laptop
   goes silent, which needs the autopilot armed): at connection `robot_interface` goes MANUAL →
-  requests `default` (normal 73/74 mapping, so Rover's pre-arm motor check passes) → arms,
+  requests `default` (normal 73/74 mapping, so Rover's pre-arm motor check passes) → waits
+  ~3.5 s disarmed (Rover sets the thrusters' ±1000 output range only in its 1 Hz loop while
+  disarmed; armed earlier, idle can come out at full reverse — 2026-10-20) → arms,
   retrying every 2 s → requests `override`, then continues exactly as before
   (`arm_sequence_step`). Our thrust path does not need the autopilot armed (passthrough ignores
   arming); a failed arm is logged and never blocks the session — after `arm_timeout` (15 s) it

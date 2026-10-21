@@ -1,17 +1,27 @@
 # Merged side-scan sonar ping after slant-range correction.
 #
-# Produced by sss_processor_node from a port + starboard OmniscanProfile pair.
+# Produced by sss_processor_node from the port and starboard OmniscanProfile
+# of one ping, paired by the per-device ping counter normalised by the two
+# units' constant counter offset. A row may carry ONE side only: the absent
+# side has *_ping_number = 0, a zeroed *_stamp and empty *_intensity_db / *_y.
+# Test presence with *_ping_number != 0, never with array length (a present
+# side can legitimately yield an empty array when the altitude covers the
+# whole swath). Side identity comes from the packet (channel_number, else the
+# sign of transducer_heading_deg), never from the topic.
 # The processor:
 #   - converts raw u16 power samples to dB
 #   - estimates transducer altitude above seabed via First-Bottom-Return (FBR)
-#     detection across pings (10-ping bootstrap before first publish)
+#     detection across pings. Altitude never withholds a ping: before the
+#     tracker locks it uses a provisional or last-known value, and 0.0
+#     (ground range = slant range) when nothing was ever detected
 #   - applies slant-range correction, assuming flat seabed locally to each ping
 #     (altitude is allowed to vary from ping to ping — non-flat across pings)
 #   - drops water-column samples (slant range < altitude)
 #   - tags every remaining sample with its y-coordinate in the robot frame at
 #     ping time
 #
-# The robot pose at ping time is snapped to the nearest /blueboat/odom sample.
+# The robot pose at ping time is snapped to the nearest /blueboat/odom sample
+# within 1 s; a ping with no such sample is dropped (the only drop).
 # The frame label is "base_link" for documentation only — no TF is published
 # in this project; downstream consumers read pose via /blueboat/odom directly.
 
@@ -22,8 +32,9 @@ uint32 port_ping_number
 uint32 starboard_ping_number
 
 # --- Robot state at ping time -----------------------------------------------
-# Origin-relative pose, snapshotted from /blueboat/odom at the matched-pair
-# stamp (nearest-sample lookup). x/y in meters, origin = boot-time anchor.
+# Origin-relative pose, snapshotted from /blueboat/odom at the row's stamp
+# (nearest-sample lookup). x/y in meters in /blueboat/odom's local ENU frame:
+# origin = the boat at launch (real) or the Gazebo world origin (sim).
 float32 robot_x
 float32 robot_y
 geometry_msgs/Quaternion robot_orientation

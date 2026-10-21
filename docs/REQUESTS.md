@@ -78,6 +78,8 @@ Nothing else is needed. The simulator's acquisition and sea-state paths are unaf
 
 ## R-4 Superproject root `.claude/CLAUDE.md` — interface tables (for the user to apply)
 
+**Status 2026-10-19: applied** by the user's order. The rows went into root §4.1 (plus a §4.2 note), the §3 paragraph into root §3, and D8 into root §6. The pathlog went into the `file-interfaces` skill's mission-report row. The `/blueboat/update_path` row names today's clients honestly: only this module's tests. The replanner and an MCS Replanner mode do not exist yet.
+
 **§4.1, new rows:**
 
 | Name | Type | Producer → Consumers | Notes |

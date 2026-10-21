@@ -536,7 +536,10 @@ class BlueBoatController(Node):
             if self.mode == 'default':
                 self.arm_seq = 'arming'
                 self.arm_seq_t0 = now
-                self.last_arm_tx = 0.0
+                # Rover applies the +-1000 output range of the 73/74 thrusters only in its
+                # 1 Hz loop while DISARMED; armed earlier, idle can come out at full reverse
+                # (link_guardian/README.md). First arm request ~3.5 s from now (2 s retry).
+                self.last_arm_tx = now + 1.5
             elif now - self.arm_seq_t0 > self.arm_default_timeout:
                 log.error(f"param_set did not confirm 'default' within {self.arm_default_timeout:.0f} s - "
                           "continuing to override WITHOUT arming. The link guardian will arm "

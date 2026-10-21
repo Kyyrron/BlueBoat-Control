@@ -543,9 +543,9 @@ class Controller(Node):
                                 'r': tuple(arr('inner_gains_r', [1.5, 0.0, 0.0]))}
             self.pid_lookahead = dbl('pid_lookahead', 2.5)
         else:
-            self.outer_gains = {'x':   tuple(arr('outer_gains_x',   [6.0, 0.01, 0.0])),
+            self.outer_gains = {'x':   tuple(arr('outer_gains_x',   [8.0, 0.01, 0.0])),
                                 'psi': tuple(arr('outer_gains_psi', [4.0, 0.01, 0.0]))}
-            self.inner_gains = {'u': tuple(arr('inner_gains_u', [2.0, 0.0, 0.0])),
+            self.inner_gains = {'u': tuple(arr('inner_gains_u', [2.5, 0.0, 0.0])),
                                 'r': tuple(arr('inner_gains_r', [2.5, 0.0, 0.0]))}
             self.pid_lookahead = dbl('pid_lookahead', 2.5)
             
