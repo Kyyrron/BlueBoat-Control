@@ -513,6 +513,27 @@ class Controller(Node):
                                  f"values, got {len(value)}")
             return value
 
+        # -- tuning profile (2026-10-21, additive, ordered by the user) -----
+        # Which of the two tuning branches below supplies the defaults. ''
+        # (the default) follows `simulation`, so every launch file gets
+        # exactly what it got before; 'field' flies the real-boat branch --
+        # gains, MPC weights, horizon AND plant model, i.e. what was flown --
+        # in simulation, 'sim' the simulation branch. Only the tuning
+        # defaults follow it: the .npy name, the RViz marker and solve_LoS's
+        # manual-target surge stay on `simulation`.
+        self.declare_parameter('gain_profile', '')
+        profile = self.get_parameter('gain_profile').get_parameter_value().string_value
+        if profile not in ('', 'field', 'sim'):
+            self.get_logger().fatal(
+                f"gain_profile must be '', 'field' or 'sim', got {profile!r}")
+            raise ValueError(f"gain_profile {profile!r}")
+        tuning_sim = self.isSimulation if profile == '' else profile == 'sim'
+        self.tuning_profile = 'sim' if tuning_sim else 'field'
+        if profile:
+            self.get_logger().info(
+                f"gain_profile '{profile}': {self.tuning_profile} tuning branch "
+                f"(simulation={self.isSimulation})")
+
         # -- control loop --------------------------------------------------
         # Load-bearing beyond the gains: the governor rescales with it, and the
         # MPC solve has to finish inside it.
@@ -536,7 +557,7 @@ class Controller(Node):
         self.gov_Emax = dbl('gov_Emax', 0.0)
 
         # -- PID ------------------------------------------------------------
-        if not self.isSimulation:
+        if not tuning_sim:
             self.outer_gains = {'x':   tuple(arr('outer_gains_x',   [3.0, 0.01, 0.0])),
                                 'psi': tuple(arr('outer_gains_psi', [3.0, 0.01, 0.0]))}
             self.inner_gains = {'u': tuple(arr('inner_gains_u', [1.0, 0.0, 0.0])),
@@ -554,7 +575,7 @@ class Controller(Node):
         self.los_ku          = dbl('los_ku', 20.0)
         self.los_kpsi        = dbl('los_kpsi', 10.0)
         self.los_kd          = dbl('los_kd', 1.0)
-        self.los_speed_scale = dbl('los_speed_scale', 1.0 if not self.isSimulation else 2.0)
+        self.los_speed_scale = dbl('los_speed_scale', 1.0 if not tuning_sim else 2.0)
         # Zero-authored-speed hold. A stationary reference (station_keeping, a
         # clamped-out mission, the awaiting-YAML fallback) gives U_d = 0, and
         # neither controller can hold position on one: LoS commands zero surge,
@@ -575,12 +596,12 @@ class Controller(Node):
 
         # -- point following (manual target and pinger) ----------------------
         # Simulation and the real boat have always used different values here.
-        self.k_v   = dbl('point_k_v',   2.0  if self.isSimulation else 0.15)
-        self.k_psi = dbl('point_k_psi', 60.0 if self.isSimulation else 100.0)
+        self.k_v   = dbl('point_k_v',   2.0  if tuning_sim else 0.15)
+        self.k_psi = dbl('point_k_psi', 60.0 if tuning_sim else 100.0)
         # Negative disables the arrival check. Since the manual-target branch
         # got its own keep-location hold below, this governs the PINGER branch
         # only, which is why its defaults are untouched.
-        self.safety_distance = dbl('safety_distance', 1.0 if self.isSimulation else -1.0)
+        self.safety_distance = dbl('safety_distance', 1.0 if tuning_sim else -1.0)
 
         # -- manual-target keep-location hold --------------------------------
         # A reached manual target is a station to hold, not a place to stop.
@@ -624,7 +645,7 @@ class Controller(Node):
         # pre-2026-09-03 behaviour of the manual branch exactly.
         self.manual_hold_radius      = dbl('manual_hold_radius', 1.0)
         self.manual_reacquire_radius = dbl('manual_reacquire_radius', 2.0)
-        self.manual_hold_kx   = dbl('manual_hold_kx', 15.0 if self.isSimulation else 8.0)
+        self.manual_hold_kx   = dbl('manual_hold_kx', 15.0 if tuning_sim else 8.0)
         # Derived by default rather than declared independently, so retuning a
         # radius cannot silently break the handover the gains were chosen for.
         self.manual_hold_umax = dbl(
@@ -673,7 +694,7 @@ class Controller(Node):
         #
         # These are FITTED NUMBERS, not physics: refit them if hydrodynamics.xacro
         # changes, or if missions settle at a cruise speed far from 0.45 m/s.
-        if not self.isSimulation:
+        if not tuning_sim:
             self.mpc_model = {'robot_mass': 16.01,   # blueboat.xacro mass
                               'iz':          5.64,   # blueboat.xacro izz
                               'a_u': -26.77, 'a_v':  -7.55, 'a_r': -21.77,
@@ -696,8 +717,8 @@ class Controller(Node):
         # change that would break the 50 ms budget, and it has never been timed
         # in a real-robot run.
         # Both keep dt = time/horizon at 0.167-0.200 s.
-        self.mpc_horizon = integer('mpc_horizon', 30 if self.isSimulation else 15)
-        self.mpc_time    = dbl('mpc_time', 6.0 if self.isSimulation else 2.5)
+        self.mpc_horizon = integer('mpc_horizon', 30 if tuning_sim else 15)
+        self.mpc_time    = dbl('mpc_time', 6.0 if tuning_sim else 2.5)
 
         self.Q_weight = np.diag(arr('mpc_Q_diag', [50.0,   # x
                                                    50.0,   # y
@@ -717,7 +738,7 @@ class Controller(Node):
         # where PID -- whose demand its own P-gain bounds -- does not. 0.10 in
         # simulation puts the break-even outside the governor's own 0.5 m
         # dead-band.
-        self.R_weight = np.diag(arr('mpc_R_diag', [0.10, 0.10] if self.isSimulation
+        self.R_weight = np.diag(arr('mpc_R_diag', [0.10, 0.10] if tuning_sim
                                                   else [0.015, 0.015]))
 
         # THE QP WORKING-SET BUDGET. FULL_CONDENSING_QPOASES is a dense

@@ -590,7 +590,11 @@ real/sim default and the symptom→knob table: `FIELD_TUNING.md`; reference gene
   `_declare_tuning_parameters` (`ros2 param list /blueboat/master_control` shows the set),
   read once at construction; gain triples are double arrays (no tuple type in ROS 2). Several
   defaults are **split simulation/real** (PID gains, MPC horizon/time/R and its plant model,
-  point gains, `manual_hold_kx` — in N/m, not m/s). Not in `FIELD_TUNING.md`:
+  point gains, `manual_hold_kx` — in N/m, not m/s). **`gain_profile`** (2026-10-21, additive,
+  ordered by the user for BlueBoat-Experiments' AROB 2027 study) chooses that column on its
+  own: `''` (default) follows `simulation`, so every launch is unchanged (`mc_harness.py
+  --compare HEAD` 21/21, interface baseline +1 parameter); `field` flies the real column in
+  Gazebo, plant model included; `sim` the reverse. Only the tuning defaults follow it. Not in `FIELD_TUNING.md`:
   `path_request_timeout` / `path_stale_timeout` (1.0 s each — without the first, one lost
   response wedged the node), `thruster_input_timeout` (0.5 s, both interface nodes),
   `param_sequence_timeout_s` (20 s, `param_set`).

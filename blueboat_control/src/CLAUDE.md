@@ -200,6 +200,7 @@ launch argument rather than an edit and a rebuild. Values are read once, at cons
 | group | parameters |
 |---|---|
 | Control loop | `control_dt` (0.05) |
+| Tuning profile | `gain_profile` (`''`, 2026-10-21): which column of every split default below applies -- `''` follows `simulation`, `field` the real column (MPC plant model included), `sim` the simulation column. Bit-identical when unset (`mc_harness.py --compare HEAD`, 21/21) |
 | Path service health | `path_request_timeout` (1.0 s — re-issue a request whose answer never came; without it one lost response wedged the node for the whole run), `path_stale_timeout` (1.0 s — beyond this the governor stops advancing `tau` against the held window). `path_generation` adds `allow_duplicate_server` (False) and `server_discovery_wait` (2.0 s) |
 | Governor | `path_speed_scale`, `gov_Lmin`, `gov_Lmax`, `gov_Emin`, `gov_Emax` |
 | LoS guidance | `los_lookahead` (2.5), `los_ku` (**20.0**), `los_kpsi` (10.0), `los_kd` (1.0), `los_speed_scale` (1.0 real / 2.0 sim) |

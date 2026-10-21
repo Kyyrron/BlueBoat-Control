@@ -10,7 +10,12 @@ ros2 param list /blueboat/master_control      # the whole set
 ```
 
 Defaults are given **real / sim**, selected by the `simulation` parameter (`Sim_launch.py`
-sets it True). A single value means both are the same. All of them are declared in one place,
+sets it True). A single value means both are the same. **`gain_profile`** (2026-10-21,
+additive) overrides only that choice: `''` (default) follows `simulation`; `field` gives
+every real-column default — the MPC plant model, horizon and R included — in simulation
+(flying the September configuration in Gazebo), `sim` the simulation column on the real
+boat. Explicitly passed knobs still win; the `.npy` name, the RViz marker and `solve_LoS`'s
+manual surge stay on `simulation`. All of them are declared in one place,
 `Controller._declare_tuning_parameters`; the **Used in** column names the method that reads
 it, not a line number — lines move, methods do not.
 
