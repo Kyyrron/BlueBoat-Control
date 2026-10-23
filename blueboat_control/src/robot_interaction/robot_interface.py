@@ -731,7 +731,7 @@ class BlueBoatController(Node):
 
     # ======================================================================
     #  4. OPERATOR COMMAND SURFACE
-    #  /blueboat/input_str: enable, stop, override, default, arm, disarm, rearm, move.
+    #  /blueboat/input_str: enable, stop, override, default, arm, disarm, rearm, manual, move.
     # ======================================================================
 
     def str_input_callback(self, msg: String):
@@ -756,7 +756,14 @@ class BlueBoatController(Node):
                     'move': lambda: self.move_callback(input_string),
                     'arm': lambda: self.setArmedStatus(True),
                     'disarm': lambda: self.setArmedStatus(False),
-                    'rearm': self.request_rearm
+                    'rearm': self.request_rearm,
+                    # Autopilot flight mode back to MANUAL (2026-10-23, additive):
+                    # the station's Turn Off Connection with the link guardian
+                    # OFF, so BlueOS / QGC find the boat in the mode they drive
+                    # it in. Harmless at any time - a session already runs in
+                    # MANUAL (timer_callback's init); it only matters after
+                    # something else (the guardian, a failsafe) changed it.
+                    'manual': lambda: self.SetMode('MANUAL')
         }
 
         action = dispatch.get(command, lambda: self.move_callback(input_string))

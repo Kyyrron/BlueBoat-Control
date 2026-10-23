@@ -394,6 +394,8 @@ ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: <value>"
 ```
 
 `enable` · `stop` · `override` · `default` · `arm` · `disarm` · `rearm` (session only, v1.1) ·
+`manual` (2026-10-23, additive: autopilot flight mode → MANUAL; the station's Turn Off
+Connection sends it after `default` when the link guardian was turned OFF) ·
 `move <left> <right> <seconds>`
 
 `arm` only works in `default`: ArduPilot refuses to arm while SERVO1/3 are on RC passthrough
