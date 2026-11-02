@@ -88,7 +88,6 @@ import rosbag2_py
 from std_msgs.msg import String
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PoseStamped, TransformStamped
-from sensor_msgs.msg import NavSatFix
 from ros_gz_interfaces.msg import Entity
 from ros_gz_interfaces.srv import SetEntityPose
 

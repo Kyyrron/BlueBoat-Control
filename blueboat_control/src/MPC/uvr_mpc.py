@@ -51,10 +51,6 @@ def export_underwater_model(
     r_dot_sym   = ca.SX.sym('r_dot')
     Xdot = ca.vertcat(x_dot_sym, y_dot_sym, psi_dot_sym, u_dot_sym, v_dot_sym, r_dot_sym)
 
-    # Transient vector (tau = B*u)
-    tau_u = ca.SX.sym('tau_u')
-    tau_v = ca.SX.sym('tau_v')
-    tau_r = ca.SX.sym('tau_r')
 
     # Controls
     u1 = ca.SX.sym('u1')
@@ -101,9 +97,6 @@ def export_underwater_model(
 
     # C*nu
     Cnu = ca.mtimes(C, nu)
-
-    # Tau
-    tau = ca.vertcat(tau_u, tau_v, tau_r)
 
     r = 0.295
     l = 0.5
@@ -269,7 +262,7 @@ class MPCController:
         if len(poses) < self.N + 1:
             poses += [poses[-1]] * (self.N + 1 - len(poses))
 
-        x_refs, u_refs = [], []
+        x_refs = []
         
         for i in range(self.N + 1):
             pose = poses[i].pose
@@ -289,7 +282,6 @@ class MPCController:
                 psi = np.unwrap([psi_prev,psi])[-1]
 
                 psi_mid = (psi + psi_prev) / 2.0
-                dx_b =  math.cos(psi_mid) * dx + math.sin(psi_mid) * dy
                 dy_b = -math.sin(psi_mid) * dx + math.cos(psi_mid) * dy
                 v = dy_b / self.dt 
 

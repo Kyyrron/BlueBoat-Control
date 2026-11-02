@@ -12,13 +12,12 @@ downstream) and is removed.
 
 Hull: `mass = 16.01` kg (`blueboat.xacro:18`), `izz = 5.6403125` (`blueboat.xacro:42`).
 `master_control` hands the MPC `robot_mass = 16.01` and `iz = 5.64` — the mass agrees exactly,
-the yaw inertia is the URDF value rounded (0.006 % low). The **hydrodynamics do not agree at
-all**: `hydrodynamics.xacro` carries the BlueROV2 table (`xDotU -5.5`, `xU -25.15`, plus
-quadratic damping the MPC has no term for), while `master_control` passes `a_u = -26.77`,
-`a_v = -7.55`, `a_r = -21.77`, `d_u = -29.34`, `d_v = -51.54`, `d_r = -44.65`
-(`master_control.py:659-662`, the real-boat `mpc_model`). So the Gazebo plant and the MPC's
-internal model share the rigid body and nothing else — an MPC result in simulation is not a
-solver-against-its-own-model result the way the offline harness's is. Thrusters
+the yaw inertia is the URDF value rounded (0.006 % low). `hydrodynamics.xacro` carries the
+BlueROV2 table (`xDotU -5.5`, `xU -25.15`, plus quadratic damping). `master_control`'s
+**simulation** `mpc_model` is fitted to it (added mass = the xacro values, damping = secant
+linearisations of its quadratic drag, `_declare_tuning_parameters`); the **real-boat** column
+(`a_u = -26.77` … `d_r = -44.65`, provenance unknown) shares only the rigid body. Even in
+simulation the MPC's linear-damping model is an approximation of the plant, not the plant. Thrusters
 sit at `x = -0.488`, `y = ∓0.295`, `z = -0.025`, with `thruster1` on the starboard side (§5).
 `thrusters_ur` (2 thrusters) is the default; `thrusters_uvr` (3) exists and is marked not
 functional.

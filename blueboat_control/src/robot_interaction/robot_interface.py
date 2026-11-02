@@ -1,57 +1,36 @@
 #!/usr/bin/env python3
 
 # ============================================================================
-# MAVROS bridge, thrust -> PWM, pose re-zeroing, pinger dead reckoning and the
-# position CSV. Two things here are easy to get wrong and are commented at the
-# point they happen rather than here:
+# MAVROS bridge: thrust -> PWM over RC override, pose re-zeroing to the launch
+# point, pinger dead reckoning, the position CSV, and in a run session the
+# per-run CSV / report / ros2bag.
 #
-#   * THRUST SATURATION IS UNIFORM, NOT PER-SIDE (manualMove, section 3). The
-#     two thrusters carry one wrench, so clipping each independently rewrites
-#     the command instead of clamping it -- [+45, +18] became [+20, +18], which
-#     collapses the turn and makes the boat diverge. See thrust_limits.py.
-#   * ONE CSV WRITER, BOTH LAYOUTS (section 8). The pinger layout used to be
-#     written from uw_gps_callback, so a Water Linked dropout stopped recording
-#     the robot too. That callback now only caches; the timer owns the file.
-#   * RUN SESSIONS (session_mode:=true, section 10). No CSV is opened at
-#     launch: one is opened per RUN, when master_control's /blueboat/run_state
-#     says a run started, and closed + filed when it ends. Outside a session
-#     the single launch-long CSV is exactly as before.
-#   * RUN BAGS (v1.1, section 11). Each run also gets a ros2bag of every
-#     non-SSS topic, written by a SEPARATE `ros2 bag record` process
-#     (run_bag.py) pre-armed paused between runs and resumed at run start.
-#     This node only starts, resumes and stops it -- never a byte of bag data.
+#   * Thrust saturation is UNIFORM, not per-side (manualMove, thrust_limits.py).
+#   * ONE CSV writer for both layouts (log_timer_callback); uw_gps_callback only
+#     caches, so a Water Linked dropout never stops the robot's log. Column
+#     layout and actuation_state encoding: robot_log_schema.py (filled by name).
+#   * Run sessions (session_mode:=true): one CSV per run, opened and closed
+#     from master_control's /blueboat/run_state; outside a session one CSV per
+#     launch. Run bags come from a separate `ros2 bag record` process
+#     (run_bag.py) that this node only starts, resumes and stops.
 #
-# Column layout, its revision history and the actuation_state encoding live in
-# _custom_libraries/robot_log_schema.py. Rows are filled BY COLUMN NAME so the
-# two can never desynchronise.
+# FILE MAP (class BlueBoatController):
+#   1. WIRING               __init__, open_position_log
+#   2. MAIN LOOP / SAFETY   timer_callback, arm sequence, watchdog, full_stop
+#   3. THRUST -> PWM        manualMove                   <-- calibration, N4 gate
+#   4. OPERATOR COMMANDS    str_input_callback, move_callback, request_param_mode
+#   5. POSE / PINGER        odom_callback                <-- frame re-zeroing
+#   6. INBOUND TELEMETRY    imu_, gps_, state_, uw_gps_, target_, thr_input_,
+#                           monitoring_data_, param_, mode_
+#   7. MAVROS PLUMBING      set_servo, send_rc_override, setArmedStatus, SetMode
+#   8. CSV LOGGING          log_timer_callback
+#   9. SHUTDOWN             shutdown
+#  10. RUN SESSION          run_state_callback, open_run_log, close_run_log,
+#                           publish_run_log, path-update log
+#  11. RUN BAG              bag_timer_callback, _bag_begin_run, _bag_end_run,
+#                           _bag_teardown
 # ============================================================================
 
-# ----------------------------------------------------------------------------
-# FILE MAP (class BlueBoatController) -- sections are banner-commented below.
-#
-#   1. WIRING                     __init__
-#   2. MAIN LOOP AND SAFETY       timer_callback, thruster_input_stale, full_stop
-#   3. THRUST -> PWM              manualMove                   <-- calibration, N4 gate
-#   4. OPERATOR COMMANDS          str_input_callback, move_callback,
-#                                 request_param_mode
-#   5. POSE / PINGER              odom_callback                <-- frame re-zeroing
-#   6. INBOUND TELEMETRY          imu_, gps_, state_, uw_gps_, target_,
-#                                 thr_input_, monitoring_data_, param_, mode_
-#   7. MAVROS PLUMBING            set_servo, send_rc_override, setArmedStatus,
-#                                 SetMode, set_motors, publish
-#   8. CSV LOGGING                log_timer_callback
-#   9. SHUTDOWN                   shutdown
-#  10. RUN SESSION                run_state_callback, open_run_log,
-#                                 close_run_log, publish_run_log
-#  11. RUN BAG                    bag_timer_callback, _bag_begin_run,
-#                                 _bag_end_run, _bag_teardown
-#
-# Moved out of this file:
-#   CSV column layout  ->  _custom_libraries/robot_log_schema.py  (data only,
-#                          ROS-free; write-once field-data contract, CM-7)
-# ----------------------------------------------------------------------------
-
-# Common libraries import
 import json
 import os
 import re
@@ -62,133 +41,87 @@ import time
 from datetime import datetime
 import numpy as np
 
-# ROS2 import
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, QoSDurabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 
-# msg import
 from std_msgs.msg import String, Bool, Float32MultiArray
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, NavSatFix
 from mavros_msgs.msg import State, OverrideRCIn
-
-# srv import
-from mavros_msgs.srv import CommandBool, SetMode
-from mavros_msgs.srv import CommandLong
+from mavros_msgs.srv import CommandBool, SetMode, CommandLong
 from rosbag2_interfaces.srv import Resume
 
-# Custom imports
 import custom_functions as cf
-import robot_log_schema as rls   # CSV column layout (ROS-free, _custom_libraries/)
+import robot_log_schema as rls   # CSV column layout (ROS-free)
 import thrust_limits as tl       # uniform thrust saturation (ROS-free)
 import run_bag                   # per-run ros2bag recorder process (ROS-free)
-import path_update_log as pul    # the run's -pathlog.csv (live path update, ROS-free)
+import path_update_log as pul    # the run's -pathlog.csv (ROS-free)
 
 # RC override channel conventions (MAVLink / mavros)
 CHAN_RELEASE = 0        # give the channel back to the RC receiver
 CHAN_NOCHANGE = 65535   # leave the channel untouched
 PWM_NEUTRAL = 1500
 
+# Run-file sibling of a position CSV: '...-poslog[-N].csv' -> '...-<suffix>[-N].yaml'
+_POSLOG_RE = r'-poslog(-\d+)?\.csv$'
+
 class BlueBoatController(Node):
 
     # ======================================================================
-    #  1. WIRING
-    #  parameters, topics, service clients, timers.
+    #  1. WIRING -- parameters, topics, service clients, timers
     # ======================================================================
 
     def __init__(self):
         super().__init__('blueboat_controller')
 
+        # True -> publish the pinger in the world frame without dead reckoning;
+        # False (always) -> body frame, dead-reckoned at odom rate.
+        self.fixed_pinger = False
 
-        #### PINGER ####
-        self.fixed_pinger = False # True -> Publish pinger coordinates in robot frame, without dead reckoning.
-                                 # False -> Publish without yaw compensation and dead reckoning - default behavior in target following 
+        self.enable_motors = self._param('enable_motors', False).bool_value
+        self.use_UWgps = self._param('use_UWgps', True).bool_value
+        self.note = self._param('note', '').string_value
+        self.controller_type = self._param('controller_type', '').string_value
+        # Loss-of-reference watchdog: ten missed 20 Hz ticks, well inside
+        # ArduPilot's own RC_OVERRIDE_TIME.
+        self.thruster_input_timeout = self._param('thruster_input_timeout', 0.5).double_value
+        # Same name and default as master_control's: one number, both ends.
+        self.thrust_limit = self._param('thrust_limit', 20.0).double_value
+        # Empty = resolve it (custom_functions.data_root).
+        self.data_root = cf.data_root(self._param('data_dir', '').string_value)
+        # Run sessions (section 10): the CSV is per run, never per launch.
+        self.session_mode = self._param('session_mode', False).bool_value
 
-        ################## Get Parameters ##################
-        self.declare_parameter('enable_motors', False)
-        self.enable_motors = self.get_parameter('enable_motors').get_parameter_value().bool_value
+        # Link guardian (session only): arm the autopilot at connection, BEFORE
+        # override -- ArduPilot refuses to arm on RC passthrough, so MANUAL ->
+        # 'default' -> arm -> 'override'. Our thrust path does not need it; the
+        # on-boat guardian script does, to drive home if the laptop goes
+        # silent. A failed arm never blocks the session ('rearm' retries).
+        arm_on_connect = self._param('arm_on_connect', True).bool_value
+        self.arm_on_connect = self.session_mode and arm_on_connect
+        self.arm_timeout = self._param('arm_timeout', 15.0).double_value
+        # Bound on param_set confirming 'default' (cold pull over WiFi).
+        self.arm_default_timeout = self._param('arm_default_timeout', 25.0).double_value
 
-        self.declare_parameter('use_UWgps', True)
-        self.use_UWgps = self.get_parameter('use_UWgps').get_parameter_value().bool_value
-
-        self.declare_parameter('note', '')
-        self.note = self.get_parameter('note').get_parameter_value().string_value
-
-        self.declare_parameter('controller_type', '') 
-        self.controller_type = self.get_parameter('controller_type').get_parameter_value().string_value
-
-        # Loss-of-reference watchdog. master_control publishes /thruster_input once
-        # per 20 Hz control tick; 0.5 s is ten consecutive missed ticks, well outside
-        # DDS jitter at that rate and well inside ArduPilot's own RC_OVERRIDE_TIME.
-        self.declare_parameter('thruster_input_timeout', 0.5)
-        self.thruster_input_timeout = self.get_parameter('thruster_input_timeout').get_parameter_value().double_value
-
-        # Per-thruster saturation, same name and default as master_control's.
-        # This used to be two hard-coded literals inside manualMove, which meant
-        # master_control's thrust_limit parameter bought nothing on the real boat:
-        # raising it there just moved the clamp to the one here that no parameter
-        # could reach. One name, one number, both ends.
-        self.declare_parameter('thrust_limit', 20.0)
-        self.thrust_limit = self.get_parameter('thrust_limit').get_parameter_value().double_value
-
-        # Empty means "resolve it" - see custom_functions.data_root for the order.
-        self.declare_parameter('data_dir', '')
-        self.data_root = cf.data_root(
-            self.get_parameter('data_dir').get_parameter_value().string_value)
-
-        # Run sessions (section 10): the position CSV is per RUN, opened and
-        # closed by master_control's /blueboat/run_state, never at launch.
-        self.declare_parameter('session_mode', False)
-        self.session_mode = self.get_parameter('session_mode').get_parameter_value().bool_value
-
-        # Link guardian (2026-10-14, run sessions only): arm the autopilot at
-        # connection, BEFORE going to override. ArduPilot refuses to arm while
-        # SERVO1/3 sit on RC passthrough (Rover pre-arm: "no motor, sail or
-        # scripting outputs defined"), so the sequence is MANUAL -> 'default'
-        # (normal 73/74 mapping) -> arm -> 'override'. Our thrust path does not
-        # need the autopilot armed (passthrough ignores arming); the on-boat
-        # guardian script (superproject link_guardian/) does, to drive the boat
-        # home on its own if this laptop goes silent. A failed arm never blocks
-        # the session: the script arms the boat itself when it takes over, and
-        # the 'rearm' token retries between runs.
-        self.declare_parameter('arm_on_connect', True)
-        self.arm_on_connect = (self.session_mode and
-                               self.get_parameter('arm_on_connect').get_parameter_value().bool_value)
-        self.declare_parameter('arm_timeout', 15.0)
-        self.arm_timeout = self.get_parameter('arm_timeout').get_parameter_value().double_value
-        # Bound on param_set confirming 'default' (a cold parameter pull over
-        # WiFi is slow; matches param_set's own param_sequence_timeout_s).
-        self.declare_parameter('arm_default_timeout', 25.0)
-        self.arm_default_timeout = self.get_parameter('arm_default_timeout').get_parameter_value().double_value
-
-        # Run bags (v1.1, section 11): one ros2bag per run, run sessions only.
-        self.declare_parameter('record_bag', True)
-        self.record_bag = (self.session_mode and
-                           self.get_parameter('record_bag').get_parameter_value().bool_value)
+        # Run bags (section 11): one ros2bag per run, sessions only.
+        record_bag = self._param('record_bag', True).bool_value
+        self.record_bag = self.session_mode and record_bag
 
         # The path server's trajectory argument, read only to snapshot a
-        # from_yaml run's mission file beside its CSV (`-path.yaml`), so a
-        # replay can draw the path the run followed.
-        self.declare_parameter('trajectory', '')
-        self.trajectory = self.get_parameter('trajectory').get_parameter_value().string_value
+        # from_yaml run's mission beside its CSV (`-path.yaml`).
+        self.trajectory = self._param('trajectory', '').string_value
 
-        ################## ROS2 Communication ##################
-        ## Publishers
+        # ---- publishers ----
         self.param_publisher = self.create_publisher(String, '/blueboat/param_str',10)
         self.odom_publisher = self.create_publisher(Odometry, '/blueboat/odom',10)
         self.pinger_publisher = self.create_publisher(Float32MultiArray, '/blueboat/pinger_coordinates', 10)
         self.set_controller_publisher = self.create_publisher(Bool, '/blueboat/controller_ready',10)
-
-        # Actuator stream (this is how QGC drives the boat: a fixed-rate, fire-and-forget
-        # stream where the latest message wins - NOT one acknowledged RPC per actuation)
+        # Actuator stream: fixed-rate, fire-and-forget, latest wins (N6).
         self.rc_override_publisher = self.create_publisher(OverrideRCIn, '/mavros/rc/override', 10)
 
-        ## Subscribers
-
+        # ---- subscribers ----
         self.monitoring_data = []
-
-        # Subscriber
         self.plot_subscriber = self.create_subscription(
             Float32MultiArray,
             "/monitoring_data",
@@ -196,133 +129,96 @@ class BlueBoatController(Node):
             10
         )
 
-        # Node interaction
         self.str_input_subscriber = self.create_subscription(String, '/blueboat/input_str', self.str_input_callback, 10)
         self.ready_sub = self.create_subscription(Bool,'/blueboat/param_ready',self.param_callback,10)
         self.mode_sub = self.create_subscription(String, '/blueboat/param_mode',self.mode_callback,10)
 
-        # Robot sensor
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.robot_state_sub = self.create_subscription(State,'/mavros/state',self.state_callback,10)
         self.imu_sub = self.create_subscription(Imu,'/mavros/imu/data', self.imu_callback, qos)
         self.local_odom_sub = self.create_subscription(Odometry, '/mavros/local_position/odom', self.odom_callback, qos)
         self.gps_sub = self.create_subscription(NavSatFix, '/mavros/global_position/global', self.gps_callback, qos)
 
-        # Data logging
         self.uw_gps_sub = self.create_subscription(Float32MultiArray,'/uw_gps_data', self.uw_gps_callback,10)
         self.target_sub = self.create_subscription(Float32MultiArray,'/controller_target', self.target_callback,10)
         self.thruster_input_sub = self.create_subscription(Float32MultiArray, "/thruster_input", self.thr_input_callback,10)
-        # Live path update (master_control section 7): every request, answer
-        # and path transition becomes a row of the run's -pathlog.csv. Inert
-        # unless master_control publishes an event.
+        # Live path update events -> the run's -pathlog.csv.
         self.path_event_sub = self.create_subscription(
             String, '/blueboat/path_update_event', self.path_event_callback, QoSProfile(depth=50))
 
-        # Run sessions: follow master_control's run state, report the log's.
         if self.session_mode:
             self.run_state_sub = self.create_subscription(String, '/blueboat/run_state', self.run_state_callback, 10)
             self.run_log_publisher = self.create_publisher(String, '/blueboat/run_log', 10)
 
-        ## Service clients
+        # ---- service clients ----
         self.arming_client = self.create_client(CommandBool, '/mavros/cmd/arming')
         self.mode_client = self.create_client(SetMode, '/mavros/set_mode')
         self.cmd_client = self.create_client(CommandLong, '/mavros/cmd/command')
 
-        ################## Initialize ##################
+        # ---- state ----
         self.robot_state = State()
-
-        # Main loop initialization variables
         self.init = False
         self.mode = ''
 
-        # Handshake retry state.
-        # One-shot messages published before DDS discovery completes are silently lost,
-        # which is what made the launch fail "at random". Instead of publishing once and
-        # hoping, we keep a desired state and re-publish periodically until confirmed.
+        # Handshakes are re-published until confirmed: a one-shot published
+        # before DDS discovery completes is silently lost.
         self.desired_param_mode = None
         self.last_param_tx = 0.0
         self.param_retry_period = 1.0   # seconds between re-requests
+        self._last_param_ready = None   # param_callback edge detection
         self.last_ready_tx = 0.0
         self.ready_republish_period = 1.0
 
-        # Loss-of-reference watchdog state. last_thr_rx is None until the first
-        # /thruster_input arrives, which is itself a "no reference" condition.
+        # Loss-of-reference watchdog (None = no /thruster_input yet).
         self.last_thr_rx = None
         self.thr_watchdog_tripped = False
 
-        # E-STOP latch. Set by full_stop() (the 'stop' token), cleared ONLY by
-        # 'enable'. Without the latch a 'stop' is undone one tick (50 ms) later
-        # by the next manualMove(self.thruster_input): full_stop zeroes the
-        # thrust it holds, but master_control keeps publishing. The latch is
-        # what makes E-STOP an actual stop now that it no longer works by
-        # dropping out of override.
+        # E-STOP latch: set by full_stop(), cleared ONLY by 'enable'. Without it
+        # the next manualMove(self.thruster_input) undoes a stop 50 ms later.
         self.estopped = False
         self.motors_disabled_logged = False
 
-        # Arm-before-override sequence state (session only, see arm_on_connect):
-        # None (idle) / 'default' (waiting for the normal mapping) / 'arming'.
+        # Arm-before-override sequence: None / 'default' / 'arming'.
         self.arm_seq = None
         self.arm_seq_t0 = 0.0
         self.last_arm_tx = 0.0
         self.run_running = False        # session: master_control reports a run
 
         self.timer = self.create_timer(0.05, self.timer_callback)
-        self.log_timer = self.create_timer(0.33, self.log_timer_callback) # 3 times per seconds 
+        self.log_timer = self.create_timer(0.33, self.log_timer_callback)
 
-        # Manual input control init
-        self.stopping_sequence = False
-        self.stopping_time = 0.
-        self.manual_move_timer = 0.
-
+        self.manual_move_timer = 0.     # 'move' duration (no controller_type)
         self.time_set = False
 
-        ### Sensors and dead reckoning parameters
         # IMU
         self.orientation = None
         self.angular_velocity = None
         self.linear_acceleration = None
 
-        # GPS 
-        self.gps_data = [0,0] # latitude, longitude
+        # GPS
+        self.gps_data = [0,0]           # latitude, longitude
         self.pinger_gps = [0,0]
 
+        # Frame origin, latched at the first odom (odom_callback).
+        self.origin_set = False
         self.prev_time = None
         self.vel = np.zeros(3)
-        self.pos = np.zeros(3)
-        self.yaw0 = None # Used to start the starting yaw at 0 regardless of actual orientation
-
-        ## Control
+        self.yaw0 = None
 
         self.relative_coordinates = [0,0,0]
-        self.target = [0,0,0]
+        self.target = [0,0,0]           # /controller_target, stored only
         self.pinger_coordinates = np.zeros(3)
         self.corrected_pinger = [0,0]
         self.thruster_input = [0,0]
 
-        ################## Initialize PWM control ##################
-        self.interpolator = cf.generate_interpolator()
+        self.interpolator = cf.generate_interpolator()   # Newton -> PWM
 
-        ################## Initialize data collection ##################
-
-        # Column layout lives in robot_log_schema.py (ROS-free, in
-        # _custom_libraries/). It is a WRITE-ONCE field-data contract: read the
-        # module docstring before touching a name or an order. Rows are filled
-        # by column NAME below, never by index, so the two cannot desynchronise.
+        # ---- position CSV (write-once field record, robot_log_schema.py) ----
         self.data_columns = rls.columns_for(self.use_UWgps)
-        # ((world_x, world_y), (latitude, longitude)) under this layout's names,
-        # so the shared leading block is filled once instead of branched twice.
         self.target_cols, self.target_gps_cols = rls.target_columns_for(self.use_UWgps)
-
-        # Latest /uw_gps_data packet (19 raw values), CACHED here by
-        # uw_gps_callback. That callback used to assemble and write a CSV row
-        # itself, which tied the whole log -- robot pose included -- to the Water
-        # Linked link: a UGPS dropout stopped recording the boat. Now it only
-        # caches, and log_timer_callback is the single writer for both layouts.
+        # Latest /uw_gps_data packet (19 values), cached by uw_gps_callback.
         self.uw_gps_log = [0.0] * 19
 
-        # The position CSV. Outside a session: one per launch, opened right
-        # here as it always was. In a session: none until a run starts
-        # (section 10) -- an idle session records nothing.
         self.log_file = None
         self.path = None
         self.origin_path = None
@@ -330,9 +226,8 @@ class BlueBoatController(Node):
         self.log_run = None             # session: the run whose CSV is open
         self.last_csv = ''              # session: the previous run's CSV
         self.report_procs = []          # session: report subprocesses spawned
-        # Live path update log: one per run, beside the CSV, created only when
-        # the run receives a request (path_update_log.PathLog), never for the
-        # pinger layout.
+        # Path-update log: per run, created at its first request event, never
+        # for the pinger layout.
         self.pathlog = None
         self.pathlog_pending = []       # session: events of a run not opened yet
         self.run_path_source = 'mission'
@@ -364,33 +259,25 @@ class BlueBoatController(Node):
                 "side-scan sonar), filed into the run's folder.")
             self.bag_timer = self.create_timer(0.2, self.bag_timer_callback)
 
+    def _param(self, name, default):
+        """Declare one parameter and return its ParameterValue."""
+        self.declare_parameter(name, default)
+        return self.get_parameter(name).get_parameter_value()
+
     def open_position_log(self, note):
         """
         Create a new position CSV (+ sidecar name) and write its legend and
-        header. Called once from __init__ outside a session, and at the start
-        of every run inside one (open_run_log).
+        header: once from __init__ outside a session, per run inside one.
         """
         self.date = datetime.today().strftime('%Y_%m_%d-%H_%M_%S')
         log_dir = cf.ensure_data_dir(self, self.data_root, 'data', 'Robot_data')
         stem = f'{self.date}-{note}-poslog' if note else f'{self.date}-poslog'
         self.path = cf.reserve_run_file(log_dir, stem, '.csv') + '.csv'
-        # Sidecar name derived by pattern, not by a fixed-length slice: when
-        # reserve_run_file breaks a same-second collision the CSV is
-        # '...-poslog-2.csv', and stripping len('-poslog.csv') characters from
-        # that produced a mangled '...-pos-origin.yaml' that no reader finds.
-        self.origin_path = re.sub(r'-poslog(-\d+)?\.csv$', r'-origin\1.yaml', self.path)
+        # By pattern, so a collision suffix ('-poslog-2.csv') carries over.
+        self.origin_path = re.sub(_POSLOG_RE, r'-origin\1.yaml', self.path)
 
-        # Header once, then one appended-and-flushed row per tick. The previous
-        # version accumulated every row in a DataFrame and rewrote the WHOLE file
-        # on each write, which is O(n^2) in both time and bytes and, despite the
-        # comment claiming it was "for safety in case of unexpected shutdowns",
-        # is strictly less safe than this: a row appended and flushed is already
-        # on disk, and a kill mid-rewrite truncates a full file rather than one
-        # row. index=False drops the unnamed pandas index column the old writer
-        # emitted (it read 0 on every row), and there is no all-zero seed row.
-        # Since 2026-10-08 two legend rows -- description, unit -- precede the
-        # column names (robot_log_schema.LEGEND), written here with the header
-        # rather than at run end, so a killed run keeps them too.
+        # Legend rows + header now (a killed run keeps them), then one
+        # appended-and-flushed row per tick.
         self.log_file = open(self.path, 'w', buffering=1)
         for line in rls.legend_rows(self.data_columns):
             self.log_file.write(','.join(line) + '\n')
@@ -400,28 +287,20 @@ class BlueBoatController(Node):
         self.get_logger().info(f"Position log: {self.path}")
 
     # ======================================================================
-    #  2. MAIN LOOP AND SAFETY
-    #  20 Hz tick + loss-of-reference watchdog. Zero thrust on any doubt.
+    #  2. MAIN LOOP AND SAFETY -- 20 Hz; zero thrust on any doubt
     # ======================================================================
 
     def timer_callback(self):
-        """
-        Main loop
-        """
-
-        ################## Initialize robot ##################
+        # ---- connection: FCU, MANUAL, (session) arm, then override ----
         if not self.init:
-            # Wait until connected
             if not self.robot_state.connected:
                 self.get_logger().info('Waiting for FCU connection...')
                 return
 
-            # Set mode
-            if self.robot_state.mode != "MANUAL": 
+            if self.robot_state.mode != "MANUAL":
                 self.SetMode('MANUAL')
                 return
 
-            # Session: arm the autopilot first (link guardian), then override.
             if self.arm_on_connect and not self.arm_sequence_step():
                 self.maintain_param_handshake()
                 return
@@ -432,59 +311,40 @@ class BlueBoatController(Node):
 
         self.maintain_param_handshake()
 
-        # Wait for direct control to be enabled
         if self.mode != 'override':
             return
 
-        ################## E-STOP latch ##################
-        # Held until an explicit 'enable'. Everything below is skipped, and the
-        # thrust command is re-zeroed every tick through the UNFORCED manualMove
-        # so the enable_motors gate still owns the actuator (N4). full_stop() has
-        # already set enable_motors False, so that call takes the neutral-hold
-        # path below and pins the passthrough channels at 1500/1500 rather than
-        # going silent.
+        # ---- E-STOP latch (N4b): re-zero every tick through the UNFORCED
+        # manualMove, so the closed gate holds neutral; re-assert readiness
+        # False at the republish rate (the station's acknowledgement).
         if self.estopped:
             self.thruster_input = [0, 0]
             self.manualMove([0, 0])
-            # Re-assert the withdrawal of readiness at the normal republish rate
-            # (not at 20 Hz): master_control stops commanding, and the station
-            # reads this as its E-STOP acknowledgement.
             if time.time() - self.last_ready_tx > self.ready_republish_period:
                 self.last_ready_tx = time.time()
                 self.publish(Bool(), False, self.set_controller_publisher)
             return
 
-        ################## Control loop ##################
-        
-        # Start recording time
+        # ---- ready: tell the controller, and keep re-telling it ----
         if not self.time_set:
             self.initial_time = time.time()
-
-            # Send ready msg to controller node
             self.publish(Bool(), True, self.set_controller_publisher)
             self.last_ready_tx = time.time()
-
             self.time_set = True
 
-        # Periodically re-publish readiness so a controller node that finished
-        # starting late (e.g. blocked on the path service) still receives it
         if time.time() - self.last_ready_tx > self.ready_republish_period:
             self.last_ready_tx = time.time()
             self.publish(Bool(), True, self.set_controller_publisher)
-        
+
         current_time = time.time()
-        
-        ## Send input to thrusters
 
-        # If no controller is set, allow for manual input
+        # ---- thrust ----
+        # No controller: a CLI 'move' runs for its duration, then zero.
         if self.controller_type == '' and current_time - self.initial_time >= self.manual_move_timer:
-            self.manualMove([0, 0]) # If override + no controler, stop the robot after any manual move command
+            self.manualMove([0, 0])
 
-        # Loss-of-reference watchdog: a controller is configured but has gone quiet.
-        # Zero the thrust and keep zeroing it until commands come back. Deliberately
-        # NOT full_stop(): that also disarms, and these stalls are transient by design.
-        # The call goes through manualMove without force, so the enable_motors gate
-        # still holds (N4) - this is not a new /mavros/rc/override bypass.
+        # Loss-of-reference watchdog: zero (unforced, behind the N4 gate) until
+        # commands resume. Not full_stop(): that disarms, and stalls are transient.
         elif self.thruster_input_stale(current_time):
             if not self.thr_watchdog_tripped:
                 self.thr_watchdog_tripped = True
@@ -498,11 +358,10 @@ class BlueBoatController(Node):
             if self.thr_watchdog_tripped:
                 self.thr_watchdog_tripped = False
                 self.get_logger().info("/thruster_input resumed - releasing watchdog.")
-            self.manualMove(self.thruster_input)        
+            self.manualMove(self.thruster_input)
 
     def maintain_param_handshake(self):
-        """Re-send the mode request until param_set confirms it. This closes the
-        discovery race that used to make the launch hang at random."""
+        """Re-send the mode request until param_set confirms it."""
         if (self.desired_param_mode is not None
                 and self.mode != self.desired_param_mode
                 and time.time() - self.last_param_tx > self.param_retry_period):
@@ -513,11 +372,9 @@ class BlueBoatController(Node):
     def arm_sequence_step(self):
         """One tick of the session's arm-before-override sequence.
 
-        MANUAL is already set. Request the 'default' mapping (73/74, so Rover's
-        pre-arm motor check can pass), arm, and report True once done - armed,
-        or given up after a bounded wait. Giving up is not fatal: the session
-        proceeds to override as before, and the on-boat guardian arms the boat
-        itself if it ever has to take over.
+        MANUAL is already set: request the 'default' mapping (so Rover's pre-arm
+        motor check passes), arm, and return True once armed or given up after
+        a bounded wait (not fatal: the on-boat guardian arms itself if needed).
         """
         now = time.time()
         log = self.get_logger()
@@ -536,9 +393,9 @@ class BlueBoatController(Node):
             if self.mode == 'default':
                 self.arm_seq = 'arming'
                 self.arm_seq_t0 = now
-                # Rover applies the +-1000 output range of the 73/74 thrusters only in its
-                # 1 Hz loop while DISARMED; armed earlier, idle can come out at full reverse
-                # (link_guardian/README.md). First arm request ~3.5 s from now (2 s retry).
+                # Rover sets the 73/74 thrusters' +-1000 range only in its 1 Hz
+                # loop while DISARMED; armed earlier, idle can come out at full
+                # reverse. First arm request ~3.5 s from now (2 s retry).
                 self.last_arm_tx = now + 1.5
             elif now - self.arm_seq_t0 > self.arm_default_timeout:
                 log.error(f"param_set did not confirm 'default' within {self.arm_default_timeout:.0f} s - "
@@ -566,12 +423,9 @@ class BlueBoatController(Node):
         return False
 
     def request_rearm(self):
-        """'rearm': run the arm-before-override sequence again (session only).
-
-        Needed after an E-STOP (which disarms) or a failed arm at connection: in
-        override ArduPilot cannot be armed, so the boat briefly returns to the
-        'default' mapping. Refused during a run (the boat would stop following
-        it) and while the E-STOP is latched.
+        """'rearm': run the arm-before-override sequence again (session only),
+        after an E-STOP or a failed arm. Refused during a run and while the
+        E-STOP is latched.
         """
         log = self.get_logger()
         if not self.session_mode:
@@ -595,15 +449,9 @@ class BlueBoatController(Node):
 
     def thruster_input_stale(self, now):
         """
-        Loss-of-reference watchdog predicate.
-
-        True when a controller is configured but its /thruster_input has gone
-        quiet for longer than thruster_input_timeout - a stalled, crashed or
-        early-returning master_control. Without this the last received thrust
-        keeps being streamed to the motors indefinitely.
-
-        Inert when no controller is configured: that case already has its own
-        stale-command guard (manual_move_timer, set by the 'move' CLI command).
+        True when a controller is configured but /thruster_input has been quiet
+        for longer than thruster_input_timeout. Inert without a controller
+        (the 'move' CLI command has its own manual_move_timer).
         """
         if self.controller_type == '':
             return False
@@ -613,25 +461,15 @@ class BlueBoatController(Node):
 
     def full_stop(self):
         """
-        EMERGENCY STOP. Cancels any thruster input, latches the motor gate off
-        and disarms.
-
-        Deliberately does NOT change the parameter mode: dropping out of
-        override is a separate operator action ('default'), because leaving
-        override hands the RC channels back to whatever else is transmitting.
-        An E-STOP must remove authority from everyone, not transfer it.
-
-        The latch is what makes this stick - see self.estopped.
+        EMERGENCY STOP: zero thrust, latch the motor gate off, disarm, and
+        acknowledge (controller_ready False). Never changes the parameter mode:
+        leaving override would TRANSFER authority to whatever else transmits.
         """
         self.estopped = True
         self.thruster_input = [0,0]
         self.manualMove([0,0], force=True)
-        self.setArmedStatus(False) 
+        self.setArmedStatus(False)
         self.set_motors(False)
-        # Immediate acknowledgement, published here rather than from the timer
-        # so it does not depend on the timer reaching its override branch: the
-        # station waits on this to confirm the E-STOP landed, and master_control
-        # zeroes its own output on it.
         self.publish(Bool(), False, self.set_controller_publisher)
         self.last_ready_tx = time.time()
         self.get_logger().warn("E-STOP: thrust zeroed, motors disabled, disarmed. "
@@ -646,36 +484,18 @@ class BlueBoatController(Node):
         self.set_motors(True)
 
     # ======================================================================
-    #  3. THRUST -> PWM CALIBRATION
-    #  The enable_motors gate (N4) and the Newton->PWM mapping. Tunable.
+    #  3. THRUST -> PWM -- the enable_motors gate (N4) and the calibration
     # ======================================================================
 
     def manualMove(self, input, force=False):
         """
-        Convert a newton input to pwm and stream it to the motors through RC override
+        Convert a [right, left] Newton command to PWM and stream it through RC
+        override.
         """
-
-        # Safety gate (N4 / superproject CM-16).
-        #
-        # With the gate closed this used to `return`, i.e. publish NOTHING. That
-        # is not inert: by then param_set has already mapped SERVO1/3_FUNCTION to
-        # RCIN1/RCIN3 passthrough, so the ESCs follow RC channels 1 and 3 from
-        # whatever else is transmitting - a hand transmitter, a QGC joystick, or
-        # ArduPilot's own RC failsafe values - and nothing is feeding
-        # RC_OVERRIDE_TIME to keep those channels ours. Motors could and did spin
-        # with enable_motors:=False.
-        #
-        # So the closed gate now HOLDS NEUTRAL instead of going silent: thrust 0
-        # is an exact knot of the calibration table (0 N -> 1500 us, and
-        # 3000 - 1500 = 1500 for the reversed side), so this pins both channels at
-        # true neutral at the loop rate and keeps the override watchdog fed. No
-        # commanded thrust ever reaches the water while the gate is closed, which
-        # is what the gate has always promised; the CSV's actuation_state still
-        # reports ACT_MOTORS_DISABLED for the whole run.
-        #
-        # Only meaningful while we own the channels. Outside override the
-        # autopilot is not listening to us at all, and streaming would fight the
-        # release in mode_callback.
+        # Gate (N4 / CM-16). Closed, it HOLDS NEUTRAL rather than going silent:
+        # in override the ESCs follow RC channels 1/3 from any transmitter, so
+        # silence let motors spin with enable_motors:=False. Only in override;
+        # outside it streaming would fight mode_callback's release.
         if not self.enable_motors and not force:
             if self.mode == 'override':
                 if not self.motors_disabled_logged:
@@ -688,25 +508,18 @@ class BlueBoatController(Node):
 
         def thrust_to_pwm(T): # Thrust in Newton
             return int(self.interpolator(T))
-        
-        # Compensate right thruster observed weaker output
+
+        # Compensate right thruster observed weaker output. DEAD: overridden by
+        # 1.0 below, and it keys on input[1] while scaling input[0] -- left as
+        # is until someone decides what it should do (CLAUDE.md §5).
         if input[1] >= 0:
             compensation_gain = 1.2
         else:
             compensation_gain = 0.75
 
         compensation_gain=1.0
-        # Sanitize input.
-        #
-        # UNIFORM saturation, not two independent clips. The two thrusters do not
-        # carry independent signals: what the controller commands is a surge force
-        # and a yaw moment, split into a common mode and a differential. Clipping
-        # each side on its own therefore does not clamp the command, it rewrites
-        # it into a different one -- [+45, +18] became [+20, +18], collapsing a
-        # 27 N differential to 2 N, so the boat stopped turning and ran further
-        # from the path the harder the controller asked. One scale factor for both
-        # sides keeps the ratio, hence the turn, and only slows the boat down:
-        # [+45, +18] -> [+20, +8]. thrust_limits.py carries the full argument.
+        # UNIFORM saturation: one factor for both sides keeps the wrench
+        # direction ([+45, +18] -> [+20, +8]); thrust_limits.py.
         scaled, scale = tl.scale_to_limit(
             [input[0] * compensation_gain, input[1]], self.thrust_limit)
         if scale < 1.0:
@@ -719,14 +532,13 @@ class BlueBoatController(Node):
         right = float(scaled[0])
         left = float(scaled[1])
 
-        # Convert thrust to PWM (double sanitation)
         max_PWM = 1900
         min_PWM = 1100
         right_pwm = np.clip(thrust_to_pwm(right), min_PWM, max_PWM)
-        left_pwm = 3000 - np.clip(thrust_to_pwm(left), min_PWM, max_PWM) # Reverses direction of thruster rotation to account for asymmetrical propeller
+        # Left reversed for its asymmetric propeller (intentional).
+        left_pwm = 3000 - np.clip(thrust_to_pwm(left), min_PWM, max_PWM)
 
-        # Stream PWM to thrusters (published every control tick -> ~20 Hz refresh,
-        # which also keeps ArduPilot's RC_OVERRIDE_TIME watchdog fed)
+        # Every tick (~20 Hz), which also feeds ArduPilot's RC_OVERRIDE_TIME.
         self.send_rc_override(right_pwm=right_pwm, left_pwm=left_pwm)
 
     # ======================================================================
@@ -736,14 +548,11 @@ class BlueBoatController(Node):
 
     def str_input_callback(self, msg: String):
         """
-        Read str_msg content and take required action
-        By default, any unrecognized command will be sent to the move_callback,
-        allowing for manual control through the input_str topic without needing to set the command to 'move'
+        Dispatch one /blueboat/input_str command. An unrecognised first token
+        falls through to move_callback (which needs exactly four fields).
         """
         input_string = msg.data.split()
         if not input_string:
-            # An empty String message used to raise IndexError inside this
-            # subscription callback.
             self.get_logger().warn("Empty input_str message ignored.")
             return
         command = input_string[0]
@@ -757,40 +566,31 @@ class BlueBoatController(Node):
                     'arm': lambda: self.setArmedStatus(True),
                     'disarm': lambda: self.setArmedStatus(False),
                     'rearm': self.request_rearm,
-                    # Autopilot flight mode back to MANUAL (2026-10-23, additive):
-                    # the station's Turn Off Connection with the link guardian
-                    # OFF, so BlueOS / QGC find the boat in the mode they drive
-                    # it in. Harmless at any time - a session already runs in
-                    # MANUAL (timer_callback's init); it only matters after
-                    # something else (the guardian, a failsafe) changed it.
+                    # Autopilot mode -> MANUAL (station Turn Off with the guardian
+                    # OFF, so BlueOS / QGC find the boat in their mode).
                     'manual': lambda: self.SetMode('MANUAL')
         }
 
         action = dispatch.get(command, lambda: self.move_callback(input_string))
-        action()   
+        action()
 
     def move_callback(self, in_str):
         """
-        Called when input_str is 'move', the first two floats are left and right thruster inputs, 
-        the last one is the length (in seconds) of the applied thrust
+        'move <left> <right> <seconds>': apply that thrust (stored [right,
+        left]) for that long. Needs exactly four fields.
         """
-
-        # Make sure the command is valid
         if len(in_str) != 4:
-            self.get_logger().info(f" Incorrect move command.")
+            self.get_logger().info(" Incorrect move command.")
             return
 
-        # Start measuring time and apply thrust
         self.initial_time = time.time()
         left, right, self.manual_move_timer = map(float, in_str[1:])
         self.thruster_input = [right,left]
 
     def request_param_mode(self, mode):
         """
-        Ask param_set for a mode and remember the request so the main loop can
-        re-send it until param_set confirms on /blueboat/param_mode.
-        A single publish can be lost if it races DDS discovery or if param_set is
-        still waiting on mavros - this was the main cause of the random launch hangs.
+        Ask param_set for a mode; the main loop re-sends it until param_set
+        confirms on /blueboat/param_mode (a single publish can be lost).
         """
         self.desired_param_mode = mode
         self.last_param_tx = time.time()
@@ -798,17 +598,12 @@ class BlueBoatController(Node):
 
     # ======================================================================
     #  5. POSE RE-ZEROING AND PINGER DEAD RECKONING
-    #  Local-ENU frame: position is translated to the launch point, axes stay
-    #  ENU (+x = East, +y = North) and yaw stays ABSOLUTE ENU (0 = East,
-    #  CCW-positive). Yaw is deliberately NOT re-zeroed: subtracting yaw0
-    #  without also rotating the position axes produced a hybrid frame that
-    #  was only self-consistent when the boat launched facing East.
-    #  The twist is NOT rotated either (N3): it is body-frame from MAVROS.
+    #  Local ENU: position translated to the launch point, axes ENU, yaw
+    #  ABSOLUTE ENU (never re-zeroed: that made a hybrid frame). The twist is
+    #  passed through unrotated -- MAVROS gives it body-frame (N3).
     # ======================================================================
 
     def odom_callback(self, msg: Odometry):
-
-        # Set previous time measurement and compute dt
         t = self.get_clock().now().nanoseconds * 1e-9
         if self.prev_time is None:
             self.prev_time = t
@@ -816,8 +611,7 @@ class BlueBoatController(Node):
         dt = t - self.prev_time
         self.prev_time = t
 
-        # Initialize reference on first callback
-        if not hasattr(self, "origin_set") or not self.origin_set:
+        if not self.origin_set:
             self.x0 = msg.pose.pose.position.x
             self.y0 = msg.pose.pose.position.y
             self.z0 = msg.pose.pose.position.z
@@ -826,18 +620,15 @@ class BlueBoatController(Node):
             self.lon0 = self.gps_data[1]
             self.origin_set = True
 
-        # Position offset (translation only -- axes stay ENU)
         x_rel = msg.pose.pose.position.x - self.x0
         y_rel = msg.pose.pose.position.y - self.y0
         z_rel = msg.pose.pose.position.z - self.z0
 
-        # Yaw stays absolute ENU (0 = East, CCW+). yaw0 is latched above for
-        # the origin sidecar only; it is no longer part of the frame.
+        # Absolute ENU; yaw0 is provenance for the sidecar only.
         yaw = cf.quaternion_to_yaw(msg.pose.pose.orientation)
 
         self.relative_coordinates = [x_rel, y_rel, yaw]
 
-        # Build modified odometry
         odom_out = Odometry()
         odom_out.header = msg.header
         odom_out.child_frame_id = msg.child_frame_id
@@ -847,25 +638,15 @@ class BlueBoatController(Node):
         odom_out.pose.pose.position.z = z_rel
         odom_out.pose.pose.orientation = cf.yaw_to_quaternion(yaw)
 
-        # Preserve velocity and covariance
+        # Twist body-frame, unrotated (N3); covariances preserved.
         odom_out.twist = msg.twist
         odom_out.pose.covariance = msg.pose.covariance
         odom_out.twist.covariance = msg.twist.covariance
-
-        # The pose above is translated to the launch point (axes ENU, yaw
-        # absolute), but the twist is NOT rotated, and must not be: MAVROS
-        # already publishes this odometry's twist in child_frame_id 'base_link'
-        # (the ENU velocity goes out separately on local_position/velocity_local).
-        # It is body-frame surge/sway, which is what master_control and the
-        # pinger dead-reckoning below both want. See N3.
 
         self.odom_publisher.publish(odom_out)
 
         x_t = msg.twist.twist.linear.x
         y_t = msg.twist.twist.linear.y
-
-
-        
         z_t = msg.twist.twist.linear.z
         self.vel = np.array([x_t,y_t,z_t])
 
@@ -885,7 +666,7 @@ class BlueBoatController(Node):
         if self.fixed_pinger:
             return
 
-        # Apply sensor fusion to get a smoother approximation at higher frequency of pinger_coordinates
+        # Dead-reckon the body-frame pinger vector between USBL fixes.
         if av is not None and not all(self.pinger_coordinates == np.zeros(3)): # Make sure the pinger has been detected
             omega = np.array([0.0, 0.0, av.z])
             p = self.pinger_coordinates
@@ -893,9 +674,6 @@ class BlueBoatController(Node):
             self.pinger_coordinates -= (self.vel + np.cross(omega, p)) * dt
         
         self.publish(Float32MultiArray(), self.pinger_coordinates, self.pinger_publisher)
-
-        if not hasattr(self, "origin_set") or not self.origin_set:
-            return  
 
         # rotate pinger coordinates into the local-ENU world frame
         x_body = self.pinger_coordinates[0]
@@ -905,12 +683,8 @@ class BlueBoatController(Node):
 
         self.corrected_pinger = [x_world, y_world]
 
-        # The world frame IS local ENU about (lat0, lon0), so world -> east/north
-        # is the identity by construction.
-        east, north = x_world, y_world
-
-        lat, lon = cf.enu_to_gps(self.lat0, self.lon0, east, north)
-
+        # The world frame IS local ENU about (lat0, lon0).
+        lat, lon = cf.enu_to_gps(self.lat0, self.lon0, x_world, y_world)
         self.pinger_gps = [lat, lon]
 
     # ======================================================================
@@ -927,108 +701,68 @@ class BlueBoatController(Node):
         self.gps_data = [msg.latitude, msg.longitude]
 
     def state_callback(self, msg):
-        """
-        Read the state of the robot
-        """
         self.robot_state = msg
 
     def uw_gps_callback(self, msg):
         """
-        Cache the Water Linked UGPS packet and reseed the pinger dead reckoning.
-
-        This callback does NOT write the CSV any more. It used to assemble and
-        write a whole row, which meant the pinger-mode log was driven by the UGPS
-        link at 2 Hz and stopped entirely -- robot pose included -- whenever that
-        link dropped. log_timer_callback is now the single writer for both
-        layouts, and reads self.uw_gps_log from here.
-
-        /uw_gps_data layout, 19 values:
-            [date x7, aco xyz, ant xyz, lat, lon, dep, filaco xyz]
+        Cache the Water Linked UGPS packet (19 values: date x7, aco xyz,
+        ant xyz, lat, lon, dep, filaco xyz) and reseed the pinger dead
+        reckoning. Never writes the CSV (log_timer_callback does).
         """
-        # In a run session the follow mode can change between runs, so the
-        # pinger is tracked whatever this launch started with: a pinger run can
-        # begin at any time, and the station shows the pinger meanwhile.
+        # In a session a pinger run can start at any time: always track it.
         if not (self.use_UWgps or self.session_mode):
             return
 
         self.uw_gps_log = list(msg.data)
 
-        # filaco = the FILTERED acoustic position; it seeds the dead reckoning
-        # that odom_callback then propagates at odom rate.
+        # filaco = the FILTERED acoustic position.
         t_x, t_y, t_z = msg.data[16], msg.data[17], msg.data[18]
         self.pinger_coordinates = np.array([t_x, t_y, t_z])
 
     def target_callback(self, msg: Float32MultiArray):
-        """
-        Update the target, used when interacting with the controller node
-        """
         self.target = msg.data
 
     def thr_input_callback(self, msg: Float32MultiArray):
-        """
-        Update the thruster inputs, used when interacting with the controller node
-        """
         self.thruster_input = msg.data
         self.last_thr_rx = time.time()
 
     def monitoring_data_callback(self, msg: Float32MultiArray):
-        """
-        Callback for monitoring data.
-        """
         self.monitoring_data = msg.data
 
-    ################## ROS2 node interaction ##################
-
-    def param_callback(self, msg: String):
-        """
-        Prints true if the parameter changes are successful (used with the 'default' and 'override' command).
-
-        Edge-triggered: param_set heartbeats this at 1 Hz so a late subscriber
-        can see the state without waiting for a transition, and logging every
-        message would bury the console.
-        """
-        if getattr(self, '_last_param_ready', None) == msg.data:
+    def param_callback(self, msg: Bool):
+        """Log param_set's readiness on change only (it is heartbeated)."""
+        if self._last_param_ready == msg.data:
             return
         self._last_param_ready = msg.data
         self.get_logger().info(f" Parameters ready: {msg.data}")
 
     def mode_callback(self, msg: String):
-        """
-        Displays the mode sent to the robot to confirm the changes
-        """
+        """Track param_set's mode; on leaving override, release the RC channels."""
         previous_mode = self.mode
         self.mode = msg.data
 
         if previous_mode != self.mode:
             self.get_logger().info(f" Mode received: {self.mode}")
 
-            # When leaving override, hand the RC channels back so the default
-            # thruster mapping (QGC / xbox controller) works again
             if previous_mode == 'override':
                 self.send_rc_override(right_pwm=PWM_NEUTRAL, left_pwm=PWM_NEUTRAL)
                 self.send_rc_override(release=True)
 
     # ======================================================================
-    #  7. MAVROS / MAVLINK PLUMBING
-    #  RC override stream (N6), arming, mode. Rarely edited.
+    #  7. MAVROS / MAVLINK PLUMBING -- RC override stream (N6), arming, mode
     # ======================================================================
-
-    ################## Thruster interaction ##################
 
     def set_servo(self, n, pwm):
         """
-        LEGACY fallback - send a single MAV_CMD_DO_SET_SERVO via the command service.
-        Note: this only works when SERVOn_FUNCTION is 0 (Disabled). It must NOT be
-        called at control-loop rate: every call is an acknowledged RPC, and a lost
-        ACK over WiFi stalls the mavros command plugin for seconds, which was the
-        source of the delayed/overrunning 'move' behavior.
+        LEGACY fallback, called from nowhere (N6): one MAV_CMD_DO_SET_SERVO.
+        Works only with SERVOn_FUNCTION 0; never at loop rate (acknowledged
+        RPC: a lost ACK stalls the mavros command plugin for seconds).
         """
         req = CommandLong.Request()
         req.command = 183
         req.param1 = float(n)
         req.param2 = float(pwm)
 
-        # explicitly set all remaining params as float
         req.param3 = 0.0
         req.param4 = 0.0
         req.param5 = 0.0
@@ -1039,10 +773,8 @@ class BlueBoatController(Node):
 
     def send_rc_override(self, right_pwm=None, left_pwm=None, release=False):
         """
-        Publish one RC override message (channel 1 = right/servo1, channel 3 = left/servo3).
-        Fire-and-forget, latest value wins - the same transport class QGC uses.
-        Requires 'override' mode: param_set maps SERVO1/3_FUNCTION to RCIN1/RCIN3
-        passthrough and points the autopilot's GCS sysid at mavros.
+        One RC override message: channel 1 = right (servo1), 3 = left (servo3).
+        Acts only in 'override' (param_set's RCIN passthrough mapping).
         """
         msg = OverrideRCIn()
         channels = [CHAN_NOCHANGE] * 18
@@ -1057,11 +789,8 @@ class BlueBoatController(Node):
         msg.channels = channels
         self.rc_override_publisher.publish(msg)
 
-    ################## User interaction ##################
     def setArmedStatus(self,command):
-        """
-        Either arm or disarm the robot's thrusters. Note that the 'override' parameter completely disregards armed status
-        """
+        """Arm or disarm the autopilot ('override' passthrough ignores arming)."""
         self.get_logger().info(f"{'Arming' if command else 'Disarming'} vehicle...")
 
         if self.arming_client.wait_for_service(timeout_sec=1.0):
@@ -1070,9 +799,6 @@ class BlueBoatController(Node):
             self.arming_client.call_async(req)
 
     def SetMode(self, mode):
-        """
-        Set the robot's mode to the requested input.
-        """
         self.get_logger().info(f"Current mode: {self.robot_state.mode}, switching to {mode}]")
 
         if self.mode_client.wait_for_service(timeout_sec=1.0):
@@ -1081,48 +807,25 @@ class BlueBoatController(Node):
             self.mode_client.call_async(req)
 
     def set_motors(self, inBool):
-        """
-        Set the bool value of enable_motors. 
-        This is meant as a safety as no input will be set to the thrusters intil this is set to True
-        """
+        """Open or close the enable_motors gate (N4)."""
         self.enable_motors = inBool
         self.get_logger().info(f" Enable motors: {self.enable_motors}")
 
     def publish(self, msg_type, in_msg, publisher):
-        """
-        Makes publishing within code neater
-        """
-        msg = msg_type
-        msg.data = in_msg
-        publisher.publish(msg)
+        """Set .data on a message instance and publish it."""
+        msg_type.data = in_msg
+        publisher.publish(msg_type)
 
     # ======================================================================
-    #  8. CSV LOGGING
-    #  Write-once field data. Columns in _custom_libraries/robot_log_schema.py.
-    #  ONE writer for BOTH layouts, on this node's own timer. The pinger layout
-    #  used to be written from uw_gps_callback instead, i.e. at the Water Linked
-    #  link's rate, so a UGPS dropout stopped recording the robot as well.
+    #  8. CSV LOGGING -- write-once field data (robot_log_schema.py); one
+    #  writer for both layouts, on this node's own timer
     # ======================================================================
 
     def actuation_state(self):
         """
-        One integer saying whether the logged thrust command could reach the water.
-
-        Output : int, see robot_log_schema for the encoding --
-                 0 motors disabled, 1 live (enabled and in override),
-                 2 enabled but not in override, 3 watchdog forcing zero.
-
-        State 0 means NO COMMANDED THRUST reached the water. It does not mean
-        the node was silent on /mavros/rc/override: with the gate closed and the
-        autopilot in override, manualMove holds both channels at neutral 1500
-        so nothing else can drive them. Neutral is not thrust, so the meaning of
-        the column is unchanged and no recorded CSV is reinterpreted.
-
-        Without this the CSV cannot distinguish a controller that commanded zero
-        from a boat that was never listening: enable_motors False produces a
-        completely normal-looking log with no PWM ever leaving the boat, and the
-        loss-of-reference watchdog writes [0, 0] into the same thruster_input
-        field a genuine zero command uses.
+        Could the logged thrust command reach the water? 0 motors disabled
+        (channels held at neutral), 1 live, 2 enabled but not in override,
+        3 watchdog forcing zero (robot_log_schema).
         """
         if self.thr_watchdog_tripped:
             return rls.ACT_WATCHDOG
@@ -1134,17 +837,11 @@ class BlueBoatController(Node):
 
     def write_origin_sidecar(self):
         """
-        Record the world frame's own origin, once, beside the CSV.
-
-        The world frame is local ENU: origin latched at the first odom
-        callback, axes East/North, yaw absolute ENU. Every world-frame column
-        in the log -- relative_x/y/psi, the target pair, corrected_pinger_x/y
-        -- is expressed in it, and (lat0, lon0) is what georeferences a
-        recorded run afterwards. yaw0_rad is the boat's ENU heading at the
-        latch instant, kept for provenance only (it is NOT part of the frame;
-        logs recorded before the local-ENU fix used yaw - yaw0 as relative_psi).
+        Record the local-ENU world frame's origin (lat0, lon0), once, beside
+        the CSV: it georeferences every world-frame column afterwards.
+        yaw0_rad is provenance only (pre-local-ENU logs used yaw - yaw0).
         """
-        if self.origin_written or not getattr(self, 'origin_set', False):
+        if self.origin_written or not self.origin_set:
             return
         try:
             with open(self.origin_path, 'w') as f:
@@ -1164,23 +861,15 @@ class BlueBoatController(Node):
 
     def build_log_row(self):
         """
-        Assemble one CSV row for whichever layout this run selected.
-
-        Output : dict {column name: value} covering every column of
-                 self.data_columns. Filled BY COLUMN NAME, never by index, so
-                 the order in robot_log_schema can never silently desynchronise
-                 from the values written into it.
-
-        Raises AttributeError while the IMU has not reported yet; the caller
-        treats that as "not ready" rather than as a failure.
+        One CSV row, {column name: value} for every column of
+        self.data_columns. Raises AttributeError before the first IMU message
+        (the caller treats it as "not ready").
         """
         now = datetime.today()
         roll, pitch, _ = cf.quaternion_to_rpy(self.orientation)
 
         row = {
-            # Wall clock. MicroSecond is FULL microseconds in both layouts --
-            # the no-pinger path used to write now.microsecond // 1000, i.e.
-            # milliseconds under a column named MicroSecond.
+            # Wall clock; MicroSecond is full microseconds.
             'Year': now.year, 'Month': now.month, 'Day': now.day,
             'Hour': now.hour, 'Minute': now.minute, 'Second': now.second,
             'MicroSecond': now.microsecond,
@@ -1191,8 +880,6 @@ class BlueBoatController(Node):
             'relative_y': self.relative_coordinates[1],
             'relative_psi': self.relative_coordinates[2],
 
-            # Robot fix, immediately followed by the target's below so the two
-            # can be selected and plotted together.
             'gps_latitude': self.gps_data[0],
             'gps_longitude': self.gps_data[1],
 
@@ -1216,16 +903,12 @@ class BlueBoatController(Node):
 
         # --- the target block, under whichever names this layout uses --------
         if self.use_UWgps:
-            # The pinger IS the target. corrected_pinger is the dead-reckoned
-            # vector rotated into the world frame; pinger_gps is that same point
-            # in WGS84, both maintained by odom_callback.
+            # The pinger IS the target (world frame + WGS84, odom_callback).
             target_xy = self.corrected_pinger
             target_gps = self.pinger_gps
         else:
-            # /monitoring_data = [t, x, y, psi, x_d, y_d, psi_d, u1, u2].
-            # x_d/y_d are world-frame in EVERY controller branch (CM-8 / N9), so
-            # no frame correction is applied here or downstream. An empty buffer
-            # (no controller running yet) logs zeros rather than raising.
+            # /monitoring_data[4:6] = x_d, y_d, world-frame in every branch
+            # (N9) -- no correction here. Zeros before the first message.
             if len(self.monitoring_data) >= 6:
                 target_xy = [self.monitoring_data[4], self.monitoring_data[5]]
             else:
@@ -1239,8 +922,7 @@ class BlueBoatController(Node):
 
         # --- raw Water Linked packet, pinger layout only ---------------------
         if self.use_UWgps:
-            # /uw_gps_data indices 7..18; 0..6 are its own date fields, which the
-            # wall-clock stamp above already covers.
+            # /uw_gps_data[7:19]; 0..6 are its own date fields.
             ugps_names = ('aco_x', 'aco_y', 'aco_z',
                           'ant_x', 'ant_y', 'ant_z',
                           'lat', 'lon', 'dep',
@@ -1251,36 +933,22 @@ class BlueBoatController(Node):
         return row
 
     def target_to_gps(self, target_xy):
-        """
-        Convert a local-ENU world-frame target into WGS84 degrees.
-
-        Input  : target_xy -- [x, y] in the same frame as relative_x/y.
-        Output : [latitude, longitude] in degrees, or [0.0, 0.0] before the
-                 frame origin has been latched by the first odom callback.
-
-        The world frame is local ENU about (lat0, lon0), so world -> east/north
-        is the identity and only the equirectangular projection remains --
-        identical to the pinger path.
-        """
-        if not getattr(self, 'origin_set', False):
+        """[lat, lon] of a local-ENU world-frame [x, y], or [0, 0] before the
+        frame origin is latched."""
+        if not self.origin_set:
             return [0.0, 0.0]
-
-        east, north = target_xy[0], target_xy[1]
-        lat, lon = cf.enu_to_gps(self.lat0, self.lon0, east, north)
+        lat, lon = cf.enu_to_gps(self.lat0, self.lon0, target_xy[0], target_xy[1])
         return [lat, lon]
 
     def log_timer_callback(self):
-        """
-        Append one row to the position CSV. The single writer, both layouts.
-        """
+        """Append one row to the position CSV (the single writer)."""
         if self.log_file is None or self.log_file.closed:
             return              # an idle run session: nothing is recorded
         try:
             row = self.build_log_row()
         except (AttributeError, TypeError, IndexError) as exc:
-            # Normal before the first IMU / odom message; self.orientation and
-            # friends are None until then. Logged with the reason rather than a
-            # bare "not ready", so a genuine assembly bug is not hidden by it.
+            # Normal before the first IMU / odom message; the reason is logged
+            # so a genuine assembly bug is not hidden.
             self.get_logger().warn(f" -- Not ready to log yet: {exc}",
                                    throttle_duration_sec=5.0)
             return
@@ -1296,19 +964,13 @@ class BlueBoatController(Node):
         self.write_origin_sidecar()
 
     # ======================================================================
-    #  9. SHUTDOWN
-    #  Ordered teardown. Previously there was none: `rclpy.spin` raised
-    #  KeyboardInterrupt straight past destroy_node(), so the boat was left in
-    #  RC passthrough with nobody streaming and the CSV was never closed.
+    #  9. SHUTDOWN (N5) -- best-effort, safest-first, every step guarded
     # ======================================================================
 
     def shutdown(self):
         """
-        Best-effort ordered teardown, safest-first.
-
-        Called from a finally block while the launch is being torn down, so
-        every step is independently guarded: a failure in one must not skip the
-        ones after it, and none of them may raise out of the finally.
+        Ordered teardown from main()'s finally: each step is independently
+        guarded so one failure skips nothing and nothing raises out.
         """
         # 1. Motors first, always.
         try:
@@ -1316,25 +978,20 @@ class BlueBoatController(Node):
         except Exception as exc:                       # noqa: BLE001 - teardown
             self.get_logger().error(f"Shutdown: full_stop failed: {exc}")
 
-        # 2. Hand the RC channels back. Neutral before release, so the autopilot
-        #    never sees a stale non-neutral value on the way out.
+        # 2. RC channels back: neutral, then release.
         try:
             self.send_rc_override(right_pwm=PWM_NEUTRAL, left_pwm=PWM_NEUTRAL)
             self.send_rc_override(release=True)
         except Exception as exc:                       # noqa: BLE001 - teardown
             self.get_logger().error(f"Shutdown: RC release failed: {exc}")
 
-        # 3. Ask for the default servo mapping. Best effort and usually a no-op:
-        #    param_set is in the same process group and is running its own
-        #    restore at this moment (CM-15 is served by both halves, neither
-        #    depending on the other).
+        # 3. Default servo mapping (param_set runs its own restore too).
         try:
             self.request_param_mode('default')
         except Exception as exc:                       # noqa: BLE001 - teardown
             self.get_logger().error(f"Shutdown: 'default' request failed: {exc}")
 
-        # 4. Close the CSV BEFORE anything moves it. In an idle run session no
-        #    CSV is open: every run was closed and filed when it stopped.
+        # 4. Close the CSV before anything moves it (none open in an idle session).
         had_open_log = False
         try:
             if getattr(self, 'log_file', None) and not self.log_file.closed:
@@ -1349,9 +1006,8 @@ class BlueBoatController(Node):
         except Exception as exc:                       # noqa: BLE001 - teardown
             self.get_logger().error(f"Shutdown: closing the path-update log failed: {exc}")
 
-        # 4b. Close the bags BEFORE anything moves them (section 11). The
-        #     recorder shares this process group, so a launch teardown has
-        #     already SIGINTed it; this waits for it, bounded.
+        # 4b. Close the bags (the launch teardown already SIGINTed the recorder;
+        #     this waits for it, bounded).
         run_bag_dir = None
         try:
             run_bag_dir = self._bag_teardown()
@@ -1361,11 +1017,8 @@ class BlueBoatController(Node):
         if not had_open_log:
             return
 
-        # 5. Mission report. Imported HERE, not at module scope: matplotlib is
-        #    not declared in package.xml and must never be able to stop this
-        #    flight node from starting. Synchronous here (the node is going
-        #    away anyway); a run that ends mid-session is filed in a subprocess
-        #    instead, see close_run_log.
+        # 5. Mission report, synchronously. Imported here: matplotlib must never
+        #    be able to stop this flight node from starting.
         try:
             import poslog_report
             folder = poslog_report.finalise_run(self.path, bag=run_bag_dir)
@@ -1377,19 +1030,13 @@ class BlueBoatController(Node):
                 "to produce it later.")
 
     # ======================================================================
-    #  10. RUN SESSION  (session_mode only)
-    #  One position CSV per run. master_control owns the run (it is where the
-    #  operator's start/stop lands); this node follows its /blueboat/run_state
-    #  and reports what it is writing on /blueboat/run_log, so the station can
-    #  confirm that a run is actually being recorded.
+    #  10. RUN SESSION (session_mode only) -- one CSV per run, following
+    #  master_control's /blueboat/run_state, reported on /blueboat/run_log.
+    #  Also the run's path-update log (master_control section 7).
     # ======================================================================
-
-    # ------------------------------------------------------------------ #
-    #  Live path update log (master_control section 7)                    #
-    # ------------------------------------------------------------------ #
     def _open_pathlog(self, run=None):
-        """Attach this run's -pathlog.csv writer (the file itself is created
-        lazily, at the first request event). None for the pinger layout."""
+        """Attach this run's -pathlog.csv writer (file created at the first
+        event). None for the pinger layout."""
         self._close_pathlog()
         if self.use_UWgps or not self.path:
             self.pathlog = None
@@ -1451,11 +1098,9 @@ class BlueBoatController(Node):
         running = state.get('state') == 'running'
         self.run_running = running
         run = state.get('run')
-        # Additive key (live path update): a replanner run follows no file.
         self.run_path_source = str(state.get('path_source', 'mission'))
         if running and self.log_run != run:
-            # A run we are not recording yet (normally the one that just
-            # started; also a new run whose stop we missed).
+            # A run not recorded yet (also a new run whose stop we missed).
             if self.log_run is not None:
                 self.close_run_log()
             self.open_run_log(run, bool(state.get('use_pinger', False)),
@@ -1468,13 +1113,9 @@ class BlueBoatController(Node):
         self.use_UWgps = use_pinger
         self.data_columns = rls.columns_for(self.use_UWgps)
         self.target_cols, self.target_gps_cols = rls.target_columns_for(self.use_UWgps)
-        # The pinger layout's target is the dead-reckoned pinger, cached all
-        # session long (uw_gps_callback); the no-pinger one reads
-        # /monitoring_data, whose last value may predate this run.
+        # /monitoring_data's last value may predate this run.
         self.monitoring_data = []
-        # The note lands in a file name. The station already sanitises it with
-        # this exact rule (mcs launch_manager.sanitize_note), so a station note
-        # passes through unchanged; anything else is made safe the same way.
+        # File-name-safe note, the station's own rule (launch_manager.sanitize_note).
         safe_note = re.sub(r'-{2,}', '-', ''.join(
             c if (c.isalnum() or c in '._') else '-' for c in note)).strip('-')
         try:
@@ -1494,35 +1135,25 @@ class BlueBoatController(Node):
         self.publish_run_log()
 
     def _snapshot_trajectory(self, run):
-        """Copy the run's mission file beside its CSV as `-path.yaml`.
-
-        The station rewrites one session file before every start, so without
-        a copy a run's path is lost at the next start. A pinger run has none
-        (its target, the pinger, is in the bag). Never fatal: the CSV and the
-        bag are the record, this is a convenience for replay."""
+        """Copy the run's mission file beside its CSV as `-path.yaml` (the
+        station rewrites one session file per start). Never fatal. Skipped for
+        a replanner run, whose path came from /blueboat/update_path."""
         if self.run_path_source == 'replanner':
-            # Its path comes from /blueboat/update_path, not from the station
-            # file: a copy of that file would misstate what was followed. The
-            # run's -pathlog.csv and its bag record the actual path changes.
             return
         traj = self.trajectory
         if not traj.startswith('from_yaml:'):
             return
         src = os.path.expanduser(traj.partition(':')[2])
-        dst = re.sub(r'-poslog(-\d+)?\.csv$', r'-path\1.yaml', self.path)
+        dst = re.sub(_POSLOG_RE, r'-path\1.yaml', self.path)
         try:
             shutil.copyfile(src, dst)
         except OSError as exc:
             self.get_logger().warning(f"Run {run}: path not snapshotted ({exc}).")
 
     def close_run_log(self):
-        """Close the run's CSV and file its report, without stalling this node.
-
-        poslog_report renders a PNG with matplotlib, which takes seconds of
-        mostly-Python work: in-process it would hold the GIL against the 20 Hz
-        RC override stream. It runs as its own process instead, in its own
-        session so a launch teardown does not kill it half-way. The report is
-        identical to the one the shutdown hook writes (same function, CLI entry).
+        """Close the run's CSV and file its report in a subprocess (its own
+        session: a matplotlib render in-process would hold the GIL against the
+        20 Hz RC stream, and a launch teardown must not kill it half-way).
         """
         run = self.log_run
         self.log_run = None
@@ -1540,10 +1171,8 @@ class BlueBoatController(Node):
 
         if path:
             if self.bag_run is not None:
-                # The report waits for the bag: it MOVES the bag into the run
-                # folder, so the recorder must have closed it first. Closing
-                # happens on a worker thread (run_bag.stop_async), which then
-                # starts the report itself.
+                # The report MOVES the bag, so it starts from the worker
+                # thread that closes the recorder.
                 self._bag_end_run(run, path)
             else:
                 self._spawn_report(run, path)
@@ -1581,9 +1210,8 @@ class BlueBoatController(Node):
             'logging': logging,
             'csv': self.path if logging else self.last_csv,
             'layout': 'pinger' if self.use_UWgps else 'no_pinger',
-            # v1.1, additive: the run's ros2bag (section 11). `bag` is the
-            # staging directory while recording, else the previous run's
-            # final path inside its folder.
+            # Additive: `bag` = staging dir while recording, else the previous
+            # run's filed bag.
             'bag_enabled': self.record_bag,
             'bag_recording': self.bag_recording,
             'bag': (self.bag_run.output_dir if self.bag_run is not None
@@ -1594,19 +1222,16 @@ class BlueBoatController(Node):
         self.run_log_publisher.publish(msg)
 
     # ======================================================================
-    #  11. RUN BAG  (session_mode and record_bag only)
-    #  One ros2bag per run, written by a separate `ros2 bag record` process
-    #  (run_bag.py). This node never touches bag data: it pre-arms the next
-    #  run's recorder PAUSED while idle, resumes it at run start (no
-    #  discovery gap) and closes it at stop on a worker thread, whose
-    #  callback starts poslog_report to MOVE the bag into the run's folder.
+    #  11. RUN BAG (session_mode and record_bag only)
+    #  A separate `ros2 bag record` process (run_bag.py): pre-armed PAUSED
+    #  while idle, resumed at run start (no discovery gap), closed at stop on a
+    #  worker thread that then files it with poslog_report.
     # ======================================================================
 
     def bag_timer_callback(self):
         if self.bag_shutting_down:
             return
-        # A run whose recorder could not be resumed yet (pre-armed too late
-        # to be discoverable): resume as soon as its service answers.
+        # Resume a run's recorder as soon as its service answers.
         if self.bag_run is not None:
             if self.bag_resume_pending:
                 if self.bag_run.alive():
@@ -1725,8 +1350,7 @@ class BlueBoatController(Node):
         stem = os.path.splitext(os.path.basename(csv_path))[0]
         self.bag_last = os.path.join(os.path.dirname(csv_path), stem,
                                      poslog_report.bag_name(csv_path))
-        # Re-arming waits a moment: the closing recorder and a new one would
-        # otherwise both subscribe to everything at once.
+        # Delay re-arming so two recorders do not subscribe at once.
         self.bag_next_arm = time.monotonic() + 1.0
 
         def closed(r):
@@ -1756,8 +1380,7 @@ class BlueBoatController(Node):
         if self.bag_armed is not None:
             self.bag_armed.discard()
             self.bag_armed = None
-        # Bags of runs already stopped: let their closers finish and start
-        # their reports (own session, so they survive this process).
+        # Let closers of stopped runs finish and start their reports.
         for thread in self.bag_closers:
             thread.join(timeout=run_bag.SIGINT_WAIT_S + run_bag.SIGTERM_WAIT_S)
         return run_dir

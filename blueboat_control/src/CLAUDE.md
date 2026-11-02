@@ -1,26 +1,18 @@
 # CLAUDE.md — `blueboat_control/src` (controller and thrust-path evidence)
 
-Loaded when working under `blueboat_control/src/`. Moved verbatim from
-`BlueBoat-Control/.claude/CLAUDE.md` §4–§5 on 2026-10-08: that file keeps the rules (and
-N1–N9); this one keeps the measurements, derivations and tables behind them. Section
-references (§n, Nn) point to that file.
+Loaded when working under `blueboat_control/src/`. `BlueBoat-Control/.claude/CLAUDE.md`
+keeps the rules (N1–N11) and the contract; this file keeps the measurements, derivations and
+tables behind its §4–§5. Section references (§n, Nn) point to that file.
 
 ## §4 Control architecture — detail
 
-**The controller object is built in `__init__`, not on the first tick.** `_build_controller()`
-runs at the end of construction, before `rclpy.spin`. This matters only for `MPC`, which runs
-acados code generation and a C compile there: done from `timer_callback` (as it was until
-2026-08-31) it froze the single-threaded executor for the whole build, taking odom,
-`/path_request` futures and `publish_thrust` down with it. `PID` and `LoS` build a plain
-Python object and are unaffected either way. One consequence to know: the log line
-`Controller node initiated` now marks *construction*, and no longer implies
-`/blueboat/controller_ready` has arrived — `Controller ready` is the line for that.
+**The controller object is built in `__init__`, not on the first tick.** Only `MPC` cares
+(acados codegen + C compile): from `timer_callback` it froze the single-threaded executor for
+the whole build — odom, `/path_request` futures and `publish_thrust` with it.
 
-**Run sessions (2026-10-09): rebuilding between runs without stopping the loop.** With
-`session_mode:=true` the node idles between runs and a `configure` on
-`/blueboat/run_command` may switch `controller_type`. The construction code was split so the
-very same steps serve both: `_apply_controller_setup(ctype)` (reference window, `B_matrix`,
-LoS allocator — cheap, executor thread) and `_make_controller(ctype)` (returns the object,
+**Rebuilding between runs without stopping the loop.** A session `configure` may switch
+`controller_type`, through the same construction steps as `__init__`:
+`_apply_controller_setup(ctype)` (reference window, LoS allocator — cheap, executor thread) and `_make_controller(ctype)` (returns the object,
 assigns nothing). PID and LoS are rebuilt inside the callback. MPC is submitted to a
 one-thread `ThreadPoolExecutor`: the worker only *constructs* the solver (acados codegen and
 compile release the GIL in the `make` subprocess), and `timer_callback` swaps it in on the
@@ -44,11 +36,9 @@ registered (`last_world_target`, refreshed after every other branch), so the CSV
 columns keep meaning "the reference the run was on".
 
 **The generated acados solver is cached outside the working directory**, in
-`$ROS_HOME/blueboat_control/mpc` (default `~/.ros/blueboat_control/mpc`), resolved by
-`ur_mpc.acados_build_dir()`. acados defaults its json and `code_export_directory` to
-*relative* paths, so before 2026-08-31 the generated C landed wherever the launch was invoked
-from — including, when the Mission Control Station started the run, inside the station's own
-repository — and a new directory meant a full recompile. `ur_mpc.build_solver()` asks acados
+`$ROS_HOME/blueboat_control/mpc` (`ur_mpc.acados_build_dir()`): acados' relative defaults
+put the generated C wherever the launch was invoked from (once inside the station's
+repository), and a new directory meant a full recompile. `ur_mpc.build_solver()` asks acados
 for `generate=False, build=False` so it compares the stored json against the current OCP and
 regenerates only on a real change: measured 1.0 s for a first build, 0.0 s to reuse. Delete
 that directory to force a rebuild. Deliberately **not** under `cf.data_root()` — that tree is
@@ -130,8 +120,13 @@ The window is the only thing `controller_type` changes about the reference:
 
 | `controller_type` | `path_time` | `path_steps` |
 |---|---|---|
-| `PID`, `LoS` | 0.05 s | 2 |
-| `MPC` | 2.5 s | 15 |
+| `PID`, `LoS` | `control_dt` (0.05 s) | 2 |
+| `MPC` | `mpc_time` (6.0 s sim / 2.5 s real) | `mpc_horizon + 1` (31 sim / 16 real) |
+
+`N + 1`, not `N`: `MPCController.solve` reads N stages plus the terminal pose. Requesting N
+made it pad by duplicating the last pose (a zero-velocity terminal reference) and inflated
+every reference velocity by 7.1 % (window spacing `path_time/(N−1)` against the solver's
+`time/N`).
 
 **Guidance.** `PIDLoS` implements canonical Fossen lookahead LoS,
 `psi_d = gamma_p + atan2(-e_y, Delta)`, with path-speed feedforward and optional
@@ -202,13 +197,13 @@ launch argument rather than an edit and a rebuild. Values are read once, at cons
 | Control loop | `control_dt` (0.05) |
 | Path service health | `path_request_timeout` (1.0 s — re-issue a request whose answer never came; without it one lost response wedged the node for the whole run), `path_stale_timeout` (1.0 s — beyond this the governor stops advancing `tau` against the held window). `path_generation` adds `allow_duplicate_server` (False) and `server_discovery_wait` (2.0 s) |
 | Governor | `path_speed_scale`, `gov_Lmin`, `gov_Lmax`, `gov_Emin`, `gov_Emax` |
-| LoS guidance | `los_lookahead` (2.5), `los_ku` (**30.0**, 20.0 before 2026-10-27), `los_kpsi` (4.5, 10.0 before), `los_kd` (1.0), `los_speed_scale` (1.0 real / 2.0 sim) |
+| LoS guidance | `los_lookahead` (2.5), `los_ku` (30.0), `los_kpsi` (4.5), `los_kd` (1.0), `los_speed_scale` (1.0 real / 2.0 sim) |
 | Station-keeping hold | `hold_speed` (0.05, the gate) and `hold_radius` (0.5), both shared by `PID` and `LoS`; `los_hold_kx` (1.0) and `los_hold_umax` (0.8), the LoS surge law only |
-| PID | **Split simulation/real.** `pid_lookahead` (2.5 both); `outer_gains_x` (`[3.5, 0.01, 0]` real / `[6.0, 0.01, 0]` sim), `outer_gains_psi` (`[3.3, 0.01, 0]` / `[4.0, 0.01, 0]`; real kp were 3.0 / 3.0 before 2026-10-27), `inner_gains_u` (`[1.0, 0, 0]` / `[2.0, 0, 0]`), `inner_gains_r` (`[1.5, 0, 0]` / `[2.5, 0, 0]`) |
+| PID | **Split simulation/real.** `pid_lookahead` (2.5 both); `outer_gains_x` (`[3.5, 0.01, 0]` real / `[8.0, 0.01, 0]` sim), `outer_gains_psi` (`[3.3, 0.01, 0]` / `[4.0, 0.01, 0]`), `inner_gains_u` (`[1.0, 0, 0]` / `[2.5, 0, 0]`), `inner_gains_r` (`[1.5, 0, 0]` / `[2.5, 0, 0]`) |
 | MPC | **Split simulation/real, like the PID and point rows** — `mpc_horizon` (30 sim / 15 real), `mpc_time` (6.0 / 2.5), `mpc_R_diag` (0.10 / 0.015), `mpc_Q_diag` (50,50,30,1,1,1 both). The plant **model** is split too — `self.mpc_model`, not a declared parameter — with the simulation column fitted to `hydrodynamics.xacro` (added mass = the xacro values, damping = secant linearisations of its quadratic drag). Plus `mpc_qp_iter_max` (**0**, meaning "derive as `max(50, 4·nu·N)`" = 240 at N = 30, 120 at N = 15) — the qpOASES **working-set budget**, and not optional: `FULL_CONDENSING_QPOASES` is a dense active-set solver, so `nv = mpc_horizon · 2`, and acados' own default of 50 sits *below* the 60 variables of the simulation horizon. That made a saturating solve fail by construction, which is finding **C6** |
-| Point following | `point_k_v` / `point_k_psi` (2.0 / 60.0 in simulation, 0.15 / 100.0 on the real boat), `safety_distance` (−1.0, which disables the arrival check — **pinger branch only** since the manual branch got its own hold) |
-| Manual keep-location | `manual_hold_radius` (1.0 m, `<= 0` disables the whole hold), `manual_reacquire_radius` (1.5 m, 2.0 before 2026-10-27), `manual_hold_kx` (15.0 simulation / 8.0 real, **Newtons per metre**, not the m/s that `los_hold_kx` is), `manual_hold_umax` (defaults to `kx × (reacquire − hold)`, so retuning a radius cannot silently break the handover), `manual_brake_time` (1.0 s) |
-| Thrust | `thrust_limit` (20.0 N) — feeds the allocator clamp, the MPC input bounds **and, since 2026-08-31, `publish_thrust`'s own uniform saturation**. `robot_interface` and `simulation_interface` each declare a parameter of the same name and default (§5) |
+| Point following | `point_k_v` / `point_k_psi` (2.0 / 60.0 in simulation, 0.15 / 100.0 on the real boat), `safety_distance` (1.0 sim / −1.0 real, negative disables the arrival check — **pinger branch only** since the manual branch got its own hold) |
+| Manual keep-location | `manual_hold_radius` (1.0 m, `<= 0` disables the whole hold), `manual_reacquire_radius` (1.5 m), `manual_hold_kx` (15.0 simulation / 8.0 real, **Newtons per metre**, not the m/s that `los_hold_kx` is), `manual_hold_umax` (defaults to `kx × (reacquire − hold)`, so retuning a radius cannot silently break the handover), `manual_brake_time` (1.0 s) |
+| Thrust | `thrust_limit` (20.0 N) — feeds the allocator clamp, the MPC input bounds and `publish_thrust`'s uniform saturation. `robot_interface` and `simulation_interface` each declare a parameter of the same name and default (§5) |
 | Arrow control | `arrow_timeout` (0.5 s) — dead-man on `/blueboat/arrow_thrust`: an older command is not applied (zero thrust, arrow control stays engaged). Session plumbing adds `session_mode` (False), not a tuning knob |
 | Dead zone | `min_thrust` (2.0 N) — the propeller-breakaway floor on `solve_LoS`'s surge term **and on the manual keep-location surge**. `0.0` disables both and restores the pre-2026-08-31 law exactly (§5) |
 
@@ -227,12 +222,12 @@ so the reference window and the solver's horizon cannot disagree.
   (starboard) and `thruster2` at `y = +0.295` (port), and the yaw moment of a body-x force at
   `y` is `-y*Fx`, reproducing `+0.295 / -0.295` exactly; `ROV.read_model` sorts thruster
   joints alphabetically, so `forces[0]` drives `thruster1`; `simulation_interface` unpacks
-  `r, l = thr_input`; `solve_LoS` builds `[v + 0.295*yaw_rate/2, v - 0.295*yaw_rate/2]` (halved 2026-10-27; was the full yaw_rate);
+  `r, l = thr_input`; `solve_LoS` builds `[v + 0.295*yaw_rate, v - 0.295*yaw_rate]` (pursuit and
+  pinger; `manual_keep_location` uses `yaw_rate/2`, halved 2026-10-27);
   `manualMove` treats `input[0]` as right; and the CLI's `move <left> <right> <s>` is stored
   as `[right, left]`.
-- **Saturation is uniform everywhere, and it is one number.** PWM still clamps to
-  `[1100, 1900]`, but thrust is now bounded by a single rule at every point it can leave a
-  node: `ThrustAllocator.allocate`, `master_control.publish_thrust`,
+- **Saturation is uniform everywhere, and it is one number.** PWM clamps to
+  `[1100, 1900]`; thrust is bounded by a single rule at every point it can leave a node: `ThrustAllocator.allocate`, `master_control.publish_thrust`,
   `robot_interface.manualMove` and `simulation_interface` all scale the pair by **one factor**
   rather than clipping each side, and all four read a `thrust_limit` parameter defaulting to
   20.0 N. `thrust_limits.scale_to_limit` is the shared implementation.
@@ -252,12 +247,10 @@ so the reference window and the solver's horizon cannot disagree.
   Uniform scaling keeps the right:left ratio, so the direction of the wrench survives and the
   boat holds its commanded turn-per-metre and simply travels it more slowly.
 
-  Two consequences worth knowing. `publish_thrust` returns the saturated vector and
-  `timer_callback` reassigns `u` from it, so `/monitoring_data[7:9]`, the `.npy` `u1/u2` and
-  the CSV's `right_thr_in`/`left_thr_in` all now agree on what actually went on the wire.
-  And it explains thrust recorded above the ±20 N clamp before this landed:
-  **`solve_LoS` went through no allocator at all** and could emit 30–40 N, which the per-side
-  clip then reshaped rather than rejected. Simulation applied no limit whatsoever.
+  `publish_thrust` returns the saturated vector, so `/monitoring_data[7:9]`, the `.npy`
+  `u1/u2` and the CSV's thrust columns agree with the wire. Thrust recorded above ±20 N in
+  older logs comes from `solve_LoS`, which goes through no allocator (30–40 N, then
+  per-side clipped), and from simulation, which applied no limit at all.
 - **The 0–2 N band does not turn the propellers, and one law lives in it.** The bollard-pull
   table maps 0 N → PWM 1500, 1 N → 1514, 2 N → 1525, so the whole 0–2 N command range lands
   inside a T200 ESC's ~±25 µs neutral deadband. The table itself has no deadband — it crosses
@@ -289,7 +282,7 @@ so the reference window and the solver's horizon cannot disagree.
     inbound. With it the command is continuous in `d` (verified: the largest sample-to-sample
     jump scales linearly with sample spacing, slope `min_thrust/hold_radius` = 4 N/m).
 
-  **What is provably not touched.** The `± 0.295*yaw_rate` differential (as of the floor's change, 2026-09; halved on 2026-10-27 by the owner) — and therefore the
+  **What is provably not touched.** The `± 0.295*yaw_rate` differential — and therefore the
   yaw moment, which way the boat turns and how hard — is bit-identical across 865 200
   (range, bearing) grid points, and the floor never *lowers* the surge at any of them. The
   modified region is **0.61–3.27 m at |bearing| ≤ 69.5°, 5.7 % of the `d ≤ 12 m` plane**;
@@ -348,32 +341,16 @@ so the reference window and the solver's horizon cannot disagree.
   exactly 2.00 m), which is a change to the control law itself — it lifts far-field surge at
   50 m from 10.70 N to 12.94 N — and has deliberately **not** been made here.
 
-- **`param_set` never blocks forever, and always reports (2026-09-04).** It used to
-  set `busy` before its first MAVROS call and clear it *only* in a `call_async`
-  done-callback, with no timeout on any of the four calls — so a hung
-  `/mavros/param/pull` latched it permanently and every later request was dropped
-  with "Parameter sequence in progress" while `robot_interface` re-requested
-  forever. Observed in the field as an override that never locks. Three rules now
-  hold, and none may be removed:
-  1. **No state is cleared only by a callback.** A 0.5 s watchdog abandons any
-     sequence held longer than `param_sequence_timeout_s` (declared parameter,
-     default 20 s — a cold `ParamPull` walks the whole ArduPilot table over
-     MAVLink and is genuinely slow). It is a give-up bound, not an expected
-     duration.
-  2. **Every abandoned sequence is fenced off by a generation counter** (`_seq`,
-     checked first in each done-callback), so a future that completes after its
-     sequence was abandoned cannot write state belonging to the one that
-     replaced it.
-  3. **The node always reports.** `publish_state()` publishes `param_mode` even
-     before the first successful apply (as `''` = "alive, no mode locked"), and a
-     1 Hz heartbeat repeats it so a late subscriber need not wait for a
-     transition. Previously the topic was silent until the first success, which
-     is why `robot_interface` logged `current: ''`.
-  Failures schedule a bounded internal retry (`param_retry_limit` /
-  `param_retry_delay_s`) rather than stopping; the limit bounds self-driven
-  retries only, since an external request resets it.
-  **Downstream consequence, do not break it:** the heartbeat means a repeated
-  `param_mode` value is *not* evidence that a new command was acted on. The
-  Mission Control Station's safe-shutdown therefore requires a **transition** into
-  `default` (`BlueBoat-MCS/.claude/CLAUDE.md` N1). `robot_interface.mode_callback`
-  and `param_callback` are both edge-triggered for the same reason.
+## Bag replay — evidence (2026-10-27)
+
+Run `2026_10_27-16_10_14-HarbourMPC`: roll std 6°, ±20° at 0.6–2 Hz, recorded at **4.2 Hz**.
+The autopilot's ATTITUDE (#30) from `/uas1/mavlink_source`, timed by `time_boot_ms` (the
+lower envelope of receive − boot removes WiFi delays up to 119 ms), matches
+`/mavros/imu/data` to < 0.1°. On that bag's 25 Hz bursts decimated to 4 Hz, the Hermite
+interpolation is 0.60° RMS / 1.5° max against slerp's 1.30 / 3.2. The heave gate pins the
+waterline there (EKF z std 1.73 m, 37 % clipped: altitude noise). End to end
+(`flat_5p0m`, `placement:=origin`): all 1201 pings used `pose_100hz` (age ≤ 20 ms), replayed
+roll correlates with the bag's ATTITUDE at 0.9987 (0.9993 at `rate:=2`), and the two
+transducer heights are antiphase, = 0.285·sin(roll), corr 1.000. Synthetic 60 s bag: pose
+error 1 mm, attitude 0.01°, 0.8 mm drift over 2 s paused under `very_strong` current +
+`rough` waves.

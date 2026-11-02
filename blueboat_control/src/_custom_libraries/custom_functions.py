@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
+"""Shared helpers of the control nodes that need ROS message types: run-file
+locations, thrust->PWM calibration, odometry/target extraction, Gazebo calls,
+quaternion maths. ROS-free geometry lives in frame_math.py instead."""
 
-import rclpy
-# from rclpy.node import Node
 from geometry_msgs.msg import Pose, Quaternion
-# from nav_msgs.msg import Odometry
-# from std_msgs.msg import String
 from visualization_msgs.msg import Marker
 from scipy.spatial.transform import Rotation as R
 import math
@@ -14,13 +13,8 @@ from scipy.interpolate import PchipInterpolator
 
 
 #################### Run-artifact locations ####################
-# Every run artifact (the position CSV, the controller .npy) is written under one
-# root, resolved at runtime rather than inherited from the launch working
-# directory. Inheriting it meant the launcher decided where field record landed:
-# the same runs ended up scattered across the workspace, this repository and the
-# Mission Control Station's repository. Field data is write-once (CLAUDE.md #6),
-# so where it lands must not depend on the directory the operator happened to
-# stand in.
+# One root for every run artifact, resolved at run time, never inherited from
+# the launch's working directory (field data is write-once, CM-7).
 
 def data_root(explicit: str = '') -> str:
     """
@@ -180,7 +174,6 @@ def compute_target(path, dt):
     psi_prev = get_yaw_from_quaternion(present.orientation)
 
     psi_mid = (psi + psi_prev) / 2.0
-    dx_b =  np.cos(psi_mid) * dx + np.sin(psi_mid) * dy
     dy_b = -np.sin(psi_mid) * dx + np.cos(psi_mid) * dy
     v = dy_b / dt 
 
@@ -456,8 +449,3 @@ def enu_to_gps(lat0_deg, lon0_deg, east, north):
     lon = lon0 + dlon
 
     return math.degrees(lat), math.degrees(lon)
-
-# local_to_enu was removed: /blueboat/odom's world frame is local ENU by
-# construction (robot_interface translates position only and keeps yaw
-# absolute), so world -> east/north is the identity. The old function also
-# carried a spurious -pi/2 from treating an ENU yaw as a compass bearing.

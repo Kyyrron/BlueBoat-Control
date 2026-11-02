@@ -9,31 +9,17 @@ allowed to drive the thrusters, then reports the result on
 echo, and the Mission Control Station uses it as the acknowledgement that a
 safe-shutdown command landed (superproject CM-15).
 
-WHY THIS NODE IS FULL OF WATCHDOGS
-----------------------------------
-Every MAVROS call here is a round trip to the autopilot over a wireless link.
-The original version set `self.busy = True` before the first call and cleared
-it ONLY inside a `call_async` done-callback, with no timeout on any of the
-four calls. A `/mavros/param/pull` that never returned -- link drop, mavros
-restart, a lost ACK -- latched `busy` forever, so every later request was
-discarded with "Parameter sequence in progress, ignoring request" while
-robot_interface re-requested every second, forever. Observed in the field as
-an override that never locks, with no give-up and nothing on screen saying
-why.
+Every MAVROS call is a round trip over WiFi; a `/mavros/param/pull` that never
+returned once latched `busy` forever (an override that never locks). Three
+rules, none of which may be removed:
 
-Three rules follow from that, and none of them may be removed:
-
-  1. NO STATE IS EVER CLEARED ONLY BY A CALLBACK. `busy` is also cleared by a
-     wall-clock watchdog (`param_sequence_timeout_s`). A sequence that stops
-     making progress is abandoned, not waited on.
-  2. EVERY ABANDONED SEQUENCE IS FENCED OFF BY A GENERATION COUNTER. A future
-     that completes after its sequence was abandoned must not write state
-     belonging to the sequence that replaced it - `_seq` is checked in every
-     done-callback.
-  3. THE NODE ALWAYS REPORTS. `publish_state()` publishes `param_mode` even
-     when no mode has ever been applied (as the empty string), and a
-     heartbeat repeats it, so "alive but not locked" is distinguishable from
-     "dead" by a consumer that cannot see this node's log.
+  1. NO STATE IS CLEARED ONLY BY A CALLBACK: a watchdog abandons a sequence
+     held past `param_sequence_timeout_s`.
+  2. EVERY ABANDONED SEQUENCE IS FENCED OFF by a generation counter (`_seq`,
+     checked first in every done-callback).
+  3. THE NODE ALWAYS REPORTS: `param_mode` is published even with no mode
+     applied ('' = alive, not locked) and heartbeated at 1 Hz -- so a repeat
+     is state, not an acknowledgement (consumers need a transition).
 """
 
 import time
@@ -55,19 +41,14 @@ THROTTLE_RIGHT = 74       # BlueBoat default mapping
 THROTTLE_LEFT = 73
 
 # --- GCS system-id handling ---
-# ArduPilot only accepts RC_CHANNELS_OVERRIDE (and MANUAL_CONTROL) from the GCS
-# whose MAVLink system id matches SYSID_MYGCS. QGC uses 255 (the default), which
-# is exactly why QGC "just works": its joystick stream is accepted, while a stream
-# from mavros (source sysid 1 by default) would be silently dropped.
-# In 'override' mode we therefore point the autopilot at mavros; in 'default'
-# mode we hand authority back to QGC.
+# ArduPilot accepts RC_CHANNELS_OVERRIDE only from the GCS whose sysid matches
+# SYSID_MYGCS: 'override' points it at mavros (1), 'default' back to QGC (255).
 MAVROS_SYSID = 1
 QGC_SYSID = 255
-# The parameter was renamed between ArduPilot versions; we detect which one exists.
+# Renamed between ArduPilot versions; the one that exists is detected.
 GCS_ID_PARAM_CANDIDATES = ["SYSID_MYGCS", "MAV_GCS_SYSID"]
 
-# Watchdog / heartbeat cadence. The watchdog tick also drives the retry
-# scheduler, so there is exactly one periodic timer owning recovery.
+# The watchdog tick also drives the retry scheduler (one timer owns recovery).
 WATCHDOG_PERIOD_S = 0.5
 HEARTBEAT_PERIOD_S = 1.0
 
@@ -77,9 +58,8 @@ class BlueBoatParameterControl(Node):
         super().__init__('blueboat_parameter_control')
 
         ################## Parameters ##################
-        # A cold ParamPull walks the whole ArduPilot parameter table over
-        # MAVLink and is genuinely slow on a fresh WiFi link, so the default is
-        # generous. It is a give-up bound, not an expected duration.
+        # A give-up bound, not an expected duration: a cold ParamPull walks
+        # the whole parameter table over WiFi.
         self.declare_parameter('param_sequence_timeout_s', 20.0)
         self.declare_parameter('param_retry_limit', 3)
         self.declare_parameter('param_retry_delay_s', 2.0)
@@ -120,12 +100,9 @@ class BlueBoatParameterControl(Node):
         self._retry_at = 0.0           # monotonic deadline for that re-attempt
         self._warned_services = False
 
-        # NOTE: no blocking wait_for_service loop in the constructor anymore.
-        # The old version spun here until mavros was up, so if mavros was slow the
-        # node was completely deaf and the (single) 'override' request from
-        # robot_interface was lost -> random launch hangs. Service availability is
-        # now checked lazily when a request arrives; robot_interface re-sends its
-        # request every second until confirmed, so nothing is lost.
+        # No blocking wait_for_service here (it left the node deaf while mavros
+        # came up): availability is checked per request, and robot_interface
+        # re-sends every second until confirmed.
         self.watchdog_timer = self.create_timer(WATCHDOG_PERIOD_S, self._watchdog)
         self.heartbeat_timer = self.create_timer(HEARTBEAT_PERIOD_S, self._heartbeat)
 
@@ -167,8 +144,7 @@ class BlueBoatParameterControl(Node):
                              ("SERVO3_FUNCTION", THROTTLE_LEFT)]
             gcs_target = QGC_SYSID
         else:
-            # Not a dead end any more: report state so the requester can see that
-            # nothing changed rather than waiting on an echo that will never come.
+            # Report state, so the requester sees nothing changed.
             self.get_logger().error(f"Unknown mode: {mode}")
             self.publish_state()
             return
@@ -412,10 +388,7 @@ class BlueBoatParameterControl(Node):
         ready_msg.data = self.params_ready
         self.ready_pub.publish(ready_msg)
 
-        # Always publish, even before the first successful apply. The empty
-        # string means "this node is alive and no mode is locked" - the old
-        # `if self.current_mode is not None` made that state indistinguishable
-        # from a dead node, and robot_interface logged `current: ''` forever.
+        # Always publish ('' = alive, no mode locked; rule 3).
         mode_msg = String()
         mode_msg.data = self.current_mode if self.current_mode is not None else ""
         self.mode_pub.publish(mode_msg)

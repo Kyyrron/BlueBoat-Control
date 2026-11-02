@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Runtime loader for designer-generated YAML trajectories.
 
-Drop this file next to ``path_generation.py`` in the ``blueboat_control``
-package. It has no dependency on the Mission Control Station: only PyYAML
-(shipped with every ROS2 distribution) and numpy.
+Used by ``path_generation.py``; no dependency on the Mission Control
+Station, only PyYAML and numpy.
 
 The file format (``blueboat_trajectory/1``, see
-``docs/08_trajectory_format.md`` in the station repository) stores a dense
+``docs/05_trajectory_format.md`` in the station repository) stores a dense
 list of time-stamped samples ``[t, x, y, yaw]``. Evaluation at an arbitrary
 time is a binary search plus linear interpolation (yaw interpolated with
 wrap-around), clamped at the final pose — matching the "default to last

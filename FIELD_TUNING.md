@@ -73,9 +73,9 @@ worker thread — about a second when cached, about a minute after any MPC knob 
 
 | Parameter | Default real / sim | Effect |
 |---|---|---|
-| `outer_gains_x` `[kp,ki,kd]` | `[3.5,0.01,0]` / `[6.0,0.01,0]` | Along-track error → surge speed correction on top of the path feedforward. `ki` winds up: keep it tiny. |
+| `outer_gains_x` `[kp,ki,kd]` | `[3.5,0.01,0]` / `[8.0,0.01,0]` | Along-track error → surge speed correction on top of the path feedforward. `ki` winds up: keep it tiny. |
 | `outer_gains_psi` | `[3.3,0.01,0]` / `[4.0,0.01,0]` | Heading error → yaw-rate reference. ↑ = snappier turn onto the path, weaving if too high. |
-| `inner_gains_u` | `[1.0,0,0]` / `[2.0,0,0]` | Surge-speed error → force (N per m/s). |
+| `inner_gains_u` | `[1.0,0,0]` / `[2.5,0,0]` | Surge-speed error → force (N per m/s). |
 | `inner_gains_r` | `[1.5,0,0]` / `[2.5,0,0]` | Yaw-rate error → moment. Too high = thruster chatter. |
 | `pid_lookahead` (Δ) | 2.5 m | `psi_d = gamma_p + atan2(e_y, Δ)`. Small = aggressive cut back to the line, large = damped. |
 | `hold_speed` | 0.05 m/s | Below this authored speed the tangent is rotated toward the bearing to the point, so the along-track term can see the range. |
@@ -167,9 +167,10 @@ Active whenever `/blueboat/manual_target ≠ [0,0]`, in **any** `controller_type
 > (PID / LoS / MPC) goes through the allocator and is unaffected. This is **real and simulation
 > alike** (no split).
 
-> **2026-10-27 retune (real boat only, simulation defaults unchanged):** PID `outer_gains_x` kp
-> 3.0 → 3.5, `outer_gains_psi` kp 3.0 → 3.3; LoS `los_ku` 20 → 30, `los_kpsi` 10 → 4.5;
-> `manual_reacquire_radius` 2.0 → 1.5 m. **No MPC parameter was touched.**
+> **2026-10-27 retune:** real-boat PID `outer_gains_x` kp 3.0 → 3.5, `outer_gains_psi` kp
+> 3.0 → 3.3; LoS `los_ku` 20 → 30, `los_kpsi` 10 → 4.5 and `manual_reacquire_radius`
+> 2.0 → 1.5 m (these three are not split, so simulation too). Simulation PID since:
+> `outer_gains_x` kp 6.0 → 8.0, `inner_gains_u` kp 2.0 → 2.5. **No MPC parameter was touched.**
 
 **Pinger branch** (`use_pinger:=True`, `LoS`) uses the same pursuit law but no hold:
 

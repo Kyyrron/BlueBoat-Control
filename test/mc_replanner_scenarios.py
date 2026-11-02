@@ -20,7 +20,6 @@ Every check is printed and counted; exit code 1 on any failure.
 
 import math
 import os
-import sys
 import tempfile
 import json
 

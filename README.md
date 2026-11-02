@@ -170,7 +170,7 @@ ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: move 3 3 2"
 | `fcu_url` | real | MAVROS ↔ autopilot endpoint. Defaults to `udp://:14550@192.168.2.2:14550`. |
 | `session_mode` | real | **Run session** (default False; the Mission Control Station always passes true). The boat connects and goes into override but nothing follows a path or logs until a run is started on `/blueboat/run_command`; each run gets its own position CSV, report and controller `.npy`. Requires a `controller_type`. |
 | `record_bag` | real | Run sessions only, default True: each run also records a ros2bag of every topic except the side-scan sonar's, filed into the run's folder. |
-| `path_source` | both | `mission` (default): follow `trajectory`, as always. `replanner`: **live path update** — the boat holds where it is until another node (BlueBoat-Replanner) loads a path on `/blueboat/update_path`, and that node may then replace the rest of the path while the boat moves. See `docs/PATH_UPDATE_INTERFACE.md`; quick try: `temp/README.md`. |
+| `path_source` | both | `mission` (default): follow `trajectory`, as always. `replanner`: **live path update** — the boat holds where it is until another node (BlueBoat-Replanner) loads a path on `/blueboat/update_path`, and that node may then replace the rest of the path while the boat moves. See `docs/PATH_UPDATE_INTERFACE.md`; demo: `test/path_update_demo.py`. |
 
 `Replay_launch.py` takes `bag` (required), `world_dir` (empty = the stock world, in the run's
 own launch frame), `rate` (playback rate), `heave` (replay the recorded heave, default True),

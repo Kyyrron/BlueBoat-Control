@@ -71,7 +71,7 @@ tree before and after a full session.
 QT_QPA_PLATFORM=offscreen python3 log_reviewer/smoke_test.py
 ```
 
-121 checks: reading, cropping, the simulation frame, that the numbers still match `poslog_report`'s
+Checks reading, cropping, the simulation frame, that the numbers still match `poslog_report`'s
 own, rendering, export contents, the tile cache, the window, and that the field
 data is byte-for-byte untouched. It needs at least one real poslog under
 `Robot_data/` and skips cleanly (exit 0) when there is none.

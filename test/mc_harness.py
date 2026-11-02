@@ -6,12 +6,13 @@ Gazebo, no wall clock.
 Two jobs:
 
   1. REGRESSION (`--compare HEAD`). Runs fixed-mission scenarios -- library
-     shapes, manual target, arrow keys, run sessions -- for PID, LoS and MPC,
-     once with the master_control.py of a git revision (its whole
-     blueboat_control/src tree, extracted with `git archive`) and once with the
-     working tree, and requires /thruster_input, /monitoring_data and tau to be
-     BIT-IDENTICAL tick by tick. This is the proof that the live path update
-     changes nothing when it is not used.
+     shapes, manual target, arrow keys, run sessions, pinger following (PID and
+     LoS) -- for PID, LoS and MPC, once with the master_control.py of a git
+     revision (its whole blueboat_control/src tree, extracted with `git
+     archive`) and once with the working tree, and requires /thruster_input,
+     /monitoring_data, /controller_target and tau to be BIT-IDENTICAL tick by
+     tick. The proof that a refactor (or the live path update, unused) changes
+     nothing. `--scenarios replanner,replanner_session` compares those too.
 
   2. LIVE PATH UPDATE, offline (`--replanner`). Drives a replanner-owned run of
      the working tree through the real service callback: hold, first path,
@@ -195,6 +196,8 @@ def run_one(src_root, scenario, controller, real, out_path):
             "-p", "server_discovery_wait:=0.0"]
     if sc.get("path_source"):
         args += ["-p", f"path_source:={sc['path_source']}"]
+    if sc.get("use_pinger"):
+        args += ["-p", "use_pinger:=true"]
     rclpy.init(args=args)
 
     pg_ns = _load(src, os.path.join("_custom_libraries", "path_generation.py"), "pg")
@@ -220,7 +223,7 @@ def run_one(src_root, scenario, controller, real, out_path):
     plant = Plant(*sc.get("start", (0.0, 0.0, 0.0)))
     dt = node.dt
     trace = {"thrust": [], "monitoring": [], "tau": [], "answers": [], "events": [],
-             "tick_cost_ms": [], "progress": []}
+             "tick_cost_ms": [], "progress": [], "controller_target": []}
     ctx = Ctx(node, plant, clock, trace, Bool, Float32MultiArray, String)
 
     n_ticks = sc["ticks"]
@@ -242,6 +245,7 @@ def run_one(src_root, scenario, controller, real, out_path):
             node.arrow_thrust_callback(Float32MultiArray(data=[6.0, 3.0]))
         node.odom_callback(plant.odometry())
         n_thr, n_mon = len(node.thruster_input_publisher.msgs), len(node.data_publisher.msgs)
+        n_tgt = len(node.target_publisher.msgs)
         started = _real_time.perf_counter()
         node.timer_callback()
         trace["tick_cost_ms"].append((_real_time.perf_counter() - started) * 1e3)
@@ -251,6 +255,8 @@ def run_one(src_root, scenario, controller, real, out_path):
         trace["thrust"].append([float(v) for v in u])
         trace["monitoring"].append([float(v) for v in mon[-1].data] if mon else None)
         trace["tau"].append(float(node.tau))
+        trace["controller_target"].append(
+            [[float(v) for v in m.data] for m in node.target_publisher.msgs[n_tgt:]])
         if k % 2 == 0 and hasattr(node, "publish_path_progress"):
             node.publish_path_progress()
             trace["progress"].append(json.loads(node.path_progress_publisher.msgs[-1].data))
@@ -354,7 +360,24 @@ SCENARIOS = {
         (1300, lambda c: c.run_command(cmd="stop")))),
 }
 
-REGRESSION = ("circle", "kin_square", "fsin", "manual", "arrow", "session")
+def _pinger_feed_factory(goal=(8.0, 5.0)):
+    """Feed /blueboat/pinger_coordinates every tick: the body-frame vector from
+    the plant to a fixed world point, as robot_interface publishes it."""
+    def feed(c):
+        x, y, psi = c.plant.s[:3]
+        dx, dy = goal[0] - x, goal[1] - y
+        c.node.pinger_callback(c.F32(data=[math.cos(psi) * dx + math.sin(psi) * dy,
+                                           -math.sin(psi) * dx + math.cos(psi) * dy, 0.0]))
+    return feed
+
+
+# Pinger following: PID and LoS only (MPC does not support it); covers the
+# pinger branch, /controller_target and the LoS arrival latch.
+SCENARIOS["pinger"] = dict(use_pinger=True, ticks=1200, controllers=("PID", "LoS"),
+                           actions=_actions((0, _ready)),
+                           on_tick_factory=_pinger_feed_factory)
+
+REGRESSION = ("circle", "kin_square", "fsin", "manual", "arrow", "session", "pinger")
 
 try:                                    # the live-path-update scenarios
     sys.path.insert(0, HERE)
@@ -386,7 +409,8 @@ def compare(rev, controllers, scenarios, real_too):
                              capture_output=True, check=True).stdout
     subprocess.run(["tar", "-x", "-C", head_root], input=archive, check=True)
     rows, failed = [], 0
-    combos = [(s, c, False) for s in scenarios for c in controllers]
+    combos = [(s, c, False) for s in scenarios for c in controllers
+              if c in SCENARIOS[s].get("controllers", CONTROLLERS)]
     if real_too:
         combos += [("kin_square", c, True) for c in controllers]
     for scenario, controller, real in combos:
@@ -399,7 +423,7 @@ def compare(rev, controllers, scenarios, real_too):
         a, b = outs
         same_thr = a["thrust"] == b["thrust"]
         same_mon = a["monitoring"] == b["monitoring"]
-        same_tau = a["tau"] == b["tau"]
+        same_tau = a["tau"] == b["tau"] and a["controller_target"] == b["controller_target"]
         max_thr = max((abs(p - q) for ra, rb in zip(a["thrust"], b["thrust"])
                        for p, q in zip(ra, rb)), default=0.0)
         ok = same_thr and same_mon and same_tau and len(a["thrust"]) == len(b["thrust"])

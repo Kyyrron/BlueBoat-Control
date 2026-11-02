@@ -1,8 +1,7 @@
 # CLAUDE.md — `log_reviewer`
 
-Loaded when working under `log_reviewer/`. Moved verbatim from
-`BlueBoat-Control/.claude/CLAUDE.md` §9 on 2026-10-08 (section references like §6, N7 point
-there).
+Loaded when working under `log_reviewer/`. Section references like §6, N7 point to
+`BlueBoat-Control/.claude/CLAUDE.md`.
 
 A standalone **PySide6 desktop app** at the repository root for reading a recorded mission:
 open a poslog CSV, trim it on a timeline that re-derives every figure and every number live,
@@ -15,14 +14,12 @@ Nothing in it imports `rclpy`, so it needs no sourced workspace.
 
 ```bash
 python3 log_reviewer/run.py [<csv>] [--no-fetch-tiles]
-QT_QPA_PLATFORM=offscreen python3 log_reviewer/smoke_test.py     # the gate, 158 checks
+QT_QPA_PLATFORM=offscreen python3 log_reviewer/smoke_test.py     # the gate; skips without a poslog
 ```
 
-Runs unchanged under `/usr/bin/python3` (matplotlib 3.6.3, numpy 1.26) and under
-`~/ros2_ws/.venv` (3.10.8 / 2.4.4); the gate is run under both. Its dependencies — PySide6,
-matplotlib, numpy, PyYAML, requests, and Pillow via matplotlib — were already in
-`requirements.txt`. **It must not acquire `pandas`:** the system interpreter does not have it,
-and losing that interpreter would mean the app only runs inside the venv.
+Runs under both `/usr/bin/python3` and `~/ros2_ws/.venv` (run the gate under both);
+dependencies PySide6, matplotlib, numpy, PyYAML, requests, Pillow (all in
+`requirements.txt`). **It must not acquire `pandas`:** the system interpreter lacks it.
 
 ## 9.1 The rule that shapes the whole app
 
@@ -57,7 +54,7 @@ layout does *not* reach the app. That is deliberate — four things differ:
 3. **there is no actuation-state strip** (the app was asked not to have one). The
    `actuation_state` column is still read: "Thrust live (state 1)" stays in the summary, so
    dropping the plot does not drop the fact;
-4. the summary lays **22 entries into 8 rows × 3 pairs** (the "Controller" row was added 2026-10-30; `plot_table` grows its rows to fit). `poslog_report._plot_table` uses
+4. the summary lays **22 entries into 8 rows × 3 pairs** (`plot_table` grows its rows to fit). `poslog_report._plot_table` uses
    `per_col = 6` against 3 columns — 18 slots for 19 entries — so **its last row, the world
    origin, is silently dropped from every archived PNG**. Do not copy that back. The gate
    counts rendered cells against entries.
@@ -149,27 +146,16 @@ Mercator-on-equirectangular error stays within one tile — well under a pixel a
   `get_xlim()`, which is correct for a static picture and stale the moment anyone zooms.
 * **The export CSV is copied field by field**, never re-formatted from the parsed floats — a
   round trip through `float()` and `"%f"` would quietly rewrite field data at lower precision.
-* **Nothing numpy reaches PyYAML.** `export.plain()` walks the manifest and converts every
-  numpy scalar before `safe_dump`. This is not defensive tidying: `SafeDumper` represents
-  Python scalars only and raises `RepresenterError: cannot represent an object` on an
-  `np.float64` — and it does so at the LAST step of the export, after the CSV and the picture
-  are already written, leaving a folder that looks finished but has no manifest. numpy leaks in
-  invisibly, because `ax.get_xlim()` returns numpy scalars and `round()` on one returns another,
-  so the value passes every `isinstance(..., float)` eye-test on the way. The bug only fired
-  once someone panned or zoomed before exporting, which is why it survived the first gate;
-  §[3] now exports with numpy limits on purpose. Inside `plain`, **bool is tested after
-  `.item()` and before int** — `bool` subclasses `int`, and `np.bool_` subclasses neither, so
-  an unordered check writes `true` out as `1`.
+* **Nothing numpy reaches PyYAML.** `export.plain()` converts every numpy scalar before
+  `safe_dump`, which otherwise raises at the LAST export step (a folder with no manifest).
+  numpy leaks in invisibly (`ax.get_xlim()`, `round()` on one); gate §[3] exports with numpy
+  limits on purpose. Inside `plain`, **bool is tested after `.item()` and before int**
+  (`bool` subclasses `int`, `np.bool_` neither).
 * **`export()` resolves its root at call time** (`root=None` → `DEFAULT_ROOT`), never as a
-  default argument. A default binds once at import, so a redirected root would leave the
-  caller's already-exists check guarding one folder while the write went to another — and the
-  overwrite prompt would then be protecting the wrong directory. `app._export` passes
-  `root=E.DEFAULT_ROOT` explicitly for the same reason.
-* **The export's error path ends in a dialog, not a traceback.** `_export` catches broadly and
-  names the type, the message and the folder that may hold partial files. An export crosses
-  three libraries and four files; whatever one of them raises, the operator is looking at the
-  window, not at the terminal, and the app has to survive for them to retry.
-
+  default argument (bound at import, the overwrite check would guard the wrong folder);
+  `app._export` passes `root=E.DEFAULT_ROOT` explicitly.
+* **The export's error path ends in a dialog, not a traceback**: `_export` catches broadly
+  and names the type, message and folder that may hold partial files.
 * **The controller comes from the `.npy` filename, never its contents.** Neither poslog nor
   sidecar records it; `poslog_bridge.find_controller` lists `<root>/{PID,LoS,MPC}_data/` for
   `<run-start stamp>-<ctrl>_<real|simulation>_data.npy` (same stamp as the poslog) and shows

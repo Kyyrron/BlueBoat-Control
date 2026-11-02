@@ -3,66 +3,35 @@
 # ============================================================================
 # The controller node: MPC / PID / LoS on one control callback at 20 Hz.
 #
-# The reference is NOT played on a clock. A path parameter tau is advanced by a
-# GOVERNOR that moves the virtual target at the path's authored speed while the
-# boat keeps up, and slows or freezes tau when it falls behind, so the target
-# can never outrun the boat (CLAUDE.md N8). Because the authored speed is the
-# spatial rate of the path's own parameterization, a speed profile that varies
-# along the path is followed with no extra machinery.
+# The reference is not played on a clock: a GOVERNOR advances the path
+# parameter tau from the boat's measured progress, so the target can never
+# outrun the boat (CLAUDE.md N8). 'LoS' is Fossen lookahead LoS, 'PID' the same
+# law with path-speed feedforward, 'MPC' an acados OCP over a horizon window.
+# /monitoring_data is world-frame in every branch; each capture site is marked
+# "# --- world-frame monitoring target ---" (N9).
 #
-# 'LoS' is canonical Fossen lookahead LoS; 'PID' is the same law with
-# path-speed feedforward; 'MPC' solves an acados OCP over a horizon window.
+# Run sessions (session_mode:=true, station real-robot launches only): the node
+# idles until 'start' on /blueboat/run_command and 'configure' may switch
+# controller between runs (MPC built on a worker thread). Live path update
+# (path_source:=replanner, section 7, docs/PATH_UPDATE_*.md): a replanner-owned
+# run holds its own path, fed through /blueboat/update_path, instead of asking
+# /path_request.
 #
-# The world-frame monitoring target is marked throughout with
-# "# --- world-frame monitoring target ---" (CLAUDE.md N9): /monitoring_data
-# carries world-frame x_d/y_d/psi_d in EVERY branch.
-#
-# RUN SESSIONS (session_mode:=true, real-robot launches from the Mission
-# Control Station only). The node starts IDLE: manual target and arrow control
-# work, but no path or pinger is followed and no .npy row is recorded until a
-# 'start' arrives on /blueboat/run_command; 'stop' returns to idle. Between
-# runs a 'configure' may switch controller_type / use_pinger, the MPC solver
-# being built on a worker thread so the loop keeps running. With session_mode
-# false (simulation, CLI) none of this exists and the node behaves as before.
-#
-# LIVE PATH UPDATE (path_source:=replanner, section 7; docs/PATH_UPDATE_*.md).
-# A replanner-owned run holds its path HERE instead of asking /path_request:
-# it starts holding at the boat, takes its first path and every later change
-# through /blueboat/update_path, and composes each reference window locally
-# from that plan -- the governor and the three controllers run unchanged on
-# it. With path_source:=mission (the default, i.e. every fixed mission) the
-# only trace of the feature is /blueboat/path_progress reporting tau.
+# FILE MAP (class Controller):
+#   1. WIRING              __init__, controller construction
+#   2. TUNING KNOBS        _declare_tuning_parameters   <-- gains live here
+#   3. THE CONTROL LOOP    timer_callback               <-- start reading here
+#   4. GUIDANCE            path governor, accept_path, los_guidance, solve_LoS,
+#                          manual_keep_location
+#   5. CALLBACKS/HELPERS   telemetry callbacks, publish_thrust, save_monitoring
+#   6. RUN SESSION         run_command_callback ... _publish_run_state
+#   7. LIVE PATH UPDATE    _init_path_update ... publish_path_progress
+#                          (decisions: _custom_libraries/path_update.py)
 # ============================================================================
 
-# ----------------------------------------------------------------------------
-# FILE MAP (class Controller) -- sections are banner-commented below.
-#
-#   1. WIRING                     __init__
-#   2. TUNING KNOBS               _declare_tuning_parameters   <-- gains live here
-#   3. THE CONTROL LOOP           timer_callback               <-- start reading here
-#   4. GUIDANCE                   warn_if_multiple_path_servers, accept_path,
-#                                 path_progress_errors, advance_governor,
-#                                 los_guidance, solve_LoS, manual_keep_location
-#   5. CALLBACKS / HELPERS        odom_, pinger_, ready_, manual_target_,
-#                                 arrow_thrust_, publish_thrust,
-#                                 save_monitoring, get_time
-#   6. RUN SESSION                run_command_callback, _configure, _start_run,
-#                                 _stop_run, _poll_controller_build,
-#                                 _publish_run_state     (session_mode only)
-#   7. LIVE PATH UPDATE           _init_path_update, update_path_callback,
-#                                 _replanner_reference_step, publish_path_progress
-#                                 (path logic itself: _custom_libraries/path_update.py)
-#
-# Moved out of this file:
-#   inRobotFrame()  ->  _custom_libraries/frame_math.py   (pure geometry, ROS-free)
-# ----------------------------------------------------------------------------
-
-# rclpy
 from rclpy.node import Node, QoSProfile
-from rclpy.qos import QoSDurabilityPolicy
 import rclpy
 
-# Common python libraries
 import contextlib
 import json
 import os
@@ -74,37 +43,43 @@ from concurrent.futures import ThreadPoolExecutor
 from scipy.spatial.transform import Rotation as R
 from datetime import datetime
 
-# ROS2 msg libraries
 from std_msgs.msg import Bool, Float32MultiArray, String
 from nav_msgs.msg import Odometry, Path
 from visualization_msgs.msg import Marker
+from geometry_msgs.msg import PoseStamped
+from blueboat_interfaces.srv import RequestPath, UpdatePath
 
-# Custom libraries
 import ur_mpc
 import PID
-from blueboat_interfaces.srv import RequestPath
-from blueboat_interfaces.srv import UpdatePath
-from geometry_msgs.msg import PoseStamped
 import custom_functions as cf
-import frame_math as fm         # pure world<->body geometry (ROS-free)
+import frame_math as fm         # world<->body geometry (ROS-free)
 import path_stamp as ps         # /path_request response tag (ROS-free)
-import thrust_limits as tl     # uniform thrust saturation (ROS-free)
+import thrust_limits as tl      # uniform thrust saturation (ROS-free)
 import path_update as pu        # live path update core (ROS-free)
+
+# Column names of the controller .npy log; row 0 of the saved array (CM-7).
+NPY_HEADER = ['t', 'x', 'y', 'psi', 'x_d', 'y_d', 'psi_d', 'u1', 'u2']
 
 
 def _wrap(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
 
 
+def _allocation_matrix():
+    """B of the two-thruster allocation: [surge, sway, yaw] = B @ [right, left]."""
+    radius = 0.59/2
+    return np.array([[1.        ,1.],
+                     [0.        ,0.],
+                     [radius,-radius]])
+
+
 def _reference_pose(path):
     """[x, y, psi] of the FIRST pose of a reference window, world frame.
 
-    The one definition of "where the reference is right now", shared by every
-    controller branch so that /monitoring_data[4:6] -- and therefore the
-    position CSV's target_x/target_y and the .npy's x_d/y_d -- means the same
-    thing whatever controller ran (N9). It is deliberately NOT what the PID and
-    LoS laws are handed: cf.compute_target needs the second pose as well, to
-    difference the window into u, v and r.
+    The one definition of "where the reference is now", shared by every branch
+    so /monitoring_data[4:6] (hence the CSV target columns and the .npy x_d/y_d)
+    means the same thing whatever controller ran (N9). Not what the PID and LoS
+    laws are handed: cf.compute_target differences the window's second pose too.
     """
     pose = path.poses[0].pose
     q = pose.orientation
@@ -115,46 +90,28 @@ def _reference_pose(path):
 class Controller(Node):
 
     # ======================================================================
-    #  1. WIRING
-    #  topics, service, timer. Read this to see what the node talks to.
+    #  1. WIRING -- topics, services, timers, state
     # ======================================================================
 
     def __init__(self):
 
         super().__init__('master_control', namespace='blueboat')
 
+        self.controller_type = self._param('controller_type', 'MPC').string_value
+        self.isSimulation = self._param('simulation', True).bool_value
+        self.use_pinger = self._param('use_pinger', False).bool_value
+        # Run sessions (section 6): only a station real-robot launch sets it.
+        self.session_mode = self._param('session_mode', False).bool_value
+        # Empty = resolve it (custom_functions.data_root).
+        self.data_root = cf.data_root(self._param('data_dir', '').string_value)
 
-        self.declare_parameter('controller_type', 'MPC') 
-        self.controller_type = self.get_parameter('controller_type').get_parameter_value().string_value
-
-        self.declare_parameter('simulation', True) 
-        self.isSimulation = self.get_parameter('simulation').get_parameter_value().bool_value
-
-        self.declare_parameter('use_pinger', False)
-        self.use_pinger = self.get_parameter('use_pinger').get_parameter_value().bool_value
-
-        # Run sessions (section 6). False everywhere except a real-robot launch
-        # started by the Mission Control Station (BlueBoat_launch.py
-        # session_mode:=true): there the node idles until a run is started.
-        self.declare_parameter('session_mode', False)
-        self.session_mode = self.get_parameter('session_mode').get_parameter_value().bool_value
-
-        # Empty means "resolve it" - see custom_functions.data_root for the order.
-        self.declare_parameter('data_dir', '')
-        self.data_root = cf.data_root(
-            self.get_parameter('data_dir').get_parameter_value().string_value)
-
-        # Every tuning constant, declared with today's value as its default.
         self._declare_tuning_parameters()
 
         self.odom_subscriber = self.create_subscription(Odometry, '/blueboat/odom', self.odom_callback, 10)
         self.pinger_subscriber = self.create_subscription(Float32MultiArray, '/blueboat/pinger_coordinates', self.pinger_callback, 10)
         self.ready_subscriber = self.create_subscription(Bool, '/blueboat/controller_ready', self.ready_callback, 10)
-   
         self.manual_target_subscriber = self.create_subscription(Float32MultiArray, '/blueboat/manual_target', self.manual_target_callback, 10)
-        # Arrow-key thrust from the station: [right, left] N streamed while the
-        # operator drives with the keyboard, [] to release. Inert unless someone
-        # publishes, so it exists in every mode (simulation included).
+        # Station arrow keys: [right, left] N while driving, [] to release.
         self.arrow_subscriber = self.create_subscription(Float32MultiArray, '/blueboat/arrow_thrust', self.arrow_thrust_callback, 10)
 
         self.data_publisher = self.create_publisher(Float32MultiArray, "/monitoring_data", 10)
@@ -162,15 +119,12 @@ class Controller(Node):
         self.thruster_input_publisher = self.create_publisher(Float32MultiArray, "/thruster_input", 10)
         self.pose_arrow_publisher = self.create_publisher(Marker, "/pose_arrow", 10)
 
-        # Run-session plumbing (section 6): commands in, state out (published on
-        # every change and heartbeated at 1 Hz - a one-shot status races DDS
-        # discovery exactly like controller_ready did).
         if self.session_mode:
             self.run_command_subscriber = self.create_subscription(String, '/blueboat/run_command', self.run_command_callback, 10)
             self.run_state_publisher = self.create_publisher(String, '/blueboat/run_state', 10)
 
-        # Create a client for path request. In a session path_generation always
-        # runs (the follow mode can change between runs), so the client does too.
+        # In a session path_generation always runs (the follow mode can change
+        # between runs), so the client does too.
         if not self.use_pinger or self.session_mode:
             self.client = self.create_client(RequestPath, '/path_request')
 
@@ -179,14 +133,12 @@ class Controller(Node):
 
             self.warn_if_multiple_path_servers()
 
-        self.future = None # Used for client requests
+        self.future = None              # in-flight /path_request
 
         self.time_set = False
         self.initial_time = None
-        # self.dt is set by _declare_tuning_parameters (20 Hz default, was 1.0 Hz)
         self.timer = self.create_timer(self.dt, self.timer_callback)
-        # The controller log is written here, off the control tick, and a
-        # final write happens on shutdown so nothing recorded is lost.
+        # The .npy is written off the control tick (save_monitoring).
         self.log_timer = self.create_timer(2.0, self.save_monitoring)
 
         self.current_pose = None
@@ -196,77 +148,50 @@ class Controller(Node):
         self.pinger_target = None
         self.manual_target = [0.0,0.0]
 
-        # Initialize controller 
         self.controller_path = Path()
 
-        # /path_request response validation. The response is a bare
-        # nav_msgs/Path with nothing saying which request it answers, so these
-        # carry the question the answer has to match.
+        # /path_request response validation (accept_path): the response is a
+        # bare Path, so these carry the question it has to answer.
         self.tau_requested = None       # parameter the in-flight request asked for
         self.request_sent = None        # when it went out, for the timeout
         self.path_rx_time = None        # when the held window last arrived
         self.path_stamps_are_parameters = None   # None = not yet established
         self.foreign_path_count = 0
 
-        # ---- Path-parameter governor state ----------------------------------
-        # tau is the path parameter of the virtual target (same units as the
-        # path_generation time argument). It advances by the governor, NOT by
-        # the wall clock.
+        # Path parameter of the virtual target, advanced by the governor (N8).
         self.tau = 0.0
-        # path_speed_scale / gov_Lmin / gov_Lmax are declared parameters, set by
-        # _declare_tuning_parameters.
-        # ---------------------------------------------------------------------
 
-        # Per-controller reference window, allocation matrix and allocator.
-        # Moved into a method so a run session can switch controller between
-        # runs through the very same code (section 6); here it runs exactly as
-        # it always did, once, for the launched controller_type.
-        self.controller = None # Updated by _build_controller at the end of __init__
+        self.controller = None          # built by _build_controller below
         self._apply_controller_setup(self.controller_type)
 
-        # k_v, k_psi (point following) and safety_distance are declared
-        # parameters, set by _declare_tuning_parameters. Their defaults still
-        # differ between simulation and the real boat.
-        self.stopping_sequence = False # Used as a safety to stop LoS control when it gets close to target
+        # Pinger-branch arrival latch (solve_LoS); safety_distance arms it.
+        self.stopping_sequence = False
         self.stopping_time = None
 
-        # Manual-target keep-location state. Deliberately SEPARATE from
-        # stopping_sequence: that flag stays the pinger branch's, so the two
-        # point-following modes can no longer mute one another.
-        #   manual_hold        - True while holding station on a reached target
-        #   manual_brake_t0    - when the arrival reverse pulse started
-        #   manual_hold_target - the target the state above refers to, so a
-        #                        repeat of the same target does not re-arm the
-        #                        pulse while a genuinely new one does
+        # Manual-target keep-location state (manual_keep_location), separate
+        # from the pinger latch so the two point modes cannot mute each other.
+        #   manual_hold        - holding station on a reached target
+        #   manual_brake_t0    - start of the arrival reverse pulse
+        #   manual_hold_target - the target the state refers to, so a repeat of
+        #                        the same target does not re-arm the pulse
         self.manual_hold = False
         self.manual_brake_t0 = None
         self.manual_hold_target = None
 
-        # Initialize monitoring values
-        # Monitoring rows. The header goes in as strings, which is what makes
-        # np.save coerce the whole array to <U32 on write -- unchanged, because
-        # every existing log and every analysis script read that schema (CM-7). What did
-        # change is WHEN: see save_monitoring().
-        self.monitoring = []
-        self.monitoring.append(['t','x','y','psi','x_d','y_d','psi_d','u1','u2'])
+        self.monitoring = [list(NPY_HEADER)]
         self.monitoring_saved_rows = 0
 
-        self.t_record = self.get_time()
-
-        # Arrow-key control state (arrow_thrust_callback). Highest priority of
-        # every branch while active; a stale stream commands zero, it never
-        # falls through to autonomous control.
-        #   arrow_active      - engaged by any [right, left] message, released
-        #                       by [], by a manual target, or by a run start
-        #   last_world_target - the most recent world-frame target of any
-        #                       branch, held as the logged target meanwhile
+        # Arrow control (arrow_thrust_callback): highest priority while active;
+        # a stale stream commands zero, never autonomous control.
+        # last_world_target is the latest world-frame target of any branch,
+        # logged as the target while the keys drive.
         self.arrow_active = False
         self.arrow_cmd = [0.0, 0.0]
         self.arrow_rx = None
         self.last_world_target = None
 
-        # Run-session state (section 6). Outside a session a run is simply
-        # always active, which is what makes every gate below a no-op there.
+        # Run-session state (section 6). Outside a session a run is always
+        # active, which makes every run gate a no-op.
         self.run_active = not self.session_mode
         self.run_status = 'idle'        # idle | loading | running | error
         self.run_number = 0
@@ -281,31 +206,41 @@ class Controller(Node):
         self._build_pinger = None       # follow mode requested with that build
 
         if not self.session_mode:
-            ctrl = self.controller_type
-            date = datetime.today().strftime('%Y_%m_%d-%H_%M_%S')
-            sim = 'simulation' if self.isSimulation else 'real'
-            run_dir = cf.ensure_data_dir(self, self.data_root, 'data', f'{ctrl}_data')
-            self.title = cf.reserve_run_file(run_dir, f'{date}-{ctrl}_{sim}_data', '.npy')
+            self.title = self._reserve_npy(self.controller_type)
             self.get_logger().info(f"Controller log: {self.title}.npy")
         else:
-            # One .npy per RUN, reserved at its start (_start_run): nothing is
-            # recorded, and no empty file is claimed, while the session idles.
+            # One .npy per run, reserved at its start: nothing while idle.
             self.title = None
             self.run_state_timer = self.create_timer(1.0, self._publish_run_state)
 
-        # Build the controller HERE, not on the first tick. The MPC branch runs
-        # acados code generation and a C compile, which takes tens of seconds
-        # the first time; done from timer_callback it froze the whole node --
-        # the executor is single-threaded, so odom, /path_request futures and
-        # publish_thrust all stopped with it, and the interface-side watchdog
-        # then zeroed the thrust. Doing it before rclpy.spin means the cost is
-        # paid once, visibly, at launch, and a failure kills the node where the
-        # operator can see it instead of hanging the control loop.
+        # Built here, not on the first tick: MPC's acados codegen + compile run
+        # from timer_callback froze the single-threaded executor (odom, path
+        # futures, publish_thrust), and a failure here is visible at launch.
         self._build_controller()
 
-        # Live path update (section 7). Last, so every piece of state it reads
-        # exists. Inert in a fixed-mission run apart from the progress topic.
+        # Last, so every piece of state it reads exists.
         self._init_path_update()
+
+    # ------------------------------------------------------------------ #
+    #  Parameters and files                                              #
+    # ------------------------------------------------------------------ #
+    def _param(self, name, default):
+        """Declare one parameter and return its ParameterValue."""
+        self.declare_parameter(name, default)
+        return self.get_parameter(name).get_parameter_value()
+
+    def _dbl(self, name, default):
+        return self._param(name, float(default)).double_value
+
+    def _int(self, name, default):
+        return self._param(name, int(default)).integer_value
+
+    def _reserve_npy(self, ctrl):
+        """Claim this run's controller log name (without the .npy suffix)."""
+        date = datetime.today().strftime('%Y_%m_%d-%H_%M_%S')
+        sim = 'simulation' if self.isSimulation else 'real'
+        run_dir = cf.ensure_data_dir(self, self.data_root, 'data', f'{ctrl}_data')
+        return cf.reserve_run_file(run_dir, f'{date}-{ctrl}_{sim}_data', '.npy')
 
     # ------------------------------------------------------------------ #
     #  Controller construction                                           #
@@ -315,12 +250,9 @@ class Controller(Node):
     def _no_stdin():
         """Run a block with stdin closed, so a prompt raises instead of blocking.
 
-        acados_template's get_tera() asks `input("... download tera? y/N")` when
-        the Tera renderer binary is missing. Under `ros2 launch` stdout is block
-        buffered and stdin never delivers a line, so the question is invisible
-        and the read never returns -- the node just stops, forever. With stdin
-        pointed at /dev/null the same call raises EOFError immediately and we
-        get to report something useful.
+        acados_template's get_tera() asks `input(...)` when the Tera renderer is
+        missing; under `ros2 launch` that prompt is invisible and never returns.
+        With stdin on /dev/null it raises EOFError and we can report it.
         """
         saved = sys.stdin
         try:
@@ -359,64 +291,33 @@ class Controller(Node):
     def _apply_controller_setup(self, controller_type):
         """Reference window, allocation matrix and allocator for one controller.
 
-        Everything here is cheap and depends only on declared parameters, so it
-        runs on the executor thread: once from __init__, and in a run session
-        again whenever a 'configure' switches controller (section 6).
+        Cheap and parameter-only, so it runs on the executor thread: from
+        __init__, and again when a session 'configure' switches controller.
         """
-        # MPC Parameters
         if controller_type == 'MPC':
-            # mpc_horizon, mpc_time, Q_weight, R_weight and input_bounds are
-            # declared parameters, set by _declare_tuning_parameters.
-
-            # Derived from the horizon, never declared separately: the reference
-            # window and the solver's horizon must not be able to disagree.
-            #
-            # N + 1, not N. MPCController.solve reads N+1 poses --
-            # N stages plus the terminal one -- so requesting N made it pad by
-            # duplicating the last pose, giving a zero-velocity terminal
-            # reference. It also desynchronised the two spacings: this window's
-            # dtau was path_time/(path_steps-1) while the solver divides by
-            # time/horizon, inflating every reference velocity by 7.1 %. With
-            # N+1 poses the two are identically time/horizon.
+            # Derived, never declared, so window and horizon cannot disagree.
+            # N + 1 poses: solve() reads N stages plus the terminal one, and
+            # this spacing (time/horizon) is exactly the solver's.
             self.path_time = self.mpc_time
             self.path_steps = self.mpc_horizon + 1
 
-        # PID Parameters
         if controller_type == 'PID':
             self.path_time = self.dt
             self.path_steps = 2
 
-            # outer_gains, inner_gains, pid_lookahead and thruster_limits are
-            # declared parameters, set by _declare_tuning_parameters.
-
-            radius = 0.59/2
-            self.B_matrix = np.array([[1.        ,1.],
-                                      [0.        ,0.],
-                                      [radius,-radius]])
-
-        # LoS Parameters
         if controller_type ==  'LoS':
             self.path_time = self.dt
             self.path_steps = 2
-
-            radius = 0.59/2
-            self.B_matrix = np.array([[1.        ,1.],
-                                      [0.        ,0.],
-                                      [radius,-radius]])
-            # The kinematic Fossen-LoS gains (los_lookahead, los_ku, los_kpsi,
-            # los_kd, los_speed_scale) and thruster_limits are declared
-            # parameters, set by _declare_tuning_parameters.
-            self.los_allocator = PID.ThrustAllocator(self.B_matrix, limits=self.thruster_limits)
+            self.los_allocator = PID.ThrustAllocator(_allocation_matrix(),
+                                                     limits=self.thruster_limits)
 
     def _make_controller(self, controller_type):
         """Construct and RETURN the controller object for controller_type.
 
-        PID builds a plain Python object in microseconds; LoS has none (its
-        laws are methods of this node), so None. MPC runs acados code
-        generation and a C compile, so it gets a preflight check and an
-        explicit progress line. Assigns nothing: a run session calls this for
-        MPC from a worker thread and swaps the result in on the executor thread
-        (_poll_controller_build), so it must touch no node state.
+        PID: a plain Python object. LoS: None (its laws are methods of this
+        node). MPC: acados codegen + C compile, with a preflight check. Assigns
+        nothing, because a session calls it for MPC from a worker thread and
+        swaps the result in on the executor thread (_poll_controller_build).
         """
         if controller_type == 'MPC':
             self._check_acados_ready()
@@ -449,12 +350,8 @@ class Controller(Node):
             return controller
 
         if controller_type == 'PID':
-            radius = 0.59/2
-            B = np.array([[1.        ,1.],
-                          [0.        ,0.],
-                          [radius,-radius]])
             return PID.PIDLoS(dt = self.dt,
-                              B = B,
+                              B = _allocation_matrix(),
                               outer_gains = self.outer_gains,
                               inner_gains = self.inner_gains,
                               lookahead = self.pid_lookahead,
@@ -473,69 +370,40 @@ class Controller(Node):
 
     # ======================================================================
     #  2. TUNING KNOBS -- every gain, all in one place
-    #  Change a value here, or override it with a launch argument.
+    #  Values, real/sim splits and measurements: src/CLAUDE.md section 4 and
+    #  FIELD_TUNING.md. Change a default here or override it at launch.
     # ======================================================================
 
-    # ------------------------------------------------------------------ #
-    #  Tuning parameters                                                 #
-    # ------------------------------------------------------------------ #
     def _declare_tuning_parameters(self):
         """
-        Declare every tuning constant of the control stack, with today's value
-        as its default, so a gain change costs a launch argument rather than an
-        edit and a rebuild.
-
-        Declared unconditionally - independent of controller_type - so that
-        `ros2 param list` shows the whole set whatever controller is running.
-
-        ROS 2 has no dict or tuple parameter type, so the composite constants
-        (gain triples, MPC weight diagonals) are declared as double arrays and
-        reassembled here. Every name is new: nothing already on the wire is
-        renamed or retyped (N1). Defaults live in this node rather than in a
-        launch file, so simulation and the real boat get them identically (N2).
-
-        Values are read once, at construction. Changing one takes effect at the
-        next launch, not mid-run.
+        Declare every tuning constant with today's value as its default,
+        unconditionally (whatever controller_type), so `ros2 param list` shows
+        the whole set. Composite constants are double arrays reassembled here
+        (ROS 2 has no tuple type). Read once, at construction.
         """
-        def dbl(name, default):
-            self.declare_parameter(name, float(default))
-            return self.get_parameter(name).get_parameter_value().double_value
-
-        def integer(name, default):
-            self.declare_parameter(name, int(default))
-            return self.get_parameter(name).get_parameter_value().integer_value
+        dbl, integer = self._dbl, self._int
 
         def arr(name, default):
-            self.declare_parameter(name, [float(v) for v in default])
-            value = list(self.get_parameter(name).get_parameter_value().double_array_value)
+            value = list(self._param(name, [float(v) for v in default]).double_array_value)
             if len(value) != len(default):
                 raise ValueError(f"parameter '{name}' expects {len(default)} "
                                  f"values, got {len(value)}")
             return value
 
-        # -- control loop --------------------------------------------------
-        # Load-bearing beyond the gains: the governor rescales with it, and the
-        # MPC solve has to finish inside it.
+        # -- control loop (the governor rescales with it; MPC must solve in it)
         self.dt = dbl('control_dt', 0.05)
 
         # -- path-parameter governor ---------------------------------------
         self.path_speed_scale = dbl('path_speed_scale', 1.0)
         self.gov_Lmin = dbl('gov_Lmin', 0.5)
         self.gov_Lmax = dbl('gov_Lmax', 3.0)
-        # Cross-track half of the governor: same shape and units as the
-        # along-track pair. gov_Emax = 0 disables it, which is the default.
-        #
-        # Off by default because the cross-track term is only safe once the
-        # inner loops can actually close a lateral gap. At the shipped gains
-        # they cannot, and throttling the target on an error the controller
-        # cannot reduce is positive feedback: the target stalls, the boat
-        # loses the forward authority it converges with, and the offset grows.
-        # Raise the inner gains first, then set gov_Emax (5.0 is a reasonable
-        # starting point) - see CLAUDE.md section 4.
+        # Cross-track gate; gov_Emax = 0 (default) disables it. Only safe once
+        # the inner loops can close a lateral gap: throttling tau on an error
+        # the controller cannot reduce is positive feedback.
         self.gov_Emin = dbl('gov_Emin', 0.5)
         self.gov_Emax = dbl('gov_Emax', 0.0)
 
-        # -- PID ------------------------------------------------------------
+        # -- PID (split simulation/real) -------------------------------------
         if not self.isSimulation:
             self.outer_gains = {'x':   tuple(arr('outer_gains_x',   [3.5, 0.01, 0.0])),
                                 'psi': tuple(arr('outer_gains_psi', [3.3, 0.01, 0.0]))}
@@ -548,131 +416,52 @@ class Controller(Node):
             self.inner_gains = {'u': tuple(arr('inner_gains_u', [2.5, 0.0, 0.0])),
                                 'r': tuple(arr('inner_gains_r', [2.5, 0.0, 0.0]))}
             self.pid_lookahead = dbl('pid_lookahead', 2.5)
-            
+
         # -- kinematic Fossen-LoS -------------------------------------------
         self.los_lookahead   = dbl('los_lookahead', 2.5)
         self.los_ku          = dbl('los_ku', 30.0)
         self.los_kpsi        = dbl('los_kpsi', 4.5)
         self.los_kd          = dbl('los_kd', 1.0)
         self.los_speed_scale = dbl('los_speed_scale', 1.0 if not self.isSimulation else 2.0)
-        # Zero-authored-speed hold. A stationary reference (station_keeping, a
-        # clamped-out mission, the awaiting-YAML fallback) gives U_d = 0, and
-        # neither controller can hold position on one: LoS commands zero surge,
-        # and PID's along-track term cannot see a cross-track error because the
-        # path tangent it projects onto is meaningless. Below hold_speed both
-        # blend to steering at the reference point instead.
-        #
-        # hold_speed is the gate and hold_radius is "on station"; both are shared
-        # with the PID branch, which has the same problem for the same reason.
-        # The gate is what keeps this inert on a real path: every authored
-        # trajectory runs at >= 0.28 m/s, so the blend weight is exactly zero and
-        # both laws are unchanged. Raising it above the slowest authored speed
-        # would start altering path following.
+        # Zero-authored-speed hold, shared by PID and LoS: a stationary
+        # reference (U_d = 0) blends to steering at the point below hold_speed.
+        # Inert on real paths: every library shape runs >= 0.28 m/s, so the
+        # blend weight is exactly zero there.
         self.hold_speed      = dbl('hold_speed', 0.05)
         self.hold_radius     = dbl('hold_radius', 0.5)
         self.los_hold_kx     = dbl('los_hold_kx', 1.0)
         self.los_hold_umax   = dbl('los_hold_umax', 0.8)
 
-        # -- point following (manual target and pinger) ----------------------
-        # Simulation and the real boat have always used different values here.
+        # -- point following (manual target and pinger; split sim/real) ------
         self.k_v   = dbl('point_k_v',   2.0  if self.isSimulation else 0.15)
         self.k_psi = dbl('point_k_psi', 60.0 if self.isSimulation else 100.0)
-        # Negative disables the arrival check. Since the manual-target branch
-        # got its own keep-location hold below, this governs the PINGER branch
-        # only, which is why its defaults are untouched.
+        # Pinger-branch arrival check only; negative disables it.
         self.safety_distance = dbl('safety_distance', 1.0 if self.isSimulation else -1.0)
 
-        # -- manual-target keep-location hold --------------------------------
-        # A reached manual target is a station to hold, not a place to stop.
-        # The old behaviour was a one-shot latch: arrive, reverse for a second,
-        # then command zero for the rest of the run. In any current that is a
-        # boat sitting at zero thrust being pushed out of the survey area, and
-        # on the real boat the latch never even armed (safety_distance = -1.0),
-        # so the point law hunted around the target instead of settling.
-        #
-        # This replaces the latch with a state that is re-evaluated every tick:
-        #
-        #   d <= manual_hold_radius      -> on station, hold
-        #   d >  manual_reacquire_radius -> blown off station, resume pursuit
-        #
-        # and inside the hold the surge is proportional to the range outside
-        # manual_hold_radius rather than zero, so the law never stops answering
-        # a disturbance. It is the same shape as los_guidance's zero-authored-
-        # speed hold (steer at the point, surge proportional to the gap, capped,
-        # never reverse, cos-shaped) - but the gains cannot be shared with it.
-        # los_hold_kx / los_hold_umax are VELOCITIES fed through los_ku and the
-        # allocator; solve_LoS writes its surge straight onto the wire as if it
-        # were Newtons, so the two live in different units.
-        #
-        # The gains are set so the hold meets the pursuit law at the handover
-        # rather than stepping there. At d = manual_reacquire_radius the pursuit
-        # surge is 8.38 (real) and 15.42 (simulation), so a gain of 8.0 / 15.0
-        # per metre of gap arrives within half a Newton:
-        #
-        #     d      pursuit real   hold real   pursuit sim   hold sim
-        #     1.00        5.30         0.00        13.10         0.00
-        #     1.25        6.20         2.00        13.88         3.75
-        #     1.50        7.00         4.00        14.50         7.50
-        #     2.00        8.38         8.00        15.42        15.00
-        #
-        # The 2.00 N row is also the ESC breakaway: below it the propellers do
-        # not turn, so the effective station-keeping box is manual_hold_radius
-        # plus about 0.25 m on the real boat. That is deliberate - flooring the
-        # hold surge the way the pursuit law is floored would push the boat
-        # around inside its own deadband instead of letting it sit.
-        # manual_hold_radius <= 0.0 disables the hold entirely and restores the
-        # pre-2026-09-03 behaviour of the manual branch exactly.
+        # -- manual-target keep-location hold (manual_keep_location) ---------
+        # On station inside manual_hold_radius, pursuit again beyond
+        # manual_reacquire_radius. kx is in N per metre (solve_LoS writes
+        # Newtons), chosen so the hold meets the pursuit law at the handover
+        # (8.00 vs 8.38 N real, 15.00 vs 15.42 N sim). manual_hold_radius <= 0
+        # disables the hold and restores the old arrival latch exactly.
         self.manual_hold_radius      = dbl('manual_hold_radius', 1.0)
         self.manual_reacquire_radius = dbl('manual_reacquire_radius', 1.5)
         self.manual_hold_kx   = dbl('manual_hold_kx', 15.0 if self.isSimulation else 8.0)
-        # Derived by default rather than declared independently, so retuning a
-        # radius cannot silently break the handover the gains were chosen for.
+        # Derived by default, so retuning a radius cannot break the handover.
         self.manual_hold_umax = dbl(
             'manual_hold_umax',
             self.manual_hold_kx * max(0.0, self.manual_reacquire_radius
                                            - self.manual_hold_radius))
-        # Seconds of reverse on each fresh arrival, to kill the way on.
-        self.manual_brake_time = dbl('manual_brake_time', 1.0)
+        self.manual_brake_time = dbl('manual_brake_time', 1.0)   # s of reverse on arrival
 
-        # -- MPC -------------------------------------------------------------
-        # Simulation and the real boat get different values here, for the same
-        # reason the PID gains and the point-following gains above do -- except
-        # that for the MPC the split covers the plant MODEL as well as the
-        # weights, because an optimiser's behaviour is set by what it believes
-        # about the boat, not only by what it is told to care about.
-        #
-        # THE MODEL. The real-boat column is unchanged: those coefficients have
-        # been in the tree since the beginning and their provenance is unknown,
-        # so nothing here claims to improve
-        # them. The simulation column is FITTED TO THE GAZEBO PLANT, i.e. to
-        # blueboat_description/urdf/hydrodynamics.xacro, which is what the boat
-        # in simulation actually obeys. The two disagreed badly -- surge mass
-        # 2.0x heavy, yaw inertia 4.8x heavy (27.41 vs 5.76 kg m^2), yaw drag
-        # 2-4x over -- so the MPC planned trajectories the sim boat could not
-        # fly, discovered the deficit, and spent every newton it had. Measured
-        # symptom: 77.5 % of ticks on the +/-20 N bound at a 0.70 m/s mission,
-        # with the effort going into yaw (|differential| 8.54 N against 5.44 N
-        # of surge).
-        #
-        # Added mass maps one-for-one: acados builds M = M_rb - diag(a_*) and
-        # the xacro states xDotU / yDotV / nDotR with the same sign convention,
-        # so a_u/a_v/a_r ARE the xacro values.
-        #
-        # Damping does not map one-for-one. export_underwater_model carries a
-        # linear D only, while the plant is linear + quadratic, and the
-        # quadratic term dominates above ~0.4 m/s. Each d_* below is therefore a
-        # SECANT linearisation -- the linear coefficient whose steady-state drag
-        # equals the plant's at a representative operating point:
-        #
-        #   d_u = 25.15 + 33.800 * 0.45 m/s    -> exact at 0.45 m/s, and within
-        #                                         +14 % / -17 % over 0.30-0.70
-        #   d_v =  7.364 + 54.269 * 0.10 m/s   -> sway stays small in normal use
-        #   d_r =  3.744 + 40.000 * 0.15 rad/s -> 0.15 is the p75 of |yaw rate|
-        #                                         measured across every recorded
-        #                                         sim run (median 0.000, p90 0.407)
-        #
-        # These are FITTED NUMBERS, not physics: refit them if hydrodynamics.xacro
-        # changes, or if missions settle at a cruise speed far from 0.45 m/s.
+        # -- MPC (split simulation/real, plant model included) ---------------
+        # Real column: in-tree since the beginning, provenance unknown. Sim
+        # column: fitted to blueboat_description/urdf/hydrodynamics.xacro.
+        # Added mass = the xacro's xDotU/yDotV/nDotR; damping is a SECANT
+        # linearisation of its linear + quadratic drag (the acados model is
+        # linear-only):  d_u = 25.15 + 33.800*0.45 m/s,
+        # d_v = 7.364 + 54.269*0.10 m/s,  d_r = 3.744 + 40.000*0.15 rad/s.
+        # Refit if the xacro changes or missions cruise far from 0.45 m/s.
         if not self.isSimulation:
             self.mpc_model = {'robot_mass': 16.01,   # blueboat.xacro mass
                               'iz':          5.64,   # blueboat.xacro izz
@@ -688,14 +477,9 @@ class Controller(Node):
                               'd_v': -12.79,         # secant of yV + yVabsV*|v|
                               'd_r':  -9.74}         # secant of nR + nRabsR*|r|
 
-        # THE HORIZON. 6.0 s / 30 steps in simulation is the one MPC change in
-        # this repository with a measurement behind it: the circle's steady
-        # radial offset goes -1.019 m -> -0.011 m and cruise
-        # speed 26 % fast -> exact. Real-robot runs stay at 2.5 s / 15 until the
-        # solve time is measured in one -- doubling the horizon is precisely the
-        # change that would break the 50 ms budget, and it has never been timed
-        # in a real-robot run.
-        # Both keep dt = time/horizon at 0.167-0.200 s.
+        # Horizon: 6.0 s / 30 in simulation (measured: circle offset -1.019 ->
+        # -0.011 m); the real boat stays at 2.5 s / 15 until the solve time has
+        # been timed in a field run (a longer horizon risks the 50 ms budget).
         self.mpc_horizon = integer('mpc_horizon', 30 if self.isSimulation else 15)
         self.mpc_time    = dbl('mpc_time', 6.0 if self.isSimulation else 2.5)
 
@@ -705,46 +489,18 @@ class Controller(Node):
                                                     1.0,   # u
                                                     1.0,   # v
                                                     1.0])) # r
-        # THE EFFORT PENALTY. The stage cost is (x-x_ref)' Q (x-x_ref) + u' R u
-        # with u_ref identically zero, so R is an absolute penalty in N^2 -- there
-        # is no rate term anywhere. At Q_pos = 50 the break-even is where
-        # saturating BOTH thrusters costs what the position error costs:
-        #
-        #   R = 0.015 -> 0.49 m      R = 0.10 -> 1.26 m      R = 0.25 -> 2.00 m
-        #
-        # At the shipped 0.015 anything beyond half a metre of error makes full
-        # throttle literally the cheaper option, which is why the MPC saturates
-        # where PID -- whose demand its own P-gain bounds -- does not. 0.10 in
-        # simulation puts the break-even outside the governor's own 0.5 m
-        # dead-band.
+        # Absolute effort penalty (u_ref = 0, no rate term). At Q_pos = 50 full
+        # throttle on both thrusters costs what a position error of 0.49 m
+        # (R 0.015) / 1.26 m (R 0.10) does.
         self.R_weight = np.diag(arr('mpc_R_diag', [0.10, 0.10] if self.isSimulation
                                                   else [0.015, 0.015]))
 
-        # THE QP WORKING-SET BUDGET. FULL_CONDENSING_QPOASES is a dense
-        # ACTIVE-SET solver, so the condensed QP carries nv = mpc_horizon * 2
-        # variables -- 60 in simulation since the horizon doubled on
-        # 2026-09-01, 30 on the real boat -- and reaching a vertex where most
-        # of those bounds are active costs about one working-set change each.
-        # acados defaults the budget to 50, i.e. BELOW nv at horizon 30, so a
-        # saturating solve failed by construction and acados returned status 4
-        # with the primal iterate untouched. That stale iterate was then
-        # published as a command: a constant asymmetric thruster pair, which is
-        # a constant-radius circle.
-        #
-        # 0 (the default) means "derive it from the horizon" in
-        # ur_mpc.MPCController, so the arithmetic lives in exactly one place:
-        # max(50, 4 * nu * N) = 240 at N = 30, 120 at N = 15. Set a positive
-        # value to pin it.
-        #
-        # This is a solver option, so it is inside the hash acados compares for
-        # code reuse: the first launch after changing it regenerates and
-        # rebuilds once (about a minute) and says so in the log. No cache
-        # directory needs deleting.
+        # qpOASES working-set budget; 0 = derive max(50, 4*nu*N) in ur_mpc.
+        # acados' default 50 sits below the 60 variables of the sim horizon,
+        # which made saturating solves fail (finding C6, src/CLAUDE.md).
         self.mpc_qp_iter_max = integer('mpc_qp_iter_max', 0)
 
-        # -- thrust limits, shared by every branch ---------------------------
-        # One symmetric scalar feeds both the allocator clamp and the MPC input
-        # bounds, so the two cannot drift apart.
+        # -- thrust limit: one symmetric scalar for every exit ---------------
         self.thrust_limit = dbl('thrust_limit', 20.0)
         limit = self.thrust_limit
         self.thruster_limits = {"min": np.array([-limit, -limit]),
@@ -753,323 +509,75 @@ class Controller(Node):
                              "upper": np.array([ limit,  limit]),
                              "idx":   np.array([0, 1])}
 
-        # -- propeller breakaway ---------------------------------------------
-        # The thrust->PWM table maps 0..2 N onto PWM 1500..1525, which sits
-        # inside a T200 ESC's neutral deadband: commands in that band leave the
-        # propellers stationary, so the boat holds still while the log records
-        # a perfectly sensible small force. Only ONE law is measurably affected
-        # -- solve_LoS following a pinger on the real boat, where the surge
-        # command 5*ln(k_v*d + 1) stays under 2 N out to d = 3.28 m. Every
-        # other law is inside 1.4 m and needs no floor; see CLAUDE.md section 5.
-        # 0.0 disables the floor and restores the pre-2026-08-31 law exactly.
+        # -- propeller breakaway floor on solve_LoS's surge (0.0 disables) ---
+        # 0-2 N sits inside the T200 ESC's neutral deadband; src/CLAUDE.md §5.
         self.min_thrust = dbl('min_thrust', 2.0)
 
-        # -- /path_request health --------------------------------------------
-        # path_request_timeout: give up on a pending request and re-issue.
-        #   Without it a single lost response wedges the node permanently.
-        # path_stale_timeout: beyond this the held window is not a reference any
-        #   more, so the governor stops advancing tau against it. Both are
-        #   generous multiples of the 20 Hz tick - this is a wedge detector, not
-        #   a jitter detector.
+        # -- /path_request health (wedge detectors, not jitter detectors) ----
+        # timeout: re-issue a request whose answer never came.
+        # stale:   stop advancing tau against a window older than this.
         self.path_request_timeout = dbl('path_request_timeout', 1.0)
         self.path_stale_timeout   = dbl('path_stale_timeout', 1.0)
 
-        # -- arrow-key control dead-man ---------------------------------------
-        # The station streams /blueboat/arrow_thrust at 20 Hz while arrow
-        # control is on. A command older than this is not applied: thrust goes
-        # to zero and arrow control STAYS engaged (it never hands back to
-        # autonomous control by itself). Ten missed station ticks, the same
-        # margin as robot_interface's thruster_input_timeout.
+        # -- arrow-control dead-man: an older command is zero, arrow control
+        #    stays engaged (never hands back to autonomy by itself).
         self.arrow_timeout = dbl('arrow_timeout', 0.5)
 
     # ======================================================================
-    #  3. THE CONTROL LOOP
-    #  Runs at 1/self.dt (20 Hz). This is the entry point.
+    #  3. THE CONTROL LOOP -- 1/dt (20 Hz), the entry point
+    #  Every early return publishes zero rather than falling silent: a
+    #  consumer that hears nothing keeps the last value it heard.
     # ======================================================================
 
     def timer_callback(self):
-        # Every early return below publishes zero thrust rather than falling
-        # silent: a consumer that hears nothing keeps streaming the last value
-        # it did hear. The interface-side watchdog is the outer guard for the
-        # case this cannot cover - this node crashing or hanging.
-
-        # A run session's MPC rebuild finishes on a worker thread; its result
-        # is swapped in HERE, on the executor thread (no-op otherwise).
+        # A session's MPC rebuild is swapped in here, on the executor thread.
         self._poll_controller_build()
 
         if not self.ready:
             self.publish_thrust([0.0, 0.0])
             return
 
-        # The controller itself is built in __init__ (see _build_controller):
-        # acados code generation is a build step, and running it from here froze
-        # the single-threaded executor for the whole compile.
-
         if not self.time_set:
             self.initial_time = time.time()
             self.tau = 0.0
             self.time_set = True
-        
+
         current_time = time.time() - self.initial_time
 
-        ## Boat state (needed by the governor, so compute it up front)
         if self.current_pose is None or self.current_twist is None:
             self.publish_thrust([0.0, 0.0])
             return
 
-        current_state = np.array([self.current_pose[0], # x
-                                self.current_pose[1], # y
-                                self.current_pose[5], # yaw
-                                self.current_twist[0], # u (body surge)
-                                self.current_twist[1], # v (body sway)
-                                self.current_twist[5]]) # r
-        current_state = np.array(current_state).reshape(-1)
+        current_state = np.array([self.current_pose[0],    # x
+                                  self.current_pose[1],    # y
+                                  self.current_pose[5],    # yaw
+                                  self.current_twist[0],   # u (body surge)
+                                  self.current_twist[1],   # v (body sway)
+                                  self.current_twist[5]])  # r
 
         manual_active = (list(self.manual_target) != [0.0, 0.0])
-        # Arrow control pauses the mission exactly as a manual target does:
-        # the governor holds tau, requests keep the window fresh.
+        # Arrow control pauses the mission like a manual target: tau holds.
         arrow_active = self.arrow_active
 
-        ## Update path (parameter-governed, NOT wall-clock)
-        # Only during a run: an idle session neither requests nor advances the
-        # path (always true outside a session, where a run is always active).
-        # A replanner-owned run (section 7) composes its window from its own
-        # plan instead of /path_request; everything else is the block below.
+        # Reference update (parameter-governed, never wall-clock). Only during
+        # a run, and only when following a path.
         if self.path_source == 'replanner' and not self.use_pinger and self.run_active:
             self._replanner_reference_step(current_time, current_state,
                                            manual_active, arrow_active)
         elif not self.use_pinger and self.run_active:
-            # Collect a completed request
-            if self.future is not None and self.future.done():
-                try:
-                    result = self.future.result()
-                    if result is None:
-                        self.get_logger().error("Service returned None.")
-                    elif self.accept_path(result.path):
-                        self.controller_path = result.path
-                        self.path_rx_time = current_time
-                except Exception as e:
-                    self.get_logger().error(f"Service call raised exception: {e}")
-                finally:
-                    self.future = None
-                    self.request_sent = None
+            self._mission_reference_step(current_time, current_state,
+                                         manual_active or arrow_active)
 
-            elif (self.future is not None and self.request_sent is not None
-                    and current_time - self.request_sent > self.path_request_timeout):
-                # A response that never arrives must not wedge the node. Without
-                # this the future stays pending forever, no further request is
-                # ever issued, and the reference window is frozen for the rest
-                # of the run with nothing reported. path_publisher has always
-                # had this guard; this node did not.
-                self.get_logger().warning(
-                    f"No answer to /path_request within {self.path_request_timeout:.1f} s "
-                    "- retrying.", throttle_duration_sec=5.0)
-                self.future = None
-                self.request_sent = None
-
-            # Advance the governor using the boat's progress along the current
-            # window (frozen while a manual target or arrow control overrides
-            # path following).
-            #
-            # Gated on the window being FRESH. Advancing against a stale window
-            # is open loop: once the boat reaches that frozen target e_along
-            # falls below gov_Lmin, the along-track factor unclips to 1.0, and
-            # tau integrates at full rate with no feedback at all -- exactly the
-            # wall-clock reference N8 says was removed, re-entered through the
-            # back door. Holding tau instead means the boat keeps station on the
-            # last good target until the path server answers again.
-            window_age = current_time - self.path_rx_time if self.path_rx_time is not None else None
-            window_fresh = window_age is not None and window_age <= self.path_stale_timeout
-            if self.controller_path.poses and not (manual_active or arrow_active):
-                if window_fresh:
-                    e_along, e_y, _, _ = self.path_progress_errors(self.controller_path, current_state)
-                    self.advance_governor(e_along, e_y)
-                else:
-                    self.get_logger().warning(
-                        f"Path window stale ({window_age:.2f} s) - holding tau at "
-                        f"{self.tau:.2f}.", throttle_duration_sec=5.0)
-
-            # Issue the next request at the (governed) parameter tau
-            if self.future is None:
-                request = RequestPath.Request()
-                request.path_request.data = np.linspace(self.tau,
-                                                         self.tau + self.path_time,
-                                                         int(self.path_steps), dtype=float)
-                # Remember what we asked for: the response is a bare Path and
-                # says nothing about which request it answers, so this is the
-                # only thing accept_path() can check it against.
-                self.tau_requested = float(np.float32(self.tau))
-                self.request_sent = current_time
-                self.future = self.client.call_async(request)
-            # else: previous request still pending - keep controlling on the last path
-
-        ## Compute thrust
-        u = [0]*2
-        world_target = None
-
-        if arrow_active: # Arrow keys override everything, manual target included
-            age = time.time() - self.arrow_rx if self.arrow_rx is not None else math.inf
-            if age <= self.arrow_timeout:
-                u = list(self.arrow_cmd)
-            else:
-                # Dead-man: the station went quiet. Zero, and STAY in arrow
-                # control - never resume autonomous control on a lost stream.
-                u = [0.0, 0.0]
-                self.get_logger().warning(
-                    f"Arrow control: no command for {age:.2f} s "
-                    f"(arrow_timeout {self.arrow_timeout:.2f} s) - zero thrust.",
-                    throttle_duration_sec=2.0)
-            # --- world-frame monitoring target ---
-            # The logged target stays the last one registered before the keys
-            # took over (the pose at that moment if nothing was registered yet).
-            if self.last_world_target is None:
-                self.last_world_target = [float(current_state[0]),
-                                          float(current_state[1]),
-                                          float(current_state[2])]
-            world_target = list(self.last_world_target)
-            target = list(world_target)
-
-        elif manual_active: # Manual target overrides: point LoS (unchanged)
-            target = [*self.manual_target[:2], 0, 0, 0, 0] # yaw unused for LoS
-            world_target = list(target[:3])  # --- world-frame monitoring target ---
-            target = fm.inRobotFrame(current_state, target)
-            u = self.solve_LoS(target, current_time)
-
-        elif self.run_active and self.controller_path.poses: # Path following
-            # Display the current desired pose if using gazebo
-            if self.isSimulation:
-                desired_pose = self.controller_path.poses[0].pose
-                cf.create_pose_marker(desired_pose, self.pose_arrow_publisher) 
-
-            if self.controller_type == 'MPC':
-                u = self.controller.solve(path=self.controller_path, x_current=current_state)
-
-                # A FAILED SOLVE IS NOT A COMMAND (C6). ur_mpc.solve already
-                # returns zeros rather than the stale acados iterate; this is
-                # where it is REPORTED, and it has to be reported through the
-                # ROS logger. The old diagnostic was a bare print(), which never
-                # reaches /rosout -- and neither Sim_launch.py nor the
-                # simulator's full_mission_launch.py captures this node's
-                # stdout, so the failure that drove the boat in circles for
-                # 33 s left no trace anywhere an operator would look.
-                #
-                # Deliberately NOT an early return: falling through keeps
-                # publish_thrust and the monitoring append on the path, so
-                # /thruster_input stays alive (CLAUDE.md section 5) and the .npy
-                # keeps recording -- which is what made this diagnosable at all.
-                if self.controller.last_status != 0:
-                    u = [0.0, 0.0]
-                    self.get_logger().error(
-                        f"MPC solve FAILED (acados status "
-                        f"{self.controller.last_status}, "
-                        f"{self.controller.fail_count} consecutive, "
-                        f"{self.controller.total_failures} total) - commanding "
-                        "ZERO thrust. The boat will drift.",
-                        throttle_duration_sec=1.0)
-                elif self.controller.last_solve_time > 0.5 * self.dt:
-                    # The 20 Hz budget has never been measured in a
-                    # real-robot run, and doubling the
-                    # horizon is precisely the change that would break it. This
-                    # makes it visible from /rosout without a field harness (N7).
-                    self.get_logger().warning(
-                        f"MPC solve took "
-                        f"{self.controller.last_solve_time * 1e3:.1f} ms of the "
-                        f"{self.dt * 1e3:.0f} ms tick.", throttle_duration_sec=5.0)
-
-                # Desired state for monitoring (first pose of the reference path)
-                target = _reference_pose(self.controller_path)
-                world_target = list(target)  # --- world-frame monitoring target ---
-                
-            if self.controller_type == 'PID':
-                target = cf.compute_target(self.controller_path, self.dt)
-                # --- world-frame monitoring target ---
-                # poses[0], NOT target[:3]: cf.compute_target returns the SECOND
-                # pose of the window, so reporting it here made x_d/y_d mean the
-                # pose at tau + path_time on this branch and the pose at tau on
-                # the MPC branch. The law below still gets the full target.
-                world_target = _reference_pose(self.controller_path)
-                # Feed path tangent (target[2]) and authored speed (target[3])
-                # so LoS steering and speed feedforward use the real path.
-                psi_path, slow = target[2], False
-                w = 0.0
-                if self.hold_speed > 0.0:
-                    w = 1.0 - min(1.0, max(0.0, target[3] / self.hold_speed))
-                if w > 0.0 and self.hold_radius > 0.0:
-                    # Stationary reference: the tangent is meaningless and the
-                    # along-track term alone cannot see a cross-track error.
-                    # Rotate the tangent handed to PIDLoS toward the bearing to
-                    # the hold point, so its own along-track error becomes the
-                    # range and its own LoS steering points at the point. The
-                    # rotation fades out inside hold_radius, so on station the
-                    # call is exactly what it was, and slow_on_turn (the class's
-                    # own option) stops it driving away while it turns round.
-                    rng = math.hypot(target[0] - current_state[0],
-                                     target[1] - current_state[1])
-                    g = min(1.0, max(0.0, (rng - self.hold_radius) / self.hold_radius))
-                    if g > 0.0:
-                        bearing = math.atan2(target[1] - current_state[1],
-                                             target[0] - current_state[0])
-                        psi_path = target[2] + w * g * _wrap(bearing - target[2])
-                        slow = True
-                u,_ = self.controller.compute(current_state, target[:3],
-                                              u_ff=target[3], psi_path=psi_path,
-                                              slow_on_turn=slow)
-
-            if self.controller_type == 'LoS':
-                target = cf.compute_target(self.controller_path, self.dt)
-                # --- world-frame monitoring target --- see the PID branch above
-                world_target = _reference_pose(self.controller_path)
-                u = self.los_guidance(target, current_state)
-        
-        elif self.run_active and self._awaiting_hold_active():
-            # A replanner-owned run before its first path (section 7): hold the
-            # pose captured at the start with the manual-target keep-location
-            # law -- the station's field-used "hold where released" -- until
-            # /blueboat/update_path loads a path. Arrows and a manual target
-            # still come first (branches above).
-            hx, hy, hyaw = self.path_updater.hold
-            world_target = [hx, hy, hyaw]  # --- world-frame monitoring target ---
-            target = fm.inRobotFrame(current_state, [hx, hy, 0, 0, 0, 0])
-            u = self.solve_LoS(target, current_time, keep_location=True)
-
-        elif self.run_active and self.use_pinger and self.pinger_target is not None: # MPC is not supported for this
-            # --- world-frame monitoring target ---
-            px, py = float(self.pinger_target[0]), float(self.pinger_target[1])
-            c_m, s_m = np.cos(current_state[2]), np.sin(current_state[2])
-            world_target = [current_state[0] + c_m*px - s_m*py,
-                            current_state[1] + s_m*px + c_m*py, 0.0]
-            # --------------------------------------
-            if self.controller_type == 'PID':
-                # Adapt the controller input to be used in robot frame
-                target = [*self.pinger_target[:2], 0]
-                current_state[[0,1,2]] = 0
-                u,_ = self.controller.compute(current_state, target)
-
-            if self.controller_type == 'LoS':
-                target = self.pinger_target
-                u = self.solve_LoS(target, current_time)
-
-            # Publish controller target (for data recording)
-            msg = Float32MultiArray()
-            msg.data = [float(v) for v in target]
-            self.target_publisher.publish(msg)
-
-        else:
-            if not self.session_mode:
-                self.get_logger().info('Nothing to target yet.')
-            elif self.run_active:
-                self.get_logger().info('Nothing to target yet.', throttle_duration_sec=5.0)
-            else:
-                # An idle session: the normal state between runs, not news.
-                self.get_logger().info(
-                    'Session idle - no run active, holding zero thrust '
-                    '(manual target or arrow keys to move).',
-                    throttle_duration_sec=30.0)
+        command = self._compute_command(current_state, current_time,
+                                        manual_active, arrow_active)
+        if command is None:
+            self._log_nothing_to_target()
             self.publish_thrust([0.0, 0.0])
             return
+        u, target, world_target = command
 
-        # Remembered for arrow control, which keeps logging the last target
-        # registered before the keys took over.
+        # Kept for arrow control, which logs the last target registered before
+        # the keys took over.
         if world_target is not None and not arrow_active:
             self.last_world_target = [float(v) for v in list(world_target)[:3]]
 
@@ -1087,8 +595,7 @@ class Controller(Node):
             f"Thrust: {thrust_str}"
         )
 
-        # Publish thruster input. Reassigned so the monitoring row below records
-        # the saturated command that was actually sent (see publish_thrust).
+        # The monitoring row records the saturated command actually sent.
         u = self.publish_thrust(u)
 
         if self.pinger_target is not None and self.use_pinger:
@@ -1097,58 +604,238 @@ class Controller(Node):
             target_str = ", ".join(f"{float(x):.2f}" for x in list(self.manual_target))
             self.get_logger().info(f'\nManual target coordinates: \n{target_str}')
 
-        # Update and save monitoring metrics to be graphed later
         if (self.controller_path.poses or (self.use_pinger and self.pinger_target is not None)
                 or manual_active or arrow_active or self._awaiting_hold_active()):
-            x_m   = current_state[0]
-            y_m   = current_state[1]
-            psi_m = current_state[2]
+            self._record_monitoring(current_time, current_state, u,
+                                    world_target if world_target is not None else target)
 
+    def _mission_reference_step(self, current_time, current_state, overridden):
+        """Fixed-mission reference: collect the /path_request answer, advance
+        the governor on a fresh window (held while `overridden` by a manual
+        target or arrow control), and issue the next request at tau."""
+        if self.future is not None and self.future.done():
+            try:
+                result = self.future.result()
+                if result is None:
+                    self.get_logger().error("Service returned None.")
+                elif self.accept_path(result.path):
+                    self.controller_path = result.path
+                    self.path_rx_time = current_time
+            except Exception as e:
+                self.get_logger().error(f"Service call raised exception: {e}")
+            finally:
+                self.future = None
+                self.request_sent = None
+
+        elif (self.future is not None and self.request_sent is not None
+                and current_time - self.request_sent > self.path_request_timeout):
+            # A lost response must not wedge the node with a frozen window.
+            self.get_logger().warning(
+                f"No answer to /path_request within {self.path_request_timeout:.1f} s "
+                "- retrying.", throttle_duration_sec=5.0)
+            self.future = None
+            self.request_sent = None
+
+        # Only against a FRESH window: advancing against a stale one is open
+        # loop (the boat reaches the frozen target, the along factor unclips
+        # and tau integrates at full rate -- the wall-clock reference N8
+        # removed). Holding tau keeps station on the last good target.
+        window_age = current_time - self.path_rx_time if self.path_rx_time is not None else None
+        window_fresh = window_age is not None and window_age <= self.path_stale_timeout
+        if self.controller_path.poses and not overridden:
+            if window_fresh:
+                e_along, e_y, _, _ = self.path_progress_errors(self.controller_path, current_state)
+                self.advance_governor(e_along, e_y)
+            else:
+                self.get_logger().warning(
+                    f"Path window stale ({window_age:.2f} s) - holding tau at "
+                    f"{self.tau:.2f}.", throttle_duration_sec=5.0)
+
+        if self.future is None:
+            request = RequestPath.Request()
+            request.path_request.data = np.linspace(self.tau,
+                                                     self.tau + self.path_time,
+                                                     int(self.path_steps), dtype=float)
+            # What accept_path() checks the bare response against.
+            self.tau_requested = float(np.float32(self.tau))
+            self.request_sent = current_time
+            self.future = self.client.call_async(request)
+        # else: still pending - keep controlling on the last window
+
+    def _compute_command(self, current_state, current_time, manual_active, arrow_active):
+        """(u, target, world_target) of the active branch, or None if nothing
+        is to be targeted. Priority: arrows, manual target, path following,
+        replanner awaiting-hold, pinger. May zero current_state[:3] (pinger PID
+        runs body-frame), as the monitoring row has always recorded."""
+        if arrow_active:
+            age = time.time() - self.arrow_rx if self.arrow_rx is not None else math.inf
+            if age <= self.arrow_timeout:
+                u = list(self.arrow_cmd)
+            else:
+                # Dead-man: zero, and STAY in arrow control.
+                u = [0.0, 0.0]
+                self.get_logger().warning(
+                    f"Arrow control: no command for {age:.2f} s "
+                    f"(arrow_timeout {self.arrow_timeout:.2f} s) - zero thrust.",
+                    throttle_duration_sec=2.0)
             # --- world-frame monitoring target ---
-            monitored = world_target if world_target is not None else target
-            x_d_m   = monitored[0]
-            y_d_m   = monitored[1]
-            psi_d_m = monitored[2] if len(monitored) > 2 else 0.0
-            # --------------------------------------
+            # The last target registered before the keys took over (the pose at
+            # that moment if none yet).
+            if self.last_world_target is None:
+                self.last_world_target = [float(current_state[0]),
+                                          float(current_state[1]),
+                                          float(current_state[2])]
+            world_target = list(self.last_world_target)
+            return u, list(world_target), world_target
 
-            # In a session, t counts from the start of the run being recorded.
-            t_m = current_time
-            if self.session_mode and self.run_t0 is not None:
-                t_m = time.time() - self.run_t0
+        if manual_active:
+            target = [*self.manual_target[:2], 0, 0, 0, 0]   # yaw unused for LoS
+            world_target = list(target[:3])  # --- world-frame monitoring target ---
+            target = fm.inRobotFrame(current_state, target)
+            return self.solve_LoS(target, current_time), target, world_target
 
-            data_array = [t_m, x_m, y_m, psi_m,
-                        x_d_m, y_d_m, psi_d_m, u[0], u[1]]
+        if self.run_active and self.controller_path.poses:
+            return self._path_following_command(current_state)
 
-            # Recorded only during a run; an idle session logs nothing.
-            if self.run_active:
-                self.monitoring.append(data_array)
+        if self.run_active and self._awaiting_hold_active():
+            # Replanner run before its first path (section 7): hold the start
+            # pose with the manual-target keep-location law.
+            hx, hy, hyaw = self.path_updater.hold
+            world_target = [hx, hy, hyaw]  # --- world-frame monitoring target ---
+            target = fm.inRobotFrame(current_state, [hx, hy, 0, 0, 0, 0])
+            return self.solve_LoS(target, current_time, keep_location=True), target, world_target
 
-            publisher_msg = Float32MultiArray()
-            publisher_msg.data = [float(v) for v in data_array]
-            self.data_publisher.publish(publisher_msg)
+        if self.run_active and self.use_pinger and self.pinger_target is not None:
+            return self._pinger_command(current_state, current_time)
 
-            # NOT saved from here any more -- see save_monitoring(), on its own
-            # timer. Writing the whole log from the control tick cost the loop
-            # its rate: measured on a 3 h mission, 20 Hz had decayed to 5-8 Hz.
+        return None
+
+    def _path_following_command(self, current_state):
+        """Path following on the held reference window (MPC / PID / LoS)."""
+        u = [0]*2
+        if self.isSimulation:
+            cf.create_pose_marker(self.controller_path.poses[0].pose, self.pose_arrow_publisher)
+
+        # --- world-frame monitoring target ---: poses[0] in every branch, NOT
+        # cf.compute_target's result (the window's SECOND pose), N9.
+        world_target = _reference_pose(self.controller_path)
+
+        if self.controller_type == 'MPC':
+            u = self.controller.solve(path=self.controller_path, x_current=current_state)
+            # A failed solve is not a command (C6): ur_mpc already returns
+            # zeros; report it through the ROS logger (stdout is not captured),
+            # and fall through so /thruster_input and the .npy keep flowing.
+            if self.controller.last_status != 0:
+                u = [0.0, 0.0]
+                self.get_logger().error(
+                    f"MPC solve FAILED (acados status "
+                    f"{self.controller.last_status}, "
+                    f"{self.controller.fail_count} consecutive, "
+                    f"{self.controller.total_failures} total) - commanding "
+                    "ZERO thrust. The boat will drift.",
+                    throttle_duration_sec=1.0)
+            elif self.controller.last_solve_time > 0.5 * self.dt:
+                # The 20 Hz budget is untimed on the real boat; this makes an
+                # overrun visible from /rosout.
+                self.get_logger().warning(
+                    f"MPC solve took "
+                    f"{self.controller.last_solve_time * 1e3:.1f} ms of the "
+                    f"{self.dt * 1e3:.0f} ms tick.", throttle_duration_sec=5.0)
+            return u, world_target, list(world_target)
+
+        target = cf.compute_target(self.controller_path, self.dt)
+
+        if self.controller_type == 'PID':
+            # Path tangent (target[2]) and authored speed (target[3]) feed LoS
+            # steering and speed feedforward.
+            psi_path, slow = target[2], False
+            w = 0.0
+            if self.hold_speed > 0.0:
+                w = 1.0 - min(1.0, max(0.0, target[3] / self.hold_speed))
+            if w > 0.0 and self.hold_radius > 0.0:
+                # Stationary reference: rotate the tangent handed to PIDLoS
+                # toward the hold point, so its along-track error becomes the
+                # range; fades out inside hold_radius (src/CLAUDE.md §4).
+                rng = math.hypot(target[0] - current_state[0],
+                                 target[1] - current_state[1])
+                g = min(1.0, max(0.0, (rng - self.hold_radius) / self.hold_radius))
+                if g > 0.0:
+                    bearing = math.atan2(target[1] - current_state[1],
+                                         target[0] - current_state[0])
+                    psi_path = target[2] + w * g * _wrap(bearing - target[2])
+                    slow = True
+            u,_ = self.controller.compute(current_state, target[:3],
+                                          u_ff=target[3], psi_path=psi_path,
+                                          slow_on_turn=slow)
+
+        if self.controller_type == 'LoS':
+            u = self.los_guidance(target, current_state)
+
+        return u, target, world_target
+
+    def _pinger_command(self, current_state, current_time):
+        """Pinger following (PID or LoS; MPC is not supported)."""
+        u = [0]*2
+        # --- world-frame monitoring target ---
+        px, py = float(self.pinger_target[0]), float(self.pinger_target[1])
+        c_m, s_m = np.cos(current_state[2]), np.sin(current_state[2])
+        world_target = [current_state[0] + c_m*px - s_m*py,
+                        current_state[1] + s_m*px + c_m*py, 0.0]
+        if self.controller_type == 'PID':
+            # Body-frame solve: the boat at the origin, heading zero.
+            target = [*self.pinger_target[:2], 0]
+            current_state[[0,1,2]] = 0
+            u,_ = self.controller.compute(current_state, target)
+
+        if self.controller_type == 'LoS':
+            target = self.pinger_target
+            u = self.solve_LoS(target, current_time)
+
+        # /controller_target: body frame, pinger branch only (N9).
+        msg = Float32MultiArray()
+        msg.data = [float(v) for v in target]
+        self.target_publisher.publish(msg)
+        return u, target, world_target
+
+    def _log_nothing_to_target(self):
+        if not self.session_mode:
+            self.get_logger().info('Nothing to target yet.')
+        elif self.run_active:
+            self.get_logger().info('Nothing to target yet.', throttle_duration_sec=5.0)
+        else:
+            self.get_logger().info(
+                'Session idle - no run active, holding zero thrust '
+                '(manual target or arrow keys to move).',
+                throttle_duration_sec=30.0)
+
+    def _record_monitoring(self, current_time, current_state, u, monitored):
+        """Publish /monitoring_data and, during a run, append the .npy row."""
+        # --- world-frame monitoring target ---
+        psi_d = monitored[2] if len(monitored) > 2 else 0.0
+        # In a session, t counts from the start of the run being recorded.
+        t_m = current_time
+        if self.session_mode and self.run_t0 is not None:
+            t_m = time.time() - self.run_t0
+
+        data_array = [t_m, current_state[0], current_state[1], current_state[2],
+                      monitored[0], monitored[1], psi_d, u[0], u[1]]
+        if self.run_active:
+            self.monitoring.append(data_array)
+
+        publisher_msg = Float32MultiArray()
+        publisher_msg.data = [float(v) for v in data_array]
+        self.data_publisher.publish(publisher_msg)
 
     # ======================================================================
-    #  4. GUIDANCE
-    #  Path governor (N8) and the two steering laws.
+    #  4. GUIDANCE -- path governor (N8) and the steering laws
     # ======================================================================
 
-    # ------------------------------------------------------------------ #
-    #  Path parameter governor                                           #
-    # ------------------------------------------------------------------ #
     def warn_if_multiple_path_servers(self):
         """
-        Say so, loudly, if more than one node offers /path_request.
-
-        This node cannot refuse to run -- it is the controller -- but the
-        operator needs to know, because with two servers every request is
-        answered by whichever replies first and the reference alternates
-        between two unrelated trajectories. path_generation refuses to be the
-        second server; this covers the case where one was already up before
-        that guard existed, or was started with allow_duplicate_server.
+        Say so, loudly, if more than one node offers /path_request: every
+        request is then answered by whichever replies first and the reference
+        alternates between trajectories. path_generation refuses to be the
+        second server; this covers one started with allow_duplicate_server.
         """
         try:
             servers = []
@@ -1173,35 +860,17 @@ class Controller(Node):
 
     def accept_path(self, path):
         """
-        Is this response an answer to OUR request?
+        Is this response an answer to OUR request? (A second /path_request
+        server answers some requests; the bare Path cannot say which.)
 
-        ROS 2 does not stop a second node offering /path_request, and when two
-        do, every request is answered by whichever server replies first. The
-        response is a bare nav_msgs/Path -- no echo of the request, no server
-        identity -- so without a check the controller simply believes whatever
-        arrives. Measured on this system with two missions up: the reference
-        alternated tick by tick between two entirely different trajectories,
-        both sampled at this node's own single tau, and the boat could follow
-        neither. path_generation now refuses to be the second server; this is
-        the other half, so a controller is never at the mercy of that.
+          length   the window has as many poses as we asked for;
+          tag      poses[0] is stamped with the parameter we requested
+                   (path_stamp.encode in path_generation; RequestPath unchanged).
 
-        Two tests, cheapest first:
-
-          length   the window must have as many poses as we asked for.
-          tag      poses[0] must be stamped with the parameter we requested.
-                   path_generation stamps each pose with the parameter it was
-                   evaluated at (path_stamp.encode) precisely so this works
-                   without changing RequestPath (N1/CM-1).
-
-        A boat running a path_generation built before 2026-09-03 stamps the wall
-        clock instead. Failing every response there would leave the controller
-        with no path at all, which is worse than the fault being guarded, so
-        that case is detected once, reported loudly, and falls back to geometry:
-        reject a window whose first pose is further from the last accepted one
-        than tau could possibly have moved in the meantime.
-
-        Rejection keeps the last good window. The staleness gate in
-        timer_callback is what stops the boat driving on it indefinitely.
+        A server predating the tag stamps the clock: detected once, reported,
+        then a geometric plausibility check (the first pose cannot jump further
+        than tau could have moved). Rejection keeps the last good window; the
+        staleness gate stops the boat driving on it indefinitely.
         """
         poses = path.poses
         if not poses:
@@ -1290,26 +959,12 @@ class Controller(Node):
 
     def advance_governor(self, e_along, e_y):
         """
-        Advance the path parameter tau. When the boat is close to its virtual
-        target the target moves at the authored speed (tau_dot = speed_scale);
-        as the gap grows the target slows and finally pauses, so the boat can
-        always catch up. Never moves backward.
-
-        The gap is measured in both directions. The along-track factor answers
-        "is the boat behind?"; the cross-track factor answers "is the boat off
-        to the side?". A boat abreast of its target but far off the path is not
-        keeping up with it, and only the second factor sees that.
-
-        The cross-track factor is disabled by gov_Emax = 0 (the default), which
-        makes it identically 1 and leaves the along-track behaviour untouched.
-
-        Both factors are clipped to [0, 1] and multiplied, so their product is
-        also in [0, 1]: tau is still monotonic and still bounded above by the
-        path's own parameterisation rate. That upper bound is what makes an
-        authored speed profile that varies along the path get followed for
-        free, so nothing here may scale tau_dot by more than unity.
-
-        Returns the combined factor (diagnostic).
+        Advance tau: at the authored speed while the boat keeps up, slowing to
+        a pause as the along-track gap (and, if gov_Emax > 0, the cross-track
+        error) grows. Both factors are clipped to [0, 1] and multiplied, so tau
+        is monotonic and never faster than the path's own parameterisation --
+        which is what makes a varying authored speed profile followed for free.
+        Nothing may scale tau_dot above unity. Returns the combined factor.
         """
         span_along = max(1e-6, (self.gov_Lmax - self.gov_Lmin))
         fac_along = np.clip((self.gov_Lmax - e_along) / span_along, 0.0, 1.0)
@@ -1325,9 +980,6 @@ class Controller(Node):
         self.tau += tau_dot * self.dt
         return factor
 
-    # ------------------------------------------------------------------ #
-    #  Perfected line-of-sight guidance (kinematic, 'LoS' controller)    #
-    # ------------------------------------------------------------------ #
     def los_guidance(self, target6, state):
         """
         Canonical Fossen lookahead LoS to the path point described by
@@ -1348,9 +1000,7 @@ class Controller(Node):
 
         psi_d = gamma_p + math.atan2(-e_y, self.los_lookahead)
 
-        # Zero-authored-speed hold. w is exactly 0 for any path that has a
-        # speed, so everything in this block collapses and u_cmd is the plain
-        # feedforward law - path following is untouched.
+        # Zero-authored-speed hold; w is exactly 0 on any moving path.
         w = 0.0
         if self.hold_speed > 0.0:
             w = 1.0 - min(1.0, max(0.0, U_d / self.hold_speed))
@@ -1360,10 +1010,8 @@ class Controller(Node):
             rng = math.hypot(x_ref - x, y_ref - y)
             gap = max(0.0, rng - self.hold_radius)
             if gap > 0.0:
-                # Steer at the hold point rather than along a tangent that means
-                # nothing when the reference is stationary, and never command
-                # reverse: a lookahead law steers the wrong way backwards, so the
-                # yaw channel turns the boat round instead.
+                # Steer at the point; never reverse (a lookahead law steers the
+                # wrong way backwards), the yaw channel turns the boat round.
                 bearing = math.atan2(y_ref - y, x_ref - x)
                 psi_d = psi_d + w * _wrap(bearing - psi_d)
                 u_hold = min(self.los_hold_umax, w * self.los_hold_kx * gap)
@@ -1379,13 +1027,12 @@ class Controller(Node):
         return thrusts
 
     def solve_LoS(self, target, current_time, keep_location=None):
-        # POINT line-of-sight (used for pinger / manual targets, body frame).
-        # Unchanged from the working version.
-        #
-        # keep_location: None (every existing call) derives the manual-target
-        # variant from self.manual_target exactly as before; True selects it
-        # explicitly -- the awaiting-path hold of a replanner run (section 7),
-        # which reuses the manual-target law without being an operator target.
+        """Point line-of-sight to a body-frame target (pinger / manual target).
+
+        keep_location None derives the manual-target variant from
+        self.manual_target; True selects it explicitly (a replanner run's
+        awaiting-path hold, section 7).
+        """
         x,y,z = target
 
         bearing = np.arctan2(y, x)
@@ -1401,48 +1048,20 @@ class Controller(Node):
         if manual:
             v = 10*np.log(v+1) if not self.isSimulation else 7*np.log(v+1)  # If manual target, go faster. Don't need to be that precise here.
 
-        # Propeller breakaway. v is the common-mode surge force this law puts on
-        # BOTH thrusters, and 5*ln(k_v*d + 1) stays under min_thrust (2 N) out to
-        # d = 3.28 m at the real boat's k_v = 0.15 -- a range at which the ESC is
-        # still inside its neutral deadband, so the boat sits still while the log
-        # shows it being commanded forward. Floor the surge so it actually moves.
-        #
-        # ONLY THE SURGE. The +/- 0.295*yaw_rate differential below is untouched,
-        # so the yaw moment -- and with it which way the boat turns and how hard
-        # -- is bit-identical to the unfloored law at every range and bearing.
-        # The floor pushes the boat out of the deadband; it does not steer it.
-        #
-        # The floor is shaped by two factors, both of which only ever REDUCE it,
-        # and both of which reuse a blend this file already applies elsewhere:
-        #
-        #   g            fades the floor in over hold_radius, exactly as the PID
-        #                and LoS station-keeping holds fade theirs. Without it the
-        #                floor stepped by 1.64 N as the boat crossed 0.5 m
-        #                inbound; with it the commanded surge is continuous in d.
-        #   max(0, cos)  kills the floor when the target is abeam or behind, the
-        #                same shaping los_guidance puts on its own feedforward.
-        #                Forward surge closes the range by cos(bearing) only, so
-        #                past 90 degrees a floored surge would drive the boat AWAY
-        #                from the target while it turned round -- the unfloored
-        #                law does not, because its surge is ~0 there. The turn
-        #                itself needs no help at those bearings: the differential
-        #                is already 4.6 N per side at 90 degrees, well clear of
-        #                the deadband.
-        #
-        # v is never negative here (5*ln(x+1) with x >= 0), so no sign handling is
-        # needed, and the floor never lowers v. min_thrust = 0.0 disables the
-        # whole block and restores the original law exactly.
+        # Propeller breakaway floor on the common-mode SURGE only (the yaw
+        # differential is untouched): on the real boat 5*ln(k_v*d + 1) stays
+        # inside the ESC deadband out to 3.28 m. g fades it in over hold_radius
+        # (continuous in d); max(0, cos) drops it for a target abeam or behind,
+        # where forward surge would push the boat away. It never lowers v
+        # (v >= 0); min_thrust = 0.0 restores the original law. src/CLAUDE.md §5.
         if self.min_thrust > 0.0 and self.hold_radius > 0.0:
             g = min(1.0, max(0.0, (d - self.hold_radius) / self.hold_radius))
             breakaway = self.min_thrust * g * max(0.0, np.cos(bearing))
             if 0.0 < v < breakaway:
                 v = breakaway
 
-        # A MANUAL target is a station to hold, not a place to stop: once
-        # reached it is held against drift rather than abandoned at zero thrust.
-        # Everything below this block therefore belongs to the PINGER branch
-        # alone and is bit-identical to what it was -- safety_distance and
-        # stopping_sequence are not consulted for a manual target at all.
+        # A reached manual target is held (manual_keep_location); everything
+        # after this block is the pinger branch's arrival latch.
         if manual:
             held = self.manual_keep_location(d, bearing, yaw_rate, current_time)
             if held is not None:
@@ -1462,8 +1081,8 @@ class Controller(Node):
                 self.stopping_sequence = True
                 self.stopping_time = current_time
 
-        # As a safety, if the target is close enough, briefly move back then stop
-        else: 
+        # Arrived: briefly reverse, then stop.
+        else:
             if current_time - self.stopping_time < 1.0:
                 thruster_input = [-1.,-1.]
             else:
@@ -1473,59 +1092,20 @@ class Controller(Node):
 
     def manual_keep_location(self, d, bearing, yaw_rate, current_time):
         """
-        Hold station on a REACHED manual target.
+        Hold station on a REACHED manual target: the thruster pair while
+        holding, or None when off station (the caller runs plain pursuit).
 
-        Returns the thruster pair while holding, or None when the boat is off
-        station and the caller should run the plain pursuit law instead.
-
-        Why this exists. solve_LoS used to latch on arrival: one second astern,
-        then zero thrust for the rest of the run, cleared only by a new target.
-        With any current that is a boat commanding nothing while it is pushed
-        out of the survey area -- and on the real boat the latch never armed at
-        all (safety_distance = -1.0), so the point law hunted around the target
-        instead of settling. Neither is station keeping.
-
-        The state below is therefore re-evaluated every tick, never latched:
-
+        Re-evaluated every tick, never latched, with hysteresis:
             not holding, d <= manual_hold_radius       -> hold
             holding,     d >  manual_reacquire_radius  -> resume pursuit
-
-        The two radii are deliberately different. A single threshold with
-        position noise sitting on it toggles the mode every few ticks; the gap
-        between them is the hysteresis that stops that.
-
-        The hold itself is CONTINUOUS, not an on/off deadband: surge is
-        proportional to the range outside manual_hold_radius and capped, so the
-        law always has an answer to a disturbance and never falls silent. It is
-        the same shape as los_guidance's zero-authored-speed hold -- steer at
-        the point, surge proportional to the gap, capped, never reverse, inside
-        the same max(0, cos) shaping -- but its gains are its own, because
-        los_hold_kx / los_hold_umax are velocities fed through los_ku and the
-        allocator while this law writes its surge straight onto the wire.
-
-        Two things it does NOT do, both on purpose:
-
-          * The yaw channel is untouched. The differential is the caller's
-            +/- 0.295*yaw_rate exactly as before, so which way the boat turns
-            and how hard is the same law it always was; only the common-mode
-            surge is replaced.
-          * The surge is not floored to min_thrust. The pursuit law is floored
-            because a command under 2 N sits in the ESC deadband and moves
-            nothing while the log shows thrust; here that band IS the wanted
-            behaviour -- it is what lets the boat sit still on station. The
-            price is an effective hold box of manual_hold_radius plus about
-            0.25 m on the real boat, where the proportional term first clears
-            breakaway.
-
-        max(0, cos(bearing)) matters for the same reason it matters in the
-        floor: forward surge closes the range by cos(bearing) only, so pushing
-        while the target is abeam or behind drives the boat away from the point
-        it is trying to hold. The yaw channel turns it round first.
+        Inside the hold the surge is proportional to the gap outside
+        manual_hold_radius, capped, max(0, cos(bearing))-shaped and floored
+        to min_thrust; the yaw differential is the pursuit law's. Rationale and
+        measurements: src/CLAUDE.md §5.
         """
         if self.manual_hold_radius <= 0.0:
             return None          # hold disabled: the pursuit law, as it was
 
-        # --- state, re-evaluated every tick ---------------------------------
         if not self.manual_hold:
             if d <= self.manual_hold_radius:
                 self.manual_hold = True
@@ -1534,38 +1114,25 @@ class Controller(Node):
                     f"Manual target reached at {d:.2f} m - holding location "
                     f"(re-acquiring beyond {self.manual_reacquire_radius:.2f} m)")
         elif d > self.manual_reacquire_radius:
-            self.manual_hold = False
-            self.manual_brake_t0 = None
+            self._clear_manual_hold()
             self.get_logger().info(
                 f"Pushed {d:.2f} m off the manual target - re-acquiring it")
 
         if not self.manual_hold:
             return None
 
-        # --- arrival brake: the original one-second astern pulse ------------
+        # Arrival brake: the original astern pulse.
         if (self.manual_brake_t0 is not None
                 and current_time - self.manual_brake_t0 < self.manual_brake_time):
             return [-1., -1.]
 
-        # --- continuous proportional hold -----------------------------------
         gap = max(0.0, d - self.manual_hold_radius)
         v_hold = min(self.manual_hold_umax, self.manual_hold_kx * gap)
         v_hold *= max(0.0, np.cos(bearing))
 
-        # Same breakaway floor the pursuit law gets, and for the same reason:
-        # the proportional term does not clear 2 N until the boat is already
-        # 0.25 m outside the radius it was told to hold (0.13 m in simulation),
-        # so unfloored the commanded station is one the hardware cannot reach.
-        # Measured on the harness plant with an explicit 2 N per-side deadband:
-        # floored the boat parks at 1.00 m, unfloored at 1.25 m.
-        #
-        # The floor is written out here rather than reusing the block above,
-        # which is keyed to hold_radius -- a parameter shared with los_guidance
-        # and the PID branch that this must not couple to. It cannot lift a zero
-        # command (the guard is 0.0 < v_hold), so "no surge inside the radius"
-        # survives it, and it is exactly the step that makes the station
-        # attainable: the cost is that the thrusters pulse at a few hertz while
-        # holding against a current. That is deliberate and is documented.
+        # Breakaway floor, written out (not keyed to hold_radius, which is
+        # shared with los_guidance/PID). It cannot lift a zero command; without
+        # it the boat parks at 1.25 m instead of 1.00 m.
         if self.min_thrust > 0.0:
             floor = self.min_thrust * max(0.0, np.cos(bearing))
             if 0.0 < v_hold < floor:
@@ -1574,60 +1141,50 @@ class Controller(Node):
         return [v_hold + 0.295 * yaw_rate/2, v_hold - 0.295 * yaw_rate/2]
 
     # ======================================================================
-    #  5. CALLBACKS AND SMALL HELPERS
-    #  Inbound telemetry; nothing here computes control.
+    #  5. CALLBACKS AND SMALL HELPERS -- nothing here computes control
     # ======================================================================
 
-    def odom_callback(self, msg: Odometry):
-        pose, twist = cf.odometry(msg)
+    def _clear_manual_hold(self):
+        """Reset the keep-location state (not the target it refers to)."""
+        self.manual_hold = False
+        self.manual_brake_t0 = None
 
-        self.current_pose = pose
-        self.current_twist = twist
+    def odom_callback(self, msg: Odometry):
+        self.current_pose, self.current_twist = cf.odometry(msg)
 
     def pinger_callback(self, msg: Float32MultiArray):
         self.pinger_target = msg.data
 
     def ready_callback(self, msg: Bool):
-        # robot_interface and simulation_interface both re-publish readiness
-        # periodically (so this node can never miss it); only log the transition
-        # to avoid spam
+        # Readiness is re-published periodically; log only the transition.
         if msg.data and not self.ready:
-            self.get_logger().info(f'Controller ready')
+            self.get_logger().info('Controller ready')
         self.ready = msg.data
 
     def manual_target_callback(self, msg: Float32MultiArray):
         self.manual_target = msg.data # [x,y] in world frame
         self.stopping_sequence = False
 
-        # A manual target is a newer operator intent than the arrow keys: it
-        # releases arrow control (the station's "hold where released" publishes
-        # exactly this, the boat's own position, when the keys are let go).
+        # A newer operator intent than the arrow keys: releases arrow control
+        # (the station's "hold where released" publishes the boat's position).
         if self.arrow_active:
             self.arrow_active = False
             self.get_logger().info("Arrow control released by a manual target.")
 
-        # Reset the keep-location state only when the target actually MOVES.
-        # Re-publishing the same coordinates must not re-arm the arrival brake
-        # on a boat that is already holding station on them; a genuinely new
-        # target must. The [0, 0] resume sentinel differs from any real target,
-        # so it clears the hold on its way past.
+        # Reset the keep-location state only when the target MOVES, so a
+        # re-published target does not re-arm the arrival brake. The [0, 0]
+        # resume sentinel differs from any real target and clears it.
         target = [round(float(value), 6) for value in list(self.manual_target)[:2]]
         if target != self.manual_hold_target:
             self.manual_hold_target = target
-            self.manual_hold = False
-            self.manual_brake_t0 = None
+            self._clear_manual_hold()
 
     def arrow_thrust_callback(self, msg: Float32MultiArray):
         """
-        Arrow-key thrust from the station: [right, left] in Newtons, streamed
-        at 20 Hz while the operator drives with the keyboard ([0, 0] while no
-        key is held); an EMPTY array releases arrow control.
-
-        While engaged it overrides every other branch (timer_callback) and
-        pauses a run exactly as a manual target does. The command goes out
-        through publish_thrust like any other, so the uniform thrust_limit
-        saturation applies and this node stays the only /thruster_input
-        producer. Released by [], by a manual target, and by a run start.
+        Station arrow keys: [right, left] N at 20 Hz while driving, [] to
+        release. While engaged it overrides every branch and pauses a run; it
+        goes out through publish_thrust, so this node stays the only
+        /thruster_input producer. Released by [], a manual target, a run start.
         """
         data = list(msg.data)
         if not data:
@@ -1647,28 +1204,13 @@ class Controller(Node):
         self.arrow_cmd = [float(data[0]), float(data[1])]
         self.arrow_rx = time.time()
 
-    # inRobotFrame() moved to _custom_libraries/frame_math.py -- it used no
-    # node state at all, so it is pure geometry and now unit-testable without
-    # a ROS workspace. Called below as fm.inRobotFrame(...).
-
     def publish_thrust(self, u):
         """
-        Publish /thruster_input. Used both for the computed command and to say
-        "zero" explicitly whenever this node has nothing to command, so the
-        interface nodes are never left re-applying a stale thrust.
-
-        The command is saturated to +/- thrust_limit here, UNIFORMLY: one scale
-        factor for both thrusters, so the right:left ratio -- and with it the
-        direction of the commanded wrench -- survives the clamp and the boat
-        keeps the turn it asked for, just slower. See thrust_limits.py for why
-        clipping each side on its own does not do that.
-
-        This is the single exit for thrust, so it is the one place the rule has
-        to hold. It is a no-op for MPC, PID and LoS, whose commands are already
-        bounded (the allocator scales the same way, and the MPC's input bounds
-        are the same number). It binds on solve_LoS, which builds its array by
-        hand, goes through no allocator, and can reach 30-40 N -- the most
-        likely source of thrust recorded above the clamp before this landed.
+        Publish /thruster_input -- the single exit for thrust, also used to say
+        "zero" explicitly. Saturates UNIFORMLY to +/- thrust_limit (one factor
+        for both sides, so the wrench direction survives; thrust_limits.py).
+        Binds in practice only on solve_LoS, which bypasses the allocator.
+        Returns what went on the wire, so monitoring and the CSV agree.
         """
         limited, scale = tl.scale_to_limit(u, self.thrust_limit)
         if scale < 1.0:
@@ -1681,27 +1223,13 @@ class Controller(Node):
         msg = Float32MultiArray()
         msg.data = [float(v) for v in limited]
         self.thruster_input_publisher.publish(msg)
-
-        # Returned so the caller logs what went on the wire, not what it wished
-        # for: /monitoring_data[7:9] and the .npy u1/u2 then agree with the CSV's
-        # right_thr_in/left_thr_in, which is read straight off /thruster_input.
         return limited
 
     def save_monitoring(self):
         """
-        Write the controller log.
-
-        On its own timer, not in the control tick. np.save rewrites the whole
-        file every call -- there is no append for .npy -- and because row 0 is
-        a header of strings the entire array is re-coerced to <U32 each time.
-        Done at 10 Hz from timer_callback that is O(n) work per tick against a
-        list that grows every tick: measured on a 3 h run, the control loop had
-        decayed from its 0.05 s tick to 0.13-0.20 s, and the decay is unbounded.
-
-        Two changes, and neither touches the file's contents: the write happens
-        on a slower timer of its own, and it is skipped entirely when no new row
-        has arrived. The on-disk schema is byte-identical, so existing logs,
-        every analysis script and the log reviewer are unaffected (CM-7).
+        Write the controller log, on its own timer and only when rows were
+        added. np.save rewrites the whole file (string header -> <U32 array),
+        so doing it from the control tick decayed the 20 Hz loop on long runs.
         """
         if self.title is None:
             return                      # a session before its first run: no file
@@ -1720,17 +1248,10 @@ class Controller(Node):
         return s + ns*1e-9
 
     # ======================================================================
-    #  6. RUN SESSION  (session_mode only)
-    #  A real-robot launch from the Mission Control Station connects and then
-    #  IDLES: manual target and arrow keys drive the boat, nothing follows a
-    #  path or pinger, nothing is recorded. /blueboat/run_command (JSON):
-    #
-    #    {"cmd": "configure", "controller_type": "PID"|"LoS"|"MPC",
-    #     "use_pinger": bool, "note": str, "mission": str, "seq": n}
-    #    {"cmd": "start", "seq": n}      {"cmd": "stop", "seq": n}
-    #
-    #  /blueboat/run_state (JSON) answers every command and is heartbeated at
-    #  1 Hz; robot_interface opens and closes the run's position CSV from it.
+    #  6. RUN SESSION  (session_mode only; JSON contracts: CLAUDE.md §2.3)
+    #  The launch idles -- manual target and arrows only, nothing followed or
+    #  recorded -- until 'start'. /blueboat/run_state answers every command
+    #  and is heartbeated at 1 Hz; robot_interface opens the run's CSV from it.
     # ======================================================================
 
     def run_command_callback(self, msg: String):
@@ -1768,11 +1289,8 @@ class Controller(Node):
     def _configure(self, cmd):
         """Choose controller, follow mode, log note and mission for the NEXT run.
 
-        Refused during a run. PID and LoS are rebuilt here (microseconds); MPC
-        builds its acados solver on a worker thread -- seconds when cached,
-        about a minute after an MPC tuning change -- while this node keeps
-        serving manual target and arrow control, and is swapped in by
-        _poll_controller_build. Until then the state reads 'loading'.
+        Refused during a run. PID/LoS are rebuilt here; MPC builds on a worker
+        thread (state 'loading') and is swapped in by _poll_controller_build.
         """
         if self.run_active:
             self._answer(cmd, False, "a run is active - stop it before changing the mission")
@@ -1789,7 +1307,7 @@ class Controller(Node):
         if ctype == 'MPC' and use_pinger:
             self._answer(cmd, False, "MPC does not support pinger following - choose PID or LoS")
             return
-        # Live path update (section 7), additive: absent = unchanged.
+        # Section 7, additive: absent = unchanged.
         path_source = str(cmd.get('path_source', self.path_source))
         if path_source not in pu.PATH_SOURCES:
             self._answer(cmd, False, f"unknown path_source '{path_source}' "
@@ -1839,8 +1357,8 @@ class Controller(Node):
         try:
             controller = future.result()
         except Exception as exc:                       # noqa: BLE001 - reported
-            # The previous controller stays loaded, but the station asked for
-            # MPC: 'error' keeps Start Run disabled until it reconfigures.
+            # Previous controller stays loaded; 'error' refuses start until
+            # the station reconfigures.
             self.run_status = 'error'
             self.cmd_ok = False
             self.cmd_detail = f"MPC build failed: {type(exc).__name__}: {exc}"
@@ -1858,13 +1376,9 @@ class Controller(Node):
         self._publish_run_state()
 
     def _start_run(self, cmd):
-        """Start following the configured path or pinger, from a clean slate.
-
-        Everything the previous run or the idle period left behind is reset:
-        tau back to 0 (the station has just written the run's path, placed at
-        the boat or GPS-deployed, into the file path_generation watches), the
-        reference window, the controller's internal state, any manual target or
-        arrow control. A fresh .npy is reserved for this run alone.
+        """Start following the configured path or pinger, from a clean slate:
+        tau 0 (the station has just written the run's path), no window, no
+        controller memory, no manual target or arrow control, a fresh .npy.
         """
         if self.run_active:
             self._answer(cmd, False, "a run is already active")
@@ -1873,32 +1387,25 @@ class Controller(Node):
             self._answer(cmd, False, f"controller not ready ({self.run_status})")
             return
 
-        # Reserve this run's controller log first: if it cannot be written the
-        # run must not start (a run that cannot record is worse than none).
+        # A run that cannot record must not start.
         ctrl = self.controller_type
-        date = datetime.today().strftime('%Y_%m_%d-%H_%M_%S')
-        sim = 'simulation' if self.isSimulation else 'real'
         try:
-            run_dir = cf.ensure_data_dir(self, self.data_root, 'data', f'{ctrl}_data')
-            title = cf.reserve_run_file(run_dir, f'{date}-{ctrl}_{sim}_data', '.npy')
+            title = self._reserve_npy(ctrl)
         except OSError as exc:
             self._answer(cmd, False, f"cannot create the controller log: {exc}")
             return
         self.title = title
-        self.monitoring = [['t','x','y','psi','x_d','y_d','psi_d','u1','u2']]
+        self.monitoring = [list(NPY_HEADER)]
         self.monitoring_saved_rows = 0
 
-        # Operator overrides end: the run starts following now.
         self.manual_target = [0.0, 0.0]
-        self.manual_hold = False
-        self.manual_brake_t0 = None
+        self._clear_manual_hold()
         self.manual_hold_target = None
         self.arrow_active = False
         self.arrow_cmd = [0.0, 0.0]
         self.stopping_sequence = False
         self.stopping_time = None
 
-        # Reference from the top of the (freshly written) path.
         self.tau = 0.0
         self.controller_path = Path()
         self.future = None
@@ -1911,8 +1418,7 @@ class Controller(Node):
         if ctrl == 'PID' and self.controller is not None:
             self.controller.reset()
         if ctrl == 'MPC' and self.controller is not None:
-            # The same reset the failure path uses: zero iterate and QP memory,
-            # i.e. the state a freshly built solver starts from.
+            # As freshly built: zero iterate and QP memory.
             self.controller.solver.reset()
             self.controller.fail_count = 0
 
@@ -1920,8 +1426,7 @@ class Controller(Node):
         self.run_t0 = time.time()
         self.run_active = True
         self.run_status = 'running'
-        # Live path update (section 7): a new run never inherits a path; a
-        # replanner run starts holding at the boat, awaiting its first path.
+        # A new run never inherits a path (a replanner run starts holding).
         self._path_update_reset('run_started')
         follow = 'pinger' if self.use_pinger else 'path'
         self.get_logger().info(
@@ -1939,18 +1444,16 @@ class Controller(Node):
         self.run_status = 'idle'
         self.save_monitoring()
 
-        # The boat stops: no manual target survives the run (arrow control, an
-        # operator toggle on the station, is left alone).
+        # No manual target survives the run (arrow control, a station toggle,
+        # is left alone).
         self.manual_target = [0.0, 0.0]
-        self.manual_hold = False
-        self.manual_brake_t0 = None
+        self._clear_manual_hold()
         self.manual_hold_target = None
         self.stopping_sequence = False
         self.controller_path = Path()
         self.future = None
         self.request_sent = None
         self.path_rx_time = None
-        # Live path update (section 7): the run's path ends with the run.
         self._path_update_reset('run_stopped')
 
         self.get_logger().info(
@@ -1973,8 +1476,7 @@ class Controller(Node):
             'mission': self.run_mission,
             'run': self.run_number,
             'npy': f"{self.title}.npy" if self.title else '',
-            # Live path update (section 7), additive: robot_interface skips the
-            # -path.yaml snapshot of a replanner run (it follows no file).
+            # Additive: robot_interface skips a replanner run's path snapshot.
             'path_source': self.path_source,
         }
         msg = String()
@@ -1982,22 +1484,11 @@ class Controller(Node):
         self.run_state_publisher.publish(msg)
 
     # ======================================================================
-    #  7. LIVE PATH UPDATE  (BlueBoat-Replanner entry point)
-    #  docs/PATH_UPDATE_DESIGN.md (why) / docs/PATH_UPDATE_INTERFACE.md (the
-    #  contract). Every decision is taken by _custom_libraries/path_update.py
-    #  from a snapshot of this node's state; this section only wires it:
-    #
-    #    /blueboat/update_path        (UpdatePath.srv)   in   every launch
-    #    /blueboat/path_progress      (String JSON)      out  10 Hz + on change
-    #    /blueboat/path_update_event  (String JSON)      out  one per event
-    #
-    #  A run is either a FIXED MISSION (path_source 'mission', the default:
-    #  /path_request as ever, every request refused 'mission_owned') or
-    #  REPLANNER-OWNED ('replanner'): it starts holding at the boat, its first
-    #  path and every change come through the service, and its reference
-    #  window is composed here from that plan. Run boundaries (launch, start,
-    #  stop) discard the plan. Safety and operator controls are never touched:
-    #  a request is refused while they are engaged.
+    #  7. LIVE PATH UPDATE  (BlueBoat-Replanner entry point; docs/PATH_UPDATE_*)
+    #  Every decision is taken by path_update.py from a snapshot of this
+    #  node's state (_path_update_context); this section only wires it.
+    #  Fixed missions (path_source 'mission') refuse every request with
+    #  'mission_owned'; run boundaries discard the plan; N10.
     # ======================================================================
 
     def _init_path_update(self):
@@ -2015,14 +1506,7 @@ class Controller(Node):
             self.get_logger().fatal(msg)
             raise ValueError(msg)
 
-        def dbl(name, default):
-            self.declare_parameter(name, float(default))
-            return self.get_parameter(name).get_parameter_value().double_value
-
-        def integer(name, default):
-            self.declare_parameter(name, int(default))
-            return self.get_parameter(name).get_parameter_value().integer_value
-
+        dbl, integer = self._dbl, self._int
         # Thresholds and their derivations: docs/PATH_UPDATE_DESIGN.md D-4.
         cfg = pu.Config(
             gov_Lmax=self.gov_Lmax,
@@ -2032,9 +1516,7 @@ class Controller(Node):
             heading_tol=dbl('path_update_heading_tol', math.radians(10.0)),
             heading_coherence=dbl('path_update_heading_coherence', math.radians(45.0)),
             max_speed=dbl('path_update_max_speed', 2.0),
-            # Worst-case handling measured at 2.2 ms for 20 000 samples
-            # (design doc, real-time safety) -- 10 % of the 20 Hz tick budget at
-            # most, and 2.8 h of path at 0.5 s sample spacing.
+            # 2.2 ms worst-case handling at 20 000 samples (design doc).
             max_points=integer('path_update_max_points', 20000))
         period = dbl('path_progress_period', 0.1)
 
@@ -2094,11 +1576,9 @@ class Controller(Node):
                      float(self.current_pose[5]))
         self.path_updater.set_hold((x, y, yaw))
         if list(self.manual_target) == [0.0, 0.0]:
-            # The keep-location state is shared with the manual-target branch;
-            # start the hold from a clean slate (an operator target, which
-            # outranks this hold, keeps its own).
-            self.manual_hold = False
-            self.manual_brake_t0 = None
+            # Shared keep-location state: start clean, unless an operator
+            # target (which outranks this hold) owns it.
+            self._clear_manual_hold()
         self.get_logger().info(
             f"Awaiting the first path: holding at ({x:.2f}, {y:.2f}), "
             f"yaw {yaw:.3f} rad.")
@@ -2124,8 +1604,7 @@ class Controller(Node):
         try:
             answer, event, new_tau = self.path_updater.handle(req, self._path_update_context())
         except Exception as exc:                       # noqa: BLE001 - reported, never fatal
-            # A defect here must not take the controller down: refuse, keep
-            # everything as it was, and say so loudly.
+            # A defect here must not take the controller down: refuse.
             self.get_logger().error(f"/blueboat/update_path: internal error "
                                     f"{type(exc).__name__}: {exc} - request refused.")
             response.accepted = False
@@ -2141,8 +1620,7 @@ class Controller(Node):
             # the awaiting hold ends and path following takes over next tick.
             self.tau = float(new_tau)
             if list(self.manual_target) == [0.0, 0.0]:
-                self.manual_hold = False
-                self.manual_brake_t0 = None
+                self._clear_manual_hold()
 
         handling_ms = (time.perf_counter() - started) * 1e3
         event['handling_ms'] = handling_ms
@@ -2166,9 +1644,8 @@ class Controller(Node):
         return response
 
     def _replanner_reference_step(self, current_time, current_state, manual_active, arrow_active):
-        """The replanner-run counterpart of the /path_request block in
-        timer_callback: compose the window at tau from the plan, advance the
-        governor on it exactly as that block does, report transitions."""
+        """Replanner-run counterpart of _mission_reference_step: compose the
+        window at tau from the plan, advance the governor, report transitions."""
         updater = self.path_updater
         if updater.awaiting or not updater.plan:
             if updater.awaiting and updater.hold is None and self.current_pose is not None:
@@ -2181,8 +1658,6 @@ class Controller(Node):
         self.controller_path = self._compose_window(params, xs, ys, yaws)
         self.path_rx_time = current_time        # composed now: always fresh
 
-        # The governor, as in the request block: frozen while a manual target
-        # or arrow control overrides path following.
         if not (manual_active or arrow_active):
             e_along, e_y, _, _ = self.path_progress_errors(self.controller_path, current_state)
             self.advance_governor(e_along, e_y)
@@ -2242,8 +1717,7 @@ try:
 except KeyboardInterrupt:
     pass
 finally:
-    # The log is written on a timer now, so a run cut short here could otherwise
-    # lose its last couple of seconds. Flush before going away (CM-7).
+    # Flush the timer-written log so a cut-short run keeps its last rows (CM-7).
     try:
         node.save_monitoring()
     except Exception:

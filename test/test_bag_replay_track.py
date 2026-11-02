@@ -12,7 +12,6 @@ bursts, roll std 6 deg) when it is on this machine and rclpy / rosbag2_py import
 it is skipped otherwise. BAG= overrides the run folder.
 """
 
-import importlib.util
 import math
 import os
 import subprocess
