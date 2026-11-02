@@ -8,8 +8,22 @@ simulator), spawns the boat with blueboat_description's force-free `replay`
 description, bridges /clock and the world's set_pose service, and runs
 bag_replay, which moves the boat along the recorded pose and republishes the
 recording (see bag_replay.py). Nothing else: no controller, no
-simulation_interface, no sea state, no /current bridge, no sonar -- the
-recording already holds the real sea, and the boat cannot feel a simulated one.
+simulation_interface, no sea state, no /current bridge -- the recording
+already holds the real sea, and the boat cannot feel a simulated one -- and no
+sonar.
+
+A simulated sonar is started separately, by the operator (2026-10-27): every
+replay publishes the replayed pose at 100 Hz on /sim/sea_state/boat_pose, the
+simulator's own Gazebo-pose topic, so a blueboat_sss_sim sss_sim_node started
+over the same world renders every ping from the recorded position and full 3D
+attitude at the ping time. Start it with its mavros shim off (the replay
+already publishes the recorded /mavros/*) and let the GCS enable pinging:
+
+    ros2 launch blueboat_sss_sim sss_sim_launch.py world_dir:=<world> with_mavros_shim:=false auto_ping:=false
+
+Real motion, simulated sensor: a hybrid, never a field result (superproject
+CM-14). `placement:=origin` puts the run on the world's origin when the world
+is not where the run was (no GPS placement).
 
 A built world is only READ here: its world.sdf (with the folder on
 GZ_SIM_RESOURCE_PATH, as the simulator's own launch does) and the anchor in its
@@ -32,8 +46,10 @@ sl.declare_arg('bag', default_value = '')               # a run folder (Robot_da
 sl.declare_arg('world_dir', default_value = '')         # empty = the stock `ocean` world, in the run's launch frame
 sl.declare_arg('rate', default_value = 1.0)             # playback rate (live: /replay/command)
 sl.declare_arg('heave', default_value = True)           # replay the EKF's detrended heave; False pins the waterline
+sl.declare_arg('heave_gate', default_value = True)      # ... only when it looks like motion, not altitude noise (False: always, v1.1)
 sl.declare_arg('start_paused', default_value = False)
 sl.declare_arg('gui', default_value = True)
+sl.declare_arg('placement', default_value = 'gps')      # gps: placed by the world's anchor; origin: the run's launch point on the world origin
 
 STOCK_WORLD_NAME = 'ocean'
 
@@ -70,14 +86,20 @@ def launch_setup():
         raise RuntimeError("launch argument 'bag' is required (a run folder or its bag)")
     world_dir = os.path.expanduser(str(sl.arg('world_dir') or ''))
     gz_flags = '-r' if sl.arg('gui') else '-r -s'
+    placement = str(sl.arg('placement'))
+    if placement not in ('gps', 'origin'):
+        raise RuntimeError(f"placement must be gps or origin, not {placement!r}")
 
     if world_dir:
         world_file = os.path.join(world_dir, 'world.sdf')
         if not os.path.isfile(world_file):
             raise RuntimeError(f"{world_file}: no such world")
         anchor = world_anchor(world_dir)
-        if anchor is None:
-            raise RuntimeError(f"{world_dir}: no geo anchor (metadata.yaml geo_anchor)")
+        if anchor is None and placement == 'gps':
+            raise RuntimeError(f"{world_dir}: no geo anchor (metadata.yaml geo_anchor); "
+                               "placement:=origin replays the run on its origin")
+        if placement == 'origin':
+            anchor = None
         world_name = world_name_from_sdf(world_file)
         # The world references its meshes relatively (seabed.stl).
         sl.add_action(SetEnvironmentVariable(
@@ -98,14 +120,18 @@ def launch_setup():
                launch_arguments={'sliders': False, 'thr': 'thrusters_ur',
                                  'replay': True, 'gazebo_world_name': world_name})
 
-    sl.node('blueboat_control', 'bag_replay.py', output='screen',
-            parameters={'bag': bag,
-                        'rate': float(sl.arg('rate')),
-                        'world_name': world_name,
-                        'anchor_lat': anchor[0] if anchor else math.nan,
-                        'anchor_lon': anchor[1] if anchor else math.nan,
-                        'heave': sl.arg('heave'),
-                        'start_paused': sl.arg('start_paused')})
+    params = {'bag': bag,
+              'rate': float(sl.arg('rate')),
+              'world_name': world_name,
+              'anchor_lat': anchor[0] if anchor else math.nan,
+              'anchor_lon': anchor[1] if anchor else math.nan,
+              'heave': sl.arg('heave'),
+              'heave_gate': sl.arg('heave_gate'),
+              'start_paused': sl.arg('start_paused'),
+              'placement': placement,
+              # The pose a simulated sonar started over this world renders from.
+              'publish_boat_pose': True}
+    sl.node('blueboat_control', 'bag_replay.py', output='screen', parameters=params)
 
     return sl.launch_description()
 

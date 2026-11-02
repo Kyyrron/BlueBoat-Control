@@ -89,7 +89,8 @@ class TrackCanvas(FigureCanvasQTAgg):
         self._lat0 = artists.get("lat0", 0.0)
         self._world = bool(artists.get("world", False))
         self._track_lines = [a for a in (artists.get("robot_line"),
-                                         artists.get("target_line")) if a]
+                                         artists.get("target_line"),
+                                         artists.get("pinger_line")) if a]
         self._series = F.replay_series(run)
         self._build_replay_artists()
         # ax.clear() threw the old cursor artists away; rebuild them onto the
@@ -127,7 +128,7 @@ class TrackCanvas(FigureCanvasQTAgg):
         self.draw_idle()
 
     def set_playhead(self, t):
-        """Advance the trail to mission time `t`. Cheap: blitted, four artists."""
+        """Advance the trail to mission time `t`. Cheap: blitted, six artists."""
         if not self._replay_on or self._series is None:
             return
         F.set_replay_frame(self._replay, self._series, t)

@@ -10,7 +10,7 @@ divergence:
   * every panel's title and description are OPERATOR TEXT, not literals;
   * the track carries satellite imagery and must survive pan and zoom;
   * there is no actuation-state strip (the numbers stay in the summary);
-  * the summary lays 21 entries into 7 rows x 3 pairs. The PNG's `per_col = 6`
+  * the summary lays 22 entries into 8 rows x 3 pairs. The PNG's `per_col = 6`
     against 3 columns is 18 slots for 19 entries, so its last row - the world
     origin - is silently dropped. Do not copy that back.
 
@@ -29,7 +29,11 @@ import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
 from matplotlib.lines import Line2D
+from matplotlib.markers import MarkerStyle
+from matplotlib.path import Path
+from matplotlib.transforms import Affine2D
 
+from . import pinger_bag as PB
 from . import poslog_bridge as pb
 
 SURFACE, INK, INK2, MUTED, GRID = pb.SURFACE, pb.INK, pb.INK2, pb.MUTED, pb.GRID
@@ -142,8 +146,12 @@ def headline(ax, title, description, wrap=WRAP_CHARS, show=True):
 # Track
 # ---------------------------------------------------------------------------
 
+PINGER = "#7b4fc4"      # a third categorical slot, clear of ROBOT blue and TARGET orange
+
+
 def track_extent(run, margin=0.08):
-    """The box enclosing both tracks, padded, in whatever frame they are in.
+    """The box enclosing both tracks (and the pinger, when shown), padded, in
+    whatever frame they are in.
 
     Returns None when the run has nothing drawable at all.
     """
@@ -156,6 +164,11 @@ def track_extent(run, margin=0.08):
     if np.any(tfix):
         lons.append(series["tx"][tfix])
         lats.append(series["ty"][tfix])
+    shown = PB.track_points(run)
+    if shown is not None:
+        keep = np.isfinite(shown[0]) & np.isfinite(shown[1])
+        lons.append(shown[0][keep])
+        lats.append(shown[1][keep])
     lon_all, lat_all = np.concatenate(lons), np.concatenate(lats)
     lon_lo, lon_hi = float(np.min(lon_all)), float(np.max(lon_all))
     lat_lo, lat_hi = float(np.min(lat_all)), float(np.max(lat_all))
@@ -215,9 +228,18 @@ def plot_track(ax, run, texts, tile_provider=None, limits=None, canvas_px=900, s
     target_line = None
     if np.any(tfix):
         target_line, = ax.plot(tx[tfix], ty[tfix], "-", color=TARGET,
-                               linewidth=2.0, label="target", zorder=2)
+                               linewidth=2.0, zorder=2,
+                               label="raw_pinger" if run["layout"] == "pinger" else "target")
     robot_line, = ax.plot(x[fix], y[fix], "-", color=ROBOT, linewidth=2.0,
                           label="robot", zorder=3)
+    # The pinger the bag recorded (only when the operator asked for it). Dots,
+    # not a line: it is an estimate that is re-fixed, not a path that is driven.
+    pinger_line = None
+    shown = PB.track_points(run)
+    if shown is not None and np.any(np.isfinite(shown[0])):
+        pinger_line, = ax.plot(shown[0], shown[1], "D", markersize=4.5, color=PINGER,
+                               markeredgecolor=SURFACE, markeredgewidth=0.6,
+                               linestyle="none", label="pinger", zorder=2.5)
 
     # Start / end, ringed in the surface colour so they stay legible over the line.
     ax.plot(x[fix][0], y[fix][0], "o", markersize=9, color=ROBOT,
@@ -236,6 +258,7 @@ def plot_track(ax, run, texts, tile_provider=None, limits=None, canvas_px=900, s
     decorate_track(ax, lat0, world)
 
     return {"robot_line": robot_line, "target_line": target_line,
+            "pinger_line": pinger_line,
             "lat0": lat0, "fix": fix, "tfix": tfix, "world": world}
 
 
@@ -323,18 +346,35 @@ def replay_series(run):
     """
     series = pb.track_series(run)
     fix, tfix = series["ok"], series["tok"]
-    return {
+    out = {
         "t": run["t"],
         "lon": np.where(fix, series["x"], np.nan),
         "lat": np.where(fix, series["y"], np.nan),
         "tlon": np.where(tfix, series["tx"], np.nan),
         "tlat": np.where(tfix, series["ty"], np.nan),
+        # Absolute ENU yaw (rad, 0 = East, CCW+). The panel's aspect is metric
+        # in both frames, so this is also the arrow's on-screen angle.
+        "psi": np.asarray(run["data"]["relative_psi"], dtype=float),
     }
+    held = PB.panel_series(run)
+    if held is not None:
+        out["px"], out["py"] = held
+    return out
+
+
+_ARROW = Path([(1.0, 0.0), (-0.8, 0.65), (-0.4, 0.0), (-0.8, -0.65), (1.0, 0.0)],
+              [Path.MOVETO, Path.LINETO, Path.LINETO, Path.LINETO, Path.CLOSEPOLY])
+
+
+def arrow_marker(psi):
+    """A small arrow marker pointing along `psi` (rad, 0 = East, CCW+)."""
+    return MarkerStyle(_ARROW, transform=Affine2D().rotate(float(psi)))
 
 
 def make_replay_artists(ax, visible=False):
-    """The four replay artists - target trail, robot trail, target dot, robot
-    dot - added to `ax`. One definition, so the exported video draws exactly
+    """The six replay artists - target trail, robot trail, target dot, robot
+    dot, then the pinger trail and dot (empty unless the pinger is shown) -
+    added to `ax`. One definition, so the exported video draws exactly
     what the on-screen replay draws."""
     common = dict(visible=visible)
     target_trail = Line2D([], [], color=TARGET, linewidth=2.6, zorder=6, **common)
@@ -342,17 +382,24 @@ def make_replay_artists(ax, visible=False):
     target_dot = Line2D([], [], marker="o", markersize=9, color=TARGET,
                         markeredgecolor=SURFACE, markeredgewidth=1.8,
                         linestyle="none", zorder=8, **common)
-    robot_dot = Line2D([], [], marker="o", markersize=11, color=ROBOT,
-                       markeredgecolor=SURFACE, markeredgewidth=2.0,
-                       linestyle="none", zorder=9, **common)
-    artists = [target_trail, robot_trail, target_dot, robot_dot]
+    robot_dot = Line2D([], [], marker=arrow_marker(0.0), markersize=16,
+                       color=ROBOT, markeredgecolor=SURFACE,
+                       markeredgewidth=1.4, linestyle="none", zorder=9, **common)
+    pinger_trail = Line2D([], [], marker="D", markersize=4, color=PINGER,
+                          alpha=0.55, linestyle="none", zorder=5, **common)
+    pinger_dot = Line2D([], [], marker="D", markersize=10, color=PINGER,
+                        markeredgecolor=SURFACE, markeredgewidth=1.6,
+                        linestyle="none", zorder=8.5, **common)
+    # The pinger pair goes LAST, so the first four keep their indices.
+    artists = [target_trail, robot_trail, target_dot, robot_dot,
+               pinger_trail, pinger_dot]
     for artist in artists:
         ax.add_line(artist)
     return artists
 
 
 def set_replay_frame(artists, series, t):
-    """Advance the four replay artists to mission time `t`. Draws nothing."""
+    """Advance the replay artists to mission time `t`. Draws nothing."""
     times = series["t"]
     if not len(times):
         return
@@ -362,6 +409,17 @@ def set_replay_frame(artists, series, t):
     artists[1].set_data(series["lon"][:index + 1], series["lat"][:index + 1])
     artists[2].set_data(*last_valid(series["tlon"], series["tlat"], index))
     artists[3].set_data(*last_valid(series["lon"], series["lat"], index))
+    if "px" in series:
+        artists[4].set_data(series["px"][:index + 1], series["py"][:index + 1])
+        artists[5].set_data(*last_valid(series["px"], series["py"], index))
+    else:
+        artists[4].set_data([], [])
+        artists[5].set_data([], [])
+    psi = series.get("psi")
+    if psi is not None:
+        good = np.nonzero(~np.isnan(psi[:index + 1]))[0]
+        if len(good):
+            artists[3].set_marker(arrow_marker(psi[good[-1]]))
 
 
 def last_valid(xs, ys, index):
@@ -502,7 +560,7 @@ def plot_table(ax, rows, title="Summary", per_col=7):
 # ---------------------------------------------------------------------------
 
 def build_report_figure(run, texts, tile_provider=None, track_limits=None,
-                        figsize=(16.0, 12.0), dpi=130):
+                        figsize=(16.0, 12.4), dpi=130):
     """The exported picture: the PNG's layout minus the actuation strip.
 
     Built on a bare `Figure`, so the caller attaches whatever canvas it wants
@@ -514,7 +572,7 @@ def build_report_figure(run, texts, tile_provider=None, track_limits=None,
 
     fig = Figure(figsize=figsize, dpi=dpi, facecolor=SURFACE)
     gs = GridSpec(4, 4, figure=fig,
-                  height_ratios=[2.3, 2.3, 1.5, 1.75],
+                  height_ratios=[2.3, 2.3, 1.5, 2.0],
                   hspace=0.75, wspace=0.32,
                   left=0.055, right=0.975, top=0.880, bottom=0.045)
 

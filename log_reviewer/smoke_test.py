@@ -46,10 +46,28 @@ def find_logs(limit=6):
             if name.endswith(".csv") and "-poslog" in name:
                 found.append(os.path.join(root, name))
     found.sort(key=os.path.getsize)
-    if len(found) <= limit:
-        return found
-    # Smallest and largest, so both the short-run and long-run paths are hit.
-    return found[:limit // 2] + found[-(limit - limit // 2):]
+
+    def legacy(path):               # written before the legend rows of 2026-10-08
+        with open(path) as handle:
+            return handle.readline().startswith("Year")
+
+    if len(found) > limit:
+        # Smallest and largest, so both the short-run and long-run paths are hit.
+        found = found[:limit // 2] + found[-(limit - limit // 2):]
+    # Several sections treat the LAST log as an old-format one (they build the
+    # new format from it), so make sure the last is - whatever the corpus's
+    # newest logs look like.
+    everything = sorted((p for p in _all_logs() if legacy(p)), key=os.path.getsize)
+    if everything and not legacy(found[-1]):
+        found = [p for p in found if p != everything[-1]][:limit - 1] + [everything[-1]]
+    return found
+
+
+def _all_logs():
+    for root, _dirs, files in os.walk(ROBOT_DATA):
+        for name in files:
+            if name.endswith(".csv") and "-poslog" in name:
+                yield os.path.join(root, name)
 
 
 def digest(path):
@@ -85,6 +103,7 @@ def main():
         section_frames(logs, workspace)
         section_legend(logs, workspace)
         section_figures(logs, workspace)
+        section_pinger(logs, workspace)
         section_export(logs, workspace)
         section_tiles()
         section_gui(logs, workspace)
@@ -147,7 +166,18 @@ def section_data(logs):
 
     rows = pb.summary_rows(crop, metrics)
     labels = [label for label, _ in rows]
-    check("summary has 21 entries", len(rows) == 21, str(len(rows)))
+    check("summary has 22 entries", len(rows) == 22, str(len(rows)))
+    check("summary names the controller",
+          dict(rows)["Controller"] in ("PID", "LoS", "MPC", "unknown"))
+    with tempfile.TemporaryDirectory() as root:
+        os.makedirs(os.path.join(root, "LoS_data"))
+        open(os.path.join(root, "LoS_data",
+                          "2026_01_02-03_04_05-LoS_real_data.npy"), "wb").close()
+        fake = {"stem": "2026_01_02-03_04_05-x-poslog", "origin": {}}
+        check("find_controller reads the .npy name",
+              pb.find_controller(fake, root) == "LoS")
+        fake["stem"] = "2026_01_02-03_04_06-x-poslog"
+        check("find_controller: no match is unknown", pb.find_controller(fake, root) is None)
     check("summary keeps the world origin (the PNG drops it)",
           any("World origin" in label for label in labels))
 
@@ -232,7 +262,12 @@ def section_legend(logs, workspace):
     check("an unknown column gets empty legend cells, so the rows still line up",
           rls.legend_rows(["relative_x", "quat_w"]) == ([rls.LEGEND["relative_x"][0], ""], ["m", ""]))
 
-    old = logs[-1]
+    # Needs a log from BEFORE the legend rows (header on line 1); a corpus that
+    # holds only newer logs has nothing to upgrade.
+    old = next((p for p in logs if open(p).readline().startswith("Year")), None)
+    if old is None:
+        print("  (no pre-2026-10-08 log in the corpus - the upgrade checks are skipped)")
+        return
     new = make_legend_log(old, workspace)
     with open(new) as handle:
         top = [handle.readline().rstrip("\n").split(",") for _ in range(3)]
@@ -262,6 +297,227 @@ def section_legend(logs, workspace):
     check("the reader exposes the legend of a new log, None for an old one",
           a["legend"] is None and b["legend"] is not None
           and b["legend"][1][7] == "m")
+
+
+def mcap_file(path, topics):
+    """A minimal valid MCAP (uncompressed chunk) holding `topics`:
+    {name: [(log_time_ns, [float32 values]), ...]} - enough for the reader
+    without ROS, mcap or a real bag."""
+    import struct
+
+    def rec(op, body):
+        return bytes([op]) + struct.pack("<Q", len(body)) + body
+
+    def string(text):
+        raw = text.encode()
+        return struct.pack("<I", len(raw)) + raw
+
+    def cdr(values):        # Float32MultiArray: no dims, offset 0, then data
+        return (b"\x00\x01\x00\x00" + struct.pack("<II", 0, 0)
+                + struct.pack("<I", len(values))
+                + struct.pack("<%df" % len(values), *values))
+
+    inner = b""
+    stamps = []
+    for cid, (_name, messages) in enumerate(topics.items(), start=1):
+        inner += rec(0x04, struct.pack("<HH", cid, 0) + string(_name) + string("cdr")
+                     + struct.pack("<I", 0))
+    for cid, (_name, messages) in enumerate(topics.items(), start=1):
+        for seq, (when, values) in enumerate(messages):
+            stamps.append(when)
+            inner += rec(0x05, struct.pack("<HIQQ", cid, seq, when, when) + cdr(values))
+    chunk = (struct.pack("<QQQI", min(stamps), max(stamps), len(inner), 0)
+             + string("") + struct.pack("<Q", len(inner)) + inner)
+    magic = b"\x89MCAP0\r\n"
+    with open(path, "wb") as handle:
+        handle.write(magic + rec(0x01, string("") + string("smoke")) + rec(0x06, chunk)
+                     + rec(0x0F, struct.pack("<I", 0))
+                     + rec(0x02, struct.pack("<QQI", 0, 0, 0)) + magic)
+
+
+def synthetic_pinger_log(logs, workspace, shift_s=0.0, spike=True):
+    """A copy of the smallest real no-pinger log with a bag beside it holding a
+    STATIC pinger at a known world point, seen from the logged pose.
+
+    Returns (csv path, (px, py)). `shift_s` moves every bag time, to rehearse a
+    machine in another time zone (a whole number of half hours) or a bag that
+    is not this run's.
+    """
+    from reviewer import pinger_bag as PB
+    from reviewer import poslog_bridge as pb
+    source = None
+    for candidate in logs:
+        loaded = pb.load(candidate)
+        if loaded["layout"] == "no_pinger" and loaded["n_rows"] >= 150:
+            source = candidate
+            break
+    if source is None:
+        return None, None
+    stem = "2026_01_02-03_04_05-synth"
+    name = "%s-poslog%s.csv" % (stem, "" if not shift_s else "-%d" % abs(int(shift_s)))
+    out = os.path.join(workspace, name)
+    shutil.copy(source, out)
+    sidecar = pb.sidecar_path(source)
+    if os.path.isfile(sidecar):
+        shutil.copy(sidecar, pb.sidecar_path(out))
+    run = pb.load(out)
+    pt, px, py, psi = PB._pose(run)
+    target = (float(np.median(px)) + 4.0, float(np.median(py)) - 3.0)
+    base = PB.first_row_epoch(run) + shift_s
+    times = np.arange(pt[0] + 0.2, pt[-1] - 0.2, 0.2)
+    body = []
+    for when in times:
+        x, y, yaw = (np.interp(when, pt, q) for q in (px, py, psi))
+        dx, dy = target[0] - x, target[1] - y
+        body.append([np.cos(yaw) * dx + np.sin(yaw) * dy,
+                     -np.sin(yaw) * dx + np.cos(yaw) * dy, 0.4])
+    first = len(times) // 5                        # not detected before this
+    messages = [(int((base + w) * 1e9), [0.0, 0.0, 0.0] if i < first else b)
+                for i, (w, b) in enumerate(zip(times, body))]
+    if spike:
+        k = first + 3 * (len(times) - first) // 4
+        messages[k] = (messages[k][0], [18.0, -12.0, 0.4])
+    ugps = [(int((base + w) * 1e9),
+             [2026, 1, 2, 3, 4, 5, 0] + [1.0, 2.0, 3.0, 0, 0, 0, 0, 0, 0.5] + list(b))
+            for w, b in zip(times[first::5], body[first::5])]
+    bag = os.path.join(workspace, pb.pr.bag_name(out))
+    os.makedirs(bag, exist_ok=True)
+    mcap_file(os.path.join(bag, ".run-bag-1-1_0.mcap"),
+              {PB.BODY_TOPIC: messages, PB.UGPS_TOPIC: ugps})
+    return out, target, first
+
+
+def section_pinger(logs, workspace):
+    print("\n[2b] the pinger from the run's ros2 bag")
+    from reviewer import export as E
+    from reviewer import figures as F
+    from reviewer import pinger_bag as PB
+    from reviewer import poslog_bridge as pb
+
+    made = synthetic_pinger_log(logs, workspace)
+    if made[0] is None:
+        print("  (no no-pinger log in the corpus - skipped)")
+        return
+    csv_path, target, first = made
+    before = digest(csv_path)
+    run = pb.load(csv_path)
+    PB.attach(run)
+    found = run["pinger"]
+    check("a bag beside the log is found", PB.find_bag(csv_path) is not None)
+    check("the pinger is detected", found is not None, run["pinger_note"])
+    if found is None:
+        return
+    err = np.hypot(found["x"] - target[0], found["y"] - target[1])
+    check("a static pinger is recovered at its true place", err.max() < 0.01,
+          "max error %.3f m" % err.max())
+    check("a 20 m spike is rejected, not smoothed in",
+          found["n_accepted"] < found["n_detected"] and err.max() < 0.01)
+    check("the all-zero vector is 'not detected', so nothing is drawn before it",
+          found["first_t"] > run["t"][0] + 0.2 * (run["t"][-1] - run["t"][0]) - 1.0)
+
+    # Time: a machine in another zone, and a bag that is not this run's.
+    for shift, ok in ((9 * 3600.0, True), (-5.5 * 3600.0, True), (3600.0 + 420.0, False)):
+        other, _t, _f = synthetic_pinger_log(logs, workspace, shift_s=shift)
+        again = pb.load(other)
+        PB.attach(again)
+        if ok:
+            check("a bag a whole zone away still aligns (%+.1f h)" % (shift / 3600.0),
+                  again["pinger"] is not None and abs(again["pinger"]["shift_s"] - shift) < 1e-6
+                  and np.hypot(again["pinger"]["x"] - target[0],
+                               again["pinger"]["y"] - target[1]).max() < 0.01,
+                  again["pinger_note"])
+        else:
+            check("a bag 67 minutes off is refused, not shifted",
+                  again["pinger"] is None and "not this run" in again["pinger_note"],
+                  again["pinger_note"])
+
+    # What the panels take.
+    run["pinger_show"] = False
+    check("hidden: nothing joins the replay series", "px" not in F.replay_series(run))
+    run["pinger_show"] = True
+    series = F.replay_series(run)
+    check("shown: the pinger joins the replay series, aligned with the rows",
+          "px" in series and len(series["px"]) == run["n_rows"])
+    shown = np.isfinite(series["px"])
+    early = run["t"] < found["t"][0]
+    after = run["t"] > found["t"][-1] + PB.HOLD_S
+    check("held from its first detection, not before, and not past HOLD_S of the last",
+          shown.any() and not shown[early].any() and not shown[after].any()
+          and shown[np.searchsorted(run["t"], found["t"][len(found["t"]) // 2])])
+    fig = F.Figure()
+    artists = F.plot_track(fig.add_subplot(111), run, F.default_texts(run["stem"], run), None,
+                           None, 800, show_headline=False)
+    check("the track draws the pinger", artists.get("pinger_line") is not None)
+    box = F.track_extent(run)
+    px, py = PB.in_panel_frame(run, np.array([target[0]]), np.array([target[1]]))
+    check("the frame includes the pinger",
+          box[0] <= px[0] <= box[1] and box[2] <= py[0] <= box[3])
+
+    # The export: shaped as a with-pinger log, readable by this same app.
+    crop = pb.crop_run(run, run["t"][0], run["t"][-1])
+    crop["pinger_show"] = True
+    out = os.path.join(workspace, "pinger-export.csv")
+    E.write_cropped_csv(csv_path, out, crop["row_index"], PB.export_columns(crop))
+    shutil.copy(pb.sidecar_path(csv_path), os.path.join(workspace, "pinger-export-origin.yaml"))
+    back = pb.load(out)
+    rls = pb.rls
+    check("the export reads back as a with-pinger log",
+          back["layout"] == "pinger" and back["n_rows"] == run["n_rows"])
+    check("its columns are the with-pinger layout, the path target kept after them",
+          list(back["data"])[:len(rls.COLUMNS_PINGER)] == list(rls.COLUMNS_PINGER)
+          and {"target_x", "target_y", "target_latitude", "target_longitude"}
+          <= set(back["data"]))
+    check("the path target is not lost",
+          np.array_equal(back["data"]["target_x"], run["data"]["target_x"]))
+    with open(csv_path, newline="") as a, open(out, newline="") as b:
+        import csv as _csv
+        src = list(_csv.reader(a))
+        dst = list(_csv.reader(b))
+    _legend, si = rls.split_header(src)
+    _legend, di = rls.split_header(dst)
+    sh, dh = src[si], dst[di]
+    same = all(src[si + 1 + k][sh.index(c)] == dst[di + 1 + k][dh.index(c)]
+               for k in (0, len(back["data"]["Year"]) - 1)
+               for c in ("relative_x", "relative_psi", "right_thr_in", "roll"))
+    check("the columns both layouts share are copied verbatim", same)
+    px_col = back["data"]["corrected_pinger_x"]
+    seen = px_col != 0.0
+    check("corrected_pinger is 0.0 before the first detection and the pinger after",
+          not seen[0] and seen.any()
+          and np.hypot(px_col[seen][-1] - target[0],
+                       back["data"]["corrected_pinger_y"][seen][-1] - target[1]) < 0.01)
+    check("the raw packet fills aco..filaco from the latest message",
+          back["data"]["aco_x"][seen][-1] == 1.0 and back["data"]["dep"][seen][-1] == 0.5)
+    check("two legend rows open the export",
+          dst[0][dh.index("relative_x")] == rls.LEGEND["relative_x"][0]
+          and dst[1][dh.index("relative_x")] == "m")
+    check("the source log is untouched", digest(csv_path) == before)
+    # A log that logged the pinger itself: filtered from its own columns, no bag.
+    pinger_run = pb.load(out)
+    PB.attach(pinger_run)
+    mine = pinger_run["pinger"]
+    check("a pinger log is filtered from its own raw_pinger columns, no bag needed",
+          mine is not None and mine["bag"] is None
+          and np.hypot(mine["x"] - target[0], mine["y"] - target[1]).max() < 0.01,
+          pinger_run["pinger_note"])
+    pinger_run["pinger_show"] = True
+    fig = F.Figure()
+    drawn = F.plot_track(fig.add_subplot(111), pinger_run, F.default_texts("x", pinger_run),
+                         None, None, 800, show_headline=False)
+    labels = [line.get_label() for line in fig.axes[0].get_lines()]
+    check("its target track is called raw_pinger and the filtered pinger sits beside it",
+          "raw_pinger" in labels and "pinger" in labels and "target" not in labels, str(labels))
+    check("a no-pinger log still calls it target", "target" in [
+        line.get_label() for line in (lambda a: (F.plot_track(
+            a, run, F.default_texts("x", run), None, None, 800, show_headline=False), a.get_lines())[1])(
+                F.Figure().add_subplot(111))])
+    crop2 = pb.crop_run(pinger_run, pinger_run["t"][0], pinger_run["t"][-1])
+    crop2["pinger_show"] = True
+    folder2 = E.export(out, "pinger-of-pinger", crop2, F.default_texts("x"),
+                       root=os.path.join(workspace, "pexp2"), video_speed=20)
+    with open(out) as a, open(os.path.join(folder2, "pinger-of-pinger.csv")) as b:
+        check("a pinger log's CSV is exported verbatim (raw columns are field record)",
+              a.read().splitlines()[2:] == b.read().splitlines()[2:])
 
 
 def section_frames(logs, workspace):
@@ -355,6 +611,12 @@ def section_figures(logs, workspace):
     axes = figure.add_subplot(9, 1, 9)
     rows = pb.summary_rows(run, pb.compute_metrics(run))
     F.plot_table(axes, rows)
+    arrow = F.make_replay_artists(F.Figure().add_subplot(111))
+    F.set_replay_frame(arrow, {"t": np.array([0.0]), "lon": np.array([0.0]),
+                               "lat": np.array([0.0]), "tlon": np.array([np.nan]),
+                               "tlat": np.array([np.nan]), "psi": np.array([np.pi / 2])}, 0.0)
+    rot = arrow[3]._marker.get_transform().transform([[1.0, 0.0]])[0]
+    check("replay arrow points north for psi=pi/2", abs(rot[0]) < 1e-9 and rot[1] > 0)
     drawn = sum(1 for (_r, c), cell in axes.tables[0].get_celld().items()
                 if c % 2 == 0 and cell.get_text().get_text())
     check("every summary entry reaches the table", drawn == len(rows),
@@ -567,7 +829,7 @@ def section_gui(logs, workspace):
     check("a log opens", window.run is not None)
     check("the name entry seeds from the stem",
           window.name_edit.text() == window.run["stem"])
-    check("the summary table is filled", window.table.rowCount() == 21)
+    check("the summary table is filled", window.table.rowCount() == 22)
 
     from reviewer import replay_video as V
     from reviewer.app import ExportDialog, fmt_duration
@@ -662,6 +924,49 @@ def section_gui(logs, workspace):
           window.run["path"] == logs[0])
     check("the texts reset for the new log",
           window.texts["speed_title"] != "Vitesse")
+
+    # The pinger box: off for a log with no bag, on for one whose bag has it.
+    check("the Pinger box is enabled exactly when the bag gave a pinger, and always explains",
+          window.pinger_box.isEnabled() == (window.run["pinger"] is not None)
+          and bool(window.pinger_box.toolTip()), window.run["pinger_note"])
+    made = synthetic_pinger_log(logs, workspace)
+    if made[0] is not None:
+        window.open_log(made[0])
+        app.processEvents()
+        check("a bag with a pinger enables the box, unticked",
+              window.pinger_box.isEnabled() and not window.pinger_box.isChecked())
+        check("unticked: the crop carries no pinger", not window.crop["pinger_show"])
+        window.pinger_box.setChecked(True)
+        app.processEvents()
+        check("ticking it puts the pinger on the map",
+              window.crop["pinger_show"] and window.track._track_lines
+              and any(line.get_label() == "pinger" for line in window.track._track_lines))
+        window.play_button.setChecked(True)
+        for _ in range(3):
+            window._tick()
+        window._playhead = window.crop["t"][-1] * 0.8
+        window._show_playhead()
+        check("the replay moves the pinger marker",
+              len(window.track._replay) == 6
+              and len(window.track._replay[5].get_xdata()) == 1)
+        window.play_button.setChecked(False)
+        from reviewer import export as E2
+        from reviewer import poslog_bridge as pb
+        folder = E2.export(window.source_csv, "smoke pinger", window.crop,
+                           window.texts, root=os.path.join(workspace, "pexp"),
+                           video_speed=20)
+        import yaml as _yaml
+        with open(os.path.join(folder, "export.yaml")) as handle:
+            manifest = _yaml.safe_load(handle)
+        check("the export manifest records the pinger source and filter",
+              manifest.get("pinger", {}).get("csv_layout") == "pinger"
+              and "filter" in manifest["pinger"])
+        check("the exported CSV re-opens in the app as a pinger log",
+              pb.load(os.path.join(folder, "smoke pinger.csv"))["layout"] == "pinger")
+        window.pinger_box.setChecked(False)
+        window.open_log(logs[0])
+        app.processEvents()
+        check("a new log resets the box", not window.pinger_box.isChecked())
     window.close()
 
 

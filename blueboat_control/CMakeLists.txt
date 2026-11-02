@@ -60,6 +60,9 @@ install(PROGRAMS src/_custom_libraries/path_update_log.py
         DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS src/bag_replay.py
         DESTINATION lib/${PROJECT_NAME})
+# 2026-10-27: the replay's attitude/heave maths (ROS-free, imported by bag_replay).
+install(PROGRAMS src/_custom_libraries/replay_attitude.py
+        DESTINATION lib/${PROJECT_NAME})
 
 install(PROGRAMS src/robot_interaction/robot_interface.py
         DESTINATION lib/${PROJECT_NAME})

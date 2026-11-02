@@ -86,7 +86,8 @@ def write_replay_gif(path, run, texts, tile_provider=None, track_limits=None,
                            max(1.0, ax.bbox.width), show_headline=False)
     if not artists:
         return None
-    for line in (artists.get("robot_line"), artists.get("target_line")):
+    for line in (artists.get("robot_line"), artists.get("target_line"),
+                 artists.get("pinger_line")):
         if line is not None:
             line.set_alpha(0.25)          # as on screen while replaying
 

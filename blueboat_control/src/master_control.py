@@ -537,8 +537,8 @@ class Controller(Node):
 
         # -- PID ------------------------------------------------------------
         if not self.isSimulation:
-            self.outer_gains = {'x':   tuple(arr('outer_gains_x',   [3.0, 0.01, 0.0])),
-                                'psi': tuple(arr('outer_gains_psi', [3.0, 0.01, 0.0]))}
+            self.outer_gains = {'x':   tuple(arr('outer_gains_x',   [3.5, 0.01, 0.0])),
+                                'psi': tuple(arr('outer_gains_psi', [3.3, 0.01, 0.0]))}
             self.inner_gains = {'u': tuple(arr('inner_gains_u', [1.0, 0.0, 0.0])),
                                 'r': tuple(arr('inner_gains_r', [1.5, 0.0, 0.0]))}
             self.pid_lookahead = dbl('pid_lookahead', 2.5)
@@ -551,8 +551,8 @@ class Controller(Node):
             
         # -- kinematic Fossen-LoS -------------------------------------------
         self.los_lookahead   = dbl('los_lookahead', 2.5)
-        self.los_ku          = dbl('los_ku', 20.0)
-        self.los_kpsi        = dbl('los_kpsi', 10.0)
+        self.los_ku          = dbl('los_ku', 30.0)
+        self.los_kpsi        = dbl('los_kpsi', 4.5)
         self.los_kd          = dbl('los_kd', 1.0)
         self.los_speed_scale = dbl('los_speed_scale', 1.0 if not self.isSimulation else 2.0)
         # Zero-authored-speed hold. A stationary reference (station_keeping, a
@@ -623,7 +623,7 @@ class Controller(Node):
         # manual_hold_radius <= 0.0 disables the hold entirely and restores the
         # pre-2026-09-03 behaviour of the manual branch exactly.
         self.manual_hold_radius      = dbl('manual_hold_radius', 1.0)
-        self.manual_reacquire_radius = dbl('manual_reacquire_radius', 2.0)
+        self.manual_reacquire_radius = dbl('manual_reacquire_radius', 1.5)
         self.manual_hold_kx   = dbl('manual_hold_kx', 15.0 if self.isSimulation else 8.0)
         # Derived by default rather than declared independently, so retuning a
         # radius cannot silently break the handover the gains were chosen for.
@@ -1571,7 +1571,7 @@ class Controller(Node):
             if 0.0 < v_hold < floor:
                 v_hold = floor
 
-        return [v_hold + 0.295 * yaw_rate, v_hold - 0.295 * yaw_rate]
+        return [v_hold + 0.295 * yaw_rate/2, v_hold - 0.295 * yaw_rate/2]
 
     # ======================================================================
     #  5. CALLBACKS AND SMALL HELPERS

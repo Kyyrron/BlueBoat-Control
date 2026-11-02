@@ -35,13 +35,32 @@
 # point (robot_interface). Empty world: world = that frame. GPS-anchored built
 # world: world = ENU about the world's anchor; the offset is the median over
 # the bag's GPS fixes of (fix in anchor EN) - (boat in launch frame).
+# `placement:=origin` puts the launch frame on any built world's origin
+# instead (no GPS needed: a sensor study over a world the run never saw).
+#
+# Attitude (2026-10-27). Taken from the autopilot's own ATTITUDE messages in
+# the recorded /uas1/mavlink_source when present -- timed by their
+# time_boot_ms, not by the WiFi receive time -- else from the denser of
+# /mavros/imu/data and /mavros/local_position/odom; interpolated by a cubic
+# Hermite whose tangents are the recorded body rates (replay_attitude.py;
+# `attitude_interp:=slerp` restores the v1.1 slerp). Heave (`heave_gate`,
+# default on) replays the EKF's detrended z only when it looks like motion,
+# else pins the waterline.
+#
+# Simulated sonar (`publish_boat_pose:=true`, set by Replay_launch): the same
+# interpolated pose goes out at 100 Hz on /sim/sea_state/boat_pose, the
+# simulator's own Gazebo-pose topic, which an sss_sim_node started separately
+# renders every ping from -- so the replayed position and full 3D rotation
+# drive the simulated transducers exactly. Its z is on the simulator's datum
+# (`boat_pose_waterline_z`), whatever `waterline_z` the Gazebo model uses.
+# Real motion, simulated sensor: never a field result.
 #
 # Controls: /replay/command (String JSON) {"cmd": "pause"|"resume"|"rate",
 # "rate": x}; /replay/state (String JSON, latched, 2 Hz).
 #
 # FILE MAP
 #   1. BAG ACCESS        resolve_bag, open_reader, read_track
-#   2. TRACK MATHS       Track (frames, heave, interpolation)
+#   2. TRACK MATHS       Track (frames, heave, interpolation; replay_attitude)
 #   3. BAG CLOCK         BagClock (rate, pause)
 #   4. NODE              BagReplay: wiring, scheduler thread, pose timer,
 #                        routing, controls, state
@@ -68,18 +87,20 @@ import rosbag2_py
 
 from std_msgs.msg import String
 from nav_msgs.msg import Odometry, Path
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, TransformStamped
 from sensor_msgs.msg import NavSatFix
 from ros_gz_interfaces.msg import Entity
 from ros_gz_interfaces.srv import SetEntityPose
 
 import frame_math as fm
+import replay_attitude as ra
 
 T_MAVROS_ODOM = '/mavros/local_position/odom'
 T_MAVROS_IMU = '/mavros/imu/data'
 T_GPS = '/mavros/global_position/global'
 T_ODOM = '/blueboat/odom'
 T_MONITORING = '/monitoring_data'
+T_MAVLINK = '/uas1/mavlink_source'
 
 # Republished unchanged under their own names (beside every /mavros/* topic).
 LIVE_TOPICS = {'/thruster_input', '/controller_target',
@@ -154,10 +175,11 @@ def read_track(bag_dir):
 
     Times are the bag's RECEIVE times, in ns."""
     types = topic_types(bag_dir)
-    wanted = [t for t in (T_MAVROS_ODOM, T_MAVROS_IMU, T_GPS, T_ODOM) if t in types]
+    wanted = [t for t in (T_MAVROS_ODOM, T_MAVROS_IMU, T_GPS, T_ODOM, T_MAVLINK) if t in types]
     out = {'odom_t': [], 'odom_p': [], 'odom_q': [], 'odom_twist': [],
-           'imu_t': [], 'imu_q': [], 'bb_t': [], 'bb_p': [], 'bb_yaw': [],
-           'gps_t': [], 'gps_ll': []}
+           'imu_t': [], 'imu_q': [], 'imu_w': [], 'bb_t': [], 'bb_p': [], 'bb_yaw': [],
+           'gps_t': [], 'gps_ll': [],
+           'att_t': [], 'att_src': [], 'att': []}
     if not wanted:
         return out, types
     reader = open_reader(bag_dir, wanted)
@@ -175,8 +197,16 @@ def read_track(bag_dir):
             q = msg.orientation
             if q.x == 0.0 and q.y == 0.0 and q.z == 0.0 and q.w == 0.0:
                 continue
+            w = msg.angular_velocity
             out['imu_t'].append(t)
             out['imu_q'].append((q.x, q.y, q.z, q.w))
+            out['imu_w'].append((w.x, w.y, w.z))
+        elif topic == T_MAVLINK:
+            if msg.msgid != ra.ATTITUDE_MSGID:
+                continue
+            out['att_t'].append(t)
+            out['att_src'].append((msg.sysid, msg.compid))
+            out['att'].append(ra.decode_attitude(ra.mavlink_payload(msg.payload64, msg.len)))
         elif topic == T_ODOM:
             p = msg.pose.pose.position
             out['bb_t'].append(t)
@@ -229,14 +259,48 @@ def detrended(t_s, z, window_s=HEAVE_WINDOW_S, clip=HEAVE_CLIP_M):
     return np.clip(z - mean, -clip, clip)
 
 
-class Track:
-    """The recorded pose, in the replay world frame, as a function of bag time."""
+def mavlink_attitude(s):
+    """(bag times ns, quaternions ENU/FLU, body rates FLU) of the recorded
+    ATTITUDE messages of the main autopilot, timed by time_boot_ms; None when
+    the bag holds none."""
+    if not s.get('att_t'):
+        return None
+    srcs = s['att_src']
+    main = max(set(srcs), key=srcs.count)       # the autopilot, not a companion
+    sel = [i for i, src in enumerate(srcs) if src == main]
+    a = np.asarray([s['att'][i] for i in sel], float)
+    recv = np.asarray([s['att_t'][i] for i in sel], np.int64)
+    boot = a[:, 0].astype(np.int64)
+    t = ra.boot_to_bag_ns(recv, boot)
+    roll, pitch, yaw, p, q, r = ra.ned_frd_to_enu_flu(*a[:, 1:].T)
+    return t, ra.rpy_to_quat(roll, pitch, yaw), np.stack([p, q, r], axis=1)
 
-    def __init__(self, samples, anchor=None, heave=True, waterline_z=-0.15):
+
+class Track:
+    """The recorded pose, in the replay world frame, as a function of bag time.
+
+    attitude_source: 'auto' (the autopilot's ATTITUDE when recorded, else the
+    v1.1 choice: the denser of IMU and odom orientation), 'mavlink', 'imu' or
+    'odom'. attitude_interp: 'hermite' (replay_attitude.AttitudeTrack) or
+    'slerp' (v1.1). heave: 'auto' (replay_attitude.heave_gate), True (v1.1:
+    always) or False (pinned)."""
+
+    def __init__(self, samples, anchor=None, heave=True, waterline_z=-0.15,
+                 attitude_source='auto', attitude_interp='hermite',
+                 heave_max_std_m=ra.HEAVE_MAX_STD_M):
         s = samples
         self.source = None
         self.world_offset = np.zeros(2)
         self.launch_shift = np.zeros(3)
+        self.attitude_source = None
+        self.attitude = None                       # AttitudeTrack, hermite only
+        self.heave_mode = 'off'
+        self.heave_stats = None
+        if attitude_interp not in ('hermite', 'slerp'):
+            raise ValueError(f"attitude_interp must be hermite or slerp, not {attitude_interp!r}")
+        if attitude_source not in ('auto', 'mavlink', 'imu', 'odom'):
+            raise ValueError(f"attitude_source must be auto, mavlink, imu or odom, "
+                             f"not {attitude_source!r}")
         if s['odom_t']:
             self.source = 'mavros'
             self.t = np.asarray(s['odom_t'], np.int64)
@@ -255,25 +319,50 @@ class Track:
             else:
                 self.launch_shift = p[0].copy()
             self.xy = p[:, :2] - self.launch_shift[:2]
-            # Attitude: the denser of IMU and odom orientation (same ENU/FLU).
-            if len(s['imu_t']) > len(s['odom_t']):
+            # Attitude: the autopilot's ATTITUDE, else the denser of IMU and
+            # odom orientation (same ENU/FLU).
+            att = mavlink_attitude(s) if attitude_source in ('auto', 'mavlink') else None
+            rates = None
+            if att is not None:
+                self.attitude_source = 'mavlink'
+                self.q_t, self.q, rates = att
+            elif (attitude_source == 'imu' and s['imu_t']) or (
+                    attitude_source != 'odom' and len(s['imu_t']) > len(s['odom_t'])):
+                self.attitude_source = 'imu'
                 self.q_t = np.asarray(s['imu_t'], np.int64)
                 self.q = np.asarray(s['imu_q'], float)
+                rates = np.asarray(s['imu_w'], float) if s['imu_w'] else None
             else:
+                self.attitude_source = 'odom'
                 self.q_t, self.q = self.t, q
-            self.z = (detrended(self.t * 1e-9, p[:, 2]) if heave
-                      else np.zeros(len(self.t)))
+                rates = np.asarray([(w.angular.x, w.angular.y, w.angular.z)
+                                    for w in s['odom_twist']], float)
+            heave = ra.parse_heave(heave)
+            if heave == 'auto':
+                z, self.heave_stats = ra.heave_gate(self.t * 1e-9, p[:, 2],
+                                                    max_std=heave_max_std_m)
+                self.heave_mode = 'replayed' if z is not None else 'pinned_noisy'
+                self.z = z if z is not None else np.zeros(len(self.t))
+            elif heave:
+                self.heave_mode = 'replayed'
+                self.z = detrended(self.t * 1e-9, p[:, 2])
+            else:
+                self.z = np.zeros(len(self.t))
         elif s['bb_t']:
             self.source = 'blueboat_odom'          # yaw-only fallback
+            self.attitude_source = 'blueboat_odom'
             self.t = np.asarray(s['bb_t'], np.int64)
             self.xy = np.asarray(s['bb_p'], float)[:, :2]
             self.q_t = self.t
             self.q = np.asarray([_yaw_quat(y) for y in s['bb_yaw']], float)
+            rates = None
             self.z = np.zeros(len(self.t))
         else:
             raise ValueError('the bag has neither /mavros/local_position/odom '
                              'nor /blueboat/odom: nothing to replay a pose from')
         self.waterline_z = waterline_z
+        if attitude_interp == 'hermite':
+            self.attitude = ra.AttitudeTrack(self.q_t, self.q, rates)
 
         if anchor is not None and s['gps_t']:
             g_t = np.asarray(s['gps_t'], np.int64)
@@ -301,6 +390,9 @@ class Track:
         x = float(np.interp(t_ns, self.t, self.xy[:, 0]))
         y = float(np.interp(t_ns, self.t, self.xy[:, 1]))
         z = self.waterline_z + float(np.interp(t_ns, self.t, self.z))
+        if self.attitude is not None:
+            x, y = self.to_world(x, y)
+            return x, y, z, self.attitude.at(t_ns)
         i = int(np.searchsorted(self.q_t, t_ns))
         if i <= 0:
             q = self.q[0]
@@ -374,29 +466,70 @@ class BagReplay(Node):
         self.declare_parameter('anchor_lat', float('nan'))
         self.declare_parameter('anchor_lon', float('nan'))
         self.declare_parameter('heave', True)
+        # heave:=true replays the EKF z only when it passes replay_attitude.heave_gate
+        # (2026-10-27); heave_gate:=false replays it whatever it is (v1.1).
+        self.declare_parameter('heave_gate', True)
+        self.declare_parameter('heave_max_std_m', 0.10)
         self.declare_parameter('waterline_z', -0.15)
         self.declare_parameter('pose_rate_hz', 50.0)
         self.declare_parameter('start_paused', False)
+        self.declare_parameter('attitude_source', 'auto')     # auto | mavlink | imu | odom
+        self.declare_parameter('attitude_interp', 'hermite')  # hermite | slerp (v1.1)
+        # gps: the world's anchor places the run (v1.1); origin: the run's
+        # launch frame on the world origin, whatever the world's location.
+        self.declare_parameter('placement', 'gps')
+        # The simulated sonar's pose input (Replay_launch sonar:=true).
+        self.declare_parameter('publish_boat_pose', False)
+        self.declare_parameter('boat_pose_rate_hz', 100.0)
+        # blueboat_sss_sim's GAZEBO_BASE_REST_Z_M (sea/motion.py), the base_link
+        # rest height sss_sim_node takes as the still waterline -- cited, not
+        # imported (CM-3), so the transducers sit at its sensor_depth_m.
+        self.declare_parameter('boat_pose_waterline_z', -0.111)
 
         gp = self.get_parameter
         self.bag_dir = resolve_bag(gp('bag').get_parameter_value().string_value)
         self.world_name = gp('world_name').get_parameter_value().string_value
         self.model_name = gp('model_name').get_parameter_value().string_value
+        self.placement = gp('placement').get_parameter_value().string_value
+        if self.placement not in ('gps', 'origin'):
+            raise ValueError(f"placement must be gps or origin, not {self.placement!r}")
         alat = gp('anchor_lat').get_parameter_value().double_value
         alon = gp('anchor_lon').get_parameter_value().double_value
         anchor = None if (math.isnan(alat) or math.isnan(alon)) else (alat, alon)
+        if self.placement == 'origin':
+            anchor = None
 
         self.bag_start_ns, self.duration_ns = bag_span(self.bag_dir)
 
         samples, self.types = read_track(self.bag_dir)
-        self.track = Track(samples, anchor=anchor,
-                           heave=gp('heave').get_parameter_value().bool_value,
-                           waterline_z=gp('waterline_z').get_parameter_value().double_value)
+        heave = gp('heave').get_parameter_value().bool_value
+        if heave and gp('heave_gate').get_parameter_value().bool_value:
+            heave = 'auto'
+        self.track = Track(samples, anchor=anchor, heave=heave,
+                           waterline_z=gp('waterline_z').get_parameter_value().double_value,
+                           attitude_source=gp('attitude_source').get_parameter_value().string_value,
+                           attitude_interp=gp('attitude_interp').get_parameter_value().string_value,
+                           heave_max_std_m=gp('heave_max_std_m').get_parameter_value().double_value)
         self.frame = 'anchored' if anchor else 'empty'
+        att = self.track.attitude
+        self.attitude_rate_hz = (att.rate_hz if att is not None else
+                                 ra.AttitudeTrack(self.track.q_t, self.track.q).rate_hz)
+        hs = self.track.heave_stats
         self.get_logger().info(
             f"Replaying {self.bag_dir}: {self.duration_ns * 1e-9:.1f} s, pose from "
-            f"{self.track.source}, {self.frame} world '{self.world_name}', world offset "
-            f"({self.track.world_offset[0]:.2f}, {self.track.world_offset[1]:.2f}) m.")
+            f"{self.track.source}, {self.frame} world '{self.world_name}' ({self.placement} "
+            f"placement), world offset ({self.track.world_offset[0]:.2f}, "
+            f"{self.track.world_offset[1]:.2f}) m. Attitude from {self.track.attitude_source} "
+            f"at {self.attitude_rate_hz:.1f} Hz, "
+            f"{'Hermite on its rates' if att is not None else 'slerp'}; heave "
+            f"{self.track.heave_mode}"
+            + (f" (detrended EKF z std {hs['std_m']:.2f} m, "
+               f"{100 * hs['clipped_fraction']:.0f} % beyond the clip)" if hs else '') + '.')
+        if self.attitude_rate_hz < 10.0:
+            self.get_logger().warning(
+                f"The recorded attitude is {self.attitude_rate_hz:.1f} Hz: the roll and pitch "
+                "between samples are interpolated, not measured (a run recorded while the "
+                "sonar driver requests the autopilot's pose rates carries about 13 Hz).")
 
         # Routing table and lazy publishers.
         self.reliable = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE)
@@ -420,6 +553,16 @@ class BagReplay(Node):
         steady = Clock(clock_type=ClockType.STEADY_TIME)
         period = 1.0 / max(1.0, gp('pose_rate_hz').get_parameter_value().double_value)
         self.create_timer(period, self.pose_timer_callback, clock=steady)
+        self.boat_pose_pub = None
+        if gp('publish_boat_pose').get_parameter_value().bool_value:
+            # The simulator's per-step boat pose (sea_state_launch bridges it
+            # from Gazebo in a simulation); sss_sim_node renders each ping from it.
+            self.boat_pose_pub = self.create_publisher(
+                TransformStamped, '/sim/sea_state/boat_pose', 50)
+            hz = max(1.0, gp('boat_pose_rate_hz').get_parameter_value().double_value)
+            self.boat_pose_dz = (gp('boat_pose_waterline_z').get_parameter_value().double_value
+                                 - self.track.waterline_z)
+            self.create_timer(1.0 / hz, self.boat_pose_timer_callback, clock=steady)
         self.create_timer(0.5, self.publish_state, clock=steady)
         self.create_timer(5.0, self.publish_path, clock=steady)
         self.create_timer(0.05, self.hold_timer_callback, clock=steady)
@@ -559,6 +702,21 @@ class BagReplay(Node):
         self.pose_future = self.pose_client.call_async(req)
         self.pose_calls += 1
 
+    def boat_pose_timer_callback(self):
+        """The pose the simulated sonar renders from: the same interpolated
+        track as the Gazebo teleport, exact at each instant, sim-time stamped
+        (sss_sim_node times its pings on the sim clock)."""
+        t = min(self.clock.now_ns(), int(self.duration_ns)) + self.bag_start_ns
+        x, y, z, q = self.track.pose_at(t)
+        msg = TransformStamped()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = 'world'
+        msg.child_frame_id = self.model_name
+        tr, rot = msg.transform.translation, msg.transform.rotation
+        tr.x, tr.y, tr.z = float(x), float(y), float(z + self.boat_pose_dz)
+        rot.x, rot.y, rot.z, rot.w = q
+        self.boat_pose_pub.publish(msg)
+
     def hold_timer_callback(self):
         """While paused or finished, keep odom and GPS alive (fresh stamps,
         zero twist) so displays and staleness checks don't drop the boat."""
@@ -654,6 +812,13 @@ class BagReplay(Node):
             'world_offset': [round(float(v), 3) for v in self.track.world_offset],
             'pose_source': self.track.source,
             'gazebo': self.pose_client.service_is_ready(),
+            # Additive (2026-10-27).
+            'placement': self.placement,
+            'attitude_source': self.track.attitude_source,
+            'attitude_rate_hz': round(self.attitude_rate_hz, 1),
+            'attitude_interp': 'hermite' if self.track.attitude is not None else 'slerp',
+            'heave': self.track.heave_mode,
+            'boat_pose': self.boat_pose_pub is not None,
         }
         msg = String()
         msg.data = json.dumps(state)

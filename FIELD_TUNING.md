@@ -73,8 +73,8 @@ worker thread — about a second when cached, about a minute after any MPC knob 
 
 | Parameter | Default real / sim | Effect |
 |---|---|---|
-| `outer_gains_x` `[kp,ki,kd]` | `[3.0,0.01,0]` / `[6.0,0.01,0]` | Along-track error → surge speed correction on top of the path feedforward. `ki` winds up: keep it tiny. |
-| `outer_gains_psi` | `[3.0,0.01,0]` / `[4.0,0.01,0]` | Heading error → yaw-rate reference. ↑ = snappier turn onto the path, weaving if too high. |
+| `outer_gains_x` `[kp,ki,kd]` | `[3.5,0.01,0]` / `[6.0,0.01,0]` | Along-track error → surge speed correction on top of the path feedforward. `ki` winds up: keep it tiny. |
+| `outer_gains_psi` | `[3.3,0.01,0]` / `[4.0,0.01,0]` | Heading error → yaw-rate reference. ↑ = snappier turn onto the path, weaving if too high. |
 | `inner_gains_u` | `[1.0,0,0]` / `[2.0,0,0]` | Surge-speed error → force (N per m/s). |
 | `inner_gains_r` | `[1.5,0,0]` / `[2.5,0,0]` | Yaw-rate error → moment. Too high = thruster chatter. |
 | `pid_lookahead` (Δ) | 2.5 m | `psi_d = gamma_p + atan2(e_y, Δ)`. Small = aggressive cut back to the line, large = damped. |
@@ -101,8 +101,8 @@ Surge = authored speed feedforward (no along-track integrator); yaw = P-D on hea
 | Parameter | Default real / sim | Effect |
 |---|---|---|
 | `los_lookahead` (Δ) | 2.5 m | `psi_d = gamma_p + atan2(−e_y, Δ)`; small = harder cut onto the line. |
-| `los_ku` | 20.0 | Surge gain, **N per m/s** of speed error: 0.5 m/s short → 10 N. |
-| `los_kpsi` | 10.0 | Yaw moment per rad of heading error: 0.2 rad → 2 N·m. |
+| `los_ku` | 30.0 (was 20.0 until 2026-10-27) | Surge gain, **N per m/s** of speed error: 0.5 m/s short → 10 N. |
+| `los_kpsi` | 4.5 (was 10.0 until 2026-10-27) | Yaw moment per rad of heading error: 0.2 rad → 2 N·m. |
 | `los_kd` | 1.0 | Yaw-rate damping. **Raise this first** if `los_kpsi` makes the bow hunt. |
 | `los_speed_scale` | 1.0 / **2.0** | Scales the commanded speed, not the target's motion — use `path_speed_scale` to slow a mission. |
 | `hold_speed` | 0.05 m/s | Below it the law steers at the reference **point** and adds hold surge. |
@@ -139,7 +139,7 @@ Active whenever `/blueboat/manual_target ≠ [0,0]`, in **any** `controller_type
 | Parameter | Default real / sim | Effect |
 |---|---|---|
 | `point_k_v` | 0.15 / 2.0 | Surge in `v = 5·ln(k_v·d + 1)`. |
-| `point_k_psi` | 100.0 / 60.0 | Yaw rate per rad of bearing; the differential is `±0.295·yaw_rate`. |
+| `point_k_psi` | 100.0 / 60.0 | Yaw rate per rad of bearing; the differential is `±0.295·yaw_rate/2` (halved 2026-10-27, see the note under keep-location). |
 | `min_thrust` | 2.0 N | Breakaway floor, faded over `hold_radius`, killed by `cos(bearing)`. |
 
 **Keep-location (on station)**
@@ -155,10 +155,21 @@ Active whenever `/blueboat/manual_target ≠ [0,0]`, in **any** `controller_type
 | Parameter | Default real / sim | Effect |
 |---|---|---|
 | `manual_hold_radius` | 1.0 m | Arrive inside → hold; also the gap origin. **`<= 0` disables the hold** (pursuit-only, as before). |
-| `manual_reacquire_radius` | 2.0 m | Pushed beyond → resume pursuit. The gap to the above is the anti-toggle hysteresis. |
+| `manual_reacquire_radius` | 1.5 m (was 2.0 until 2026-10-27) | Pushed beyond → resume pursuit. The gap to the above is the anti-toggle hysteresis. |
 | `manual_hold_kx` | 8.0 / 15.0 | Hold surge in **Newtons per metre** of gap (≠ `los_hold_kx`, which is m/s). |
-| `manual_hold_umax` | derived `kx·(reacq − hold)` = 8 / 15 N | Cap. Leave it derived, so retuning a radius cannot break the handover. |
+| `manual_hold_umax` | derived `kx·(reacq − hold)` = 4 / 7.5 N (was 8 / 15 with the 2.0 m radius) | Cap. Leave it derived, so retuning a radius cannot break the handover. |
 | `manual_brake_time` | 1.0 s | Reverse pulse on each **fresh** arrival; a repeated target does not re-arm it. |
+
+> **Yaw differential halved (2026-10-27).** `solve_LoS` — the manual-target **and** pinger laws —
+> now returns `[v ± 0.295·yaw_rate/2]` instead of `[v ± 0.295·yaw_rate]`, to stop the bow hunting.
+> Every yaw gain of these two laws (`point_k_psi`, the bearing term of the hold/pursuit law) now
+> acts at half strength: to get the old turning authority back, double them. Path following
+> (PID / LoS / MPC) goes through the allocator and is unaffected. This is **real and simulation
+> alike** (no split).
+
+> **2026-10-27 retune (real boat only, simulation defaults unchanged):** PID `outer_gains_x` kp
+> 3.0 → 3.5, `outer_gains_psi` kp 3.0 → 3.3; LoS `los_ku` 20 → 30, `los_kpsi` 10 → 4.5;
+> `manual_reacquire_radius` 2.0 → 1.5 m. **No MPC parameter was touched.**
 
 **Pinger branch** (`use_pinger:=True`, `LoS`) uses the same pursuit law but no hold:
 

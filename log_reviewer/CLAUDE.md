@@ -15,7 +15,7 @@ Nothing in it imports `rclpy`, so it needs no sourced workspace.
 
 ```bash
 python3 log_reviewer/run.py [<csv>] [--no-fetch-tiles]
-QT_QPA_PLATFORM=offscreen python3 log_reviewer/smoke_test.py     # the gate, 121 checks
+QT_QPA_PLATFORM=offscreen python3 log_reviewer/smoke_test.py     # the gate, 158 checks
 ```
 
 Runs unchanged under `/usr/bin/python3` (matplotlib 3.6.3, numpy 1.26) and under
@@ -57,7 +57,7 @@ layout does *not* reach the app. That is deliberate — four things differ:
 3. **there is no actuation-state strip** (the app was asked not to have one). The
    `actuation_state` column is still read: "Thrust live (state 1)" stays in the summary, so
    dropping the plot does not drop the fact;
-4. the summary lays **21 entries into 7 rows × 3 pairs**. `poslog_report._plot_table` uses
+4. the summary lays **22 entries into 8 rows × 3 pairs** (the "Controller" row was added 2026-10-30; `plot_table` grows its rows to fit). `poslog_report._plot_table` uses
    `per_col = 6` against 3 columns — 18 slots for 19 entries — so **its last row, the world
    origin, is silently dropped from every archived PNG**. Do not copy that back. The gate
    counts rendered cells against entries.
@@ -108,6 +108,7 @@ Mercator-on-equirectangular error stays within one tile — well under a pixel a
 | `reviewer/poslog_bridge.py` | the reuse above, `crop_run`, `summary_rows`, `wall_clock` |
 | `reviewer/figures.py` | the four painters, the table, `build_report_figure`, `DEFAULT_TEXTS` |
 | `reviewer/track_view.py` | the interactive track: zoom, pan, blitted replay, hover |
+| `reviewer/pinger_bag.py` | the pinger recovered from the run's ros2 bag: MCAP + CDR reader, time alignment, the filter, the export columns (§9.7) |
 | `reviewer/replay_video.py` | the export's ×5–×20 replay GIF and its timing (§9.5) |
 | `reviewer/cursor.py` | `Overlay` (per-canvas blitting) and `LinkedCursor` (the hover dot) |
 | `reviewer/timeline.py` | the two-handled range slider (Qt ships none) |
@@ -169,6 +170,14 @@ Mercator-on-equirectangular error stays within one tile — well under a pixel a
   three libraries and four files; whatever one of them raises, the operator is looking at the
   window, not at the terminal, and the app has to survive for them to retry.
 
+* **The controller comes from the `.npy` filename, never its contents.** Neither poslog nor
+  sidecar records it; `poslog_bridge.find_controller` lists `<root>/{PID,LoS,MPC}_data/` for
+  `<run-start stamp>-<ctrl>_<real|simulation>_data.npy` (same stamp as the poslog) and shows
+  "unknown" when there is no match (older or renamed logs). A sidecar `controller:` key wins.
+* **The replay robot is an arrow** (`figures.arrow_marker`), rotated by the row's
+  `relative_psi` (absolute ENU yaw). The track's aspect is metric in both frames, so the
+  yaw is the on-screen angle; it holds the last valid yaw across NaN rows.
+
 ## 9.5 What an export contains
 
 `~/ros2_ws/data/Processed_Robot_data/<name>/` — `<name>` from the toolbar entry, sanitised
@@ -176,7 +185,7 @@ only for path separators:
 
 | File | Content |
 |---|---|
-| `<name>.csv` | the two legend rows (description, unit), the source header, then the rows inside the timeline, every column, verbatim. The legend is copied from a source written since 2026-10-08, built from `robot_log_schema` for an older one (`export.yaml` `source.legend`: `source` / `schema`) |
+| `<name>.csv` | the two legend rows (description, unit), the source header, then the rows inside the timeline, every column, verbatim — or, with **Pinger** ticked, the with-pinger layout (§9.7). The legend is copied from a source written since 2026-10-08, built from `robot_log_schema` for an older one (`export.yaml` `source.legend`: `source` / `schema`) |
 | `<name>.png` | the report **as framed in the app**: edited text, current zoom, current tile setting, no actuation strip |
 | `<name>-origin.yaml` | a **copy** of the run's origin sidecar, so the world-frame columns stay georeferenceable |
 | `<name>.gif` | the track panel **as framed in the app** (zoom, tiles) replayed over the whole selection at the speed chosen in the export dialog (**×5–×20**, default ×10), ~576×504 px |
@@ -249,3 +258,55 @@ Three consequences worth knowing:
 through the current `poslog_report` is **byte-identical** to the same log rendered through the
 committed one. The gate's `[1b]` section carries the simulated-frame checks, including that
 `poslog_report` and the app agree on the frame for the same file.
+
+## 9.7 The pinger from the run's ros2 bag
+
+A path-mode run logs the no-pinger CSV layout, so its poslog has no pinger columns, but the
+run's bag (`<date>-<note>-bag/`, filed beside the poslog) still holds `/uw_gps_data` and
+`/blueboat/pinger_coordinates` (every run session tracks the pinger whatever the follow
+mode). `reviewer/pinger_bag.py` reads them; the toolbar's **Pinger** box (unticked on open,
+enabled only when the bag gave a detection, tooltip says why otherwise) draws them on the
+track, in the replay and in the export.
+
+* **No new dependency.** No `mcap` / `rosbag2_py` here: the reader parses MCAP directly (run
+  bags have uncompressed chunks; zstd/lz4 only if the module happens to be installed) and the
+  Float32MultiArray CDR by hand. A bag is opened with `os.listdir`, not a `*.mcap` glob — a
+  bag filed from staging keeps a hidden `.run-bag-…_0.mcap` name. Reading a run takes ~0.1 s.
+* **Timestamps.** Bag **receive time** (MCAP `log_time`) only — the date fields inside
+  `/uw_gps_data` are the Water Linked unit's own clock (9 s off on 2026-10-28) and mavros
+  stamps read 0. The poslog's naive wall clock is read in *this machine's* zone and tied to the
+  bag's first message; a gap of a whole multiple of 30 min is a time-zone difference and is
+  removed, any other gap > 120 s means the bag is not this run's and nothing is drawn. Samples
+  are interpolated against the pose at their own time, never matched to the nearest 3 Hz row.
+* **Position.** `/blueboat/pinger_coordinates` (body frame, all-zero = not yet detected)
+  rotated into the local-ENU world frame with the logged pose by
+  `custom_functions.transform_body_to_world`'s formula, i.e. what `robot_interface` writes as
+  `corrected_pinger`. Not the `/uw_gps_data` lat/lon: float32 steps of ~1.4 m east-west here.
+* **Filter** (`pinger_bag.FILTER`, recorded in `export.yaml`): drop samples taken while the boat
+  turns faster than 0.35 rad/s (a yaw error is multiplied by the range), with a pose gap > 1.5 s,
+  or beyond 30 m; drop samples > 3 m from the median of ±10 s of trusted samples (the plateaus of
+  a bad fix that dead reckoning carries unchanged); then a 1 m/s speed gate (re-anchoring after
+  3 s) and a ±4 s median. On the 2026-10-28 run this keeps 122 of 431 detections. It bounds the
+  jumps; it does not make the USBL accurate — the 2026-10-28 12:52 pool run is still scattered
+  over ~20 m, which is the data, not the filter.
+* **Held, not extrapolated.** A shown estimate holds for `HOLD_S` (8 s) past its last accepted
+  sample, then disappears.
+* **Export shape.** With Pinger ticked the CSV is a **with-pinger log**: `COLUMNS_PINGER` (the
+  target block = the pinger, `aco..filaco` = the latest raw `/uw_gps_data` packet, 0.0 before the
+  first detection exactly as the writer does), followed by every source column the pinger
+  layout lacks — the path `target_x/y` and `target_latitude/longitude` — so nothing is dropped.
+  Shared columns are still copied verbatim; the legend is rebuilt from the schema. The app
+  therefore re-opens it with no second code path (and as a pinger log, the pinger is its target
+  track). `export.yaml` gains a `pinger:` block (bag, topics, counts, filter, zone shift).
+* **A log that logged the pinger itself (with-pinger layout)** needs no bag: its own
+  `corrected_pinger_x/y` (already world-frame, stamped with the pose of the same row) go through the
+  same filter (`pinger_bag.estimate_from_log`; the range gate uses the boat-to-pinger distance). Its
+  track line is labelled **raw_pinger** in place of "target", the filtered pinger is the "pinger"
+  diamonds beside it, and the box opens ticked. Its CSV is exported verbatim (the raw columns are
+  field record); only the PNG and GIF gain the filtered pinger (`export.yaml` `pinger.columns_added:
+  false`).
+* **Where it does not apply:** a no-pinger log with no bag beside it (an exported or renamed CSV),
+  an unreadable or unaligned bag, or a pinger log that never detected the pinger.
+* **The gate's corpus assumption.** Several sections treat the *last* log as a pre-2026-10-08
+  one (header on line 1) and build the new format from it; `find_logs` now guarantees that
+  instead of assuming the newest log is old.

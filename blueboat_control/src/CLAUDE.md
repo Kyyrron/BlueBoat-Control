@@ -202,12 +202,12 @@ launch argument rather than an edit and a rebuild. Values are read once, at cons
 | Control loop | `control_dt` (0.05) |
 | Path service health | `path_request_timeout` (1.0 s — re-issue a request whose answer never came; without it one lost response wedged the node for the whole run), `path_stale_timeout` (1.0 s — beyond this the governor stops advancing `tau` against the held window). `path_generation` adds `allow_duplicate_server` (False) and `server_discovery_wait` (2.0 s) |
 | Governor | `path_speed_scale`, `gov_Lmin`, `gov_Lmax`, `gov_Emin`, `gov_Emax` |
-| LoS guidance | `los_lookahead` (2.5), `los_ku` (**20.0**), `los_kpsi` (10.0), `los_kd` (1.0), `los_speed_scale` (1.0 real / 2.0 sim) |
+| LoS guidance | `los_lookahead` (2.5), `los_ku` (**30.0**, 20.0 before 2026-10-27), `los_kpsi` (4.5, 10.0 before), `los_kd` (1.0), `los_speed_scale` (1.0 real / 2.0 sim) |
 | Station-keeping hold | `hold_speed` (0.05, the gate) and `hold_radius` (0.5), both shared by `PID` and `LoS`; `los_hold_kx` (1.0) and `los_hold_umax` (0.8), the LoS surge law only |
-| PID | **Split simulation/real.** `pid_lookahead` (2.5 both); `outer_gains_x` (`[3.0, 0.01, 0]` real / `[6.0, 0.01, 0]` sim), `outer_gains_psi` (`[3.0, 0.01, 0]` / `[4.0, 0.01, 0]`), `inner_gains_u` (`[1.0, 0, 0]` / `[2.0, 0, 0]`), `inner_gains_r` (`[1.5, 0, 0]` / `[2.5, 0, 0]`) |
+| PID | **Split simulation/real.** `pid_lookahead` (2.5 both); `outer_gains_x` (`[3.5, 0.01, 0]` real / `[6.0, 0.01, 0]` sim), `outer_gains_psi` (`[3.3, 0.01, 0]` / `[4.0, 0.01, 0]`; real kp were 3.0 / 3.0 before 2026-10-27), `inner_gains_u` (`[1.0, 0, 0]` / `[2.0, 0, 0]`), `inner_gains_r` (`[1.5, 0, 0]` / `[2.5, 0, 0]`) |
 | MPC | **Split simulation/real, like the PID and point rows** — `mpc_horizon` (30 sim / 15 real), `mpc_time` (6.0 / 2.5), `mpc_R_diag` (0.10 / 0.015), `mpc_Q_diag` (50,50,30,1,1,1 both). The plant **model** is split too — `self.mpc_model`, not a declared parameter — with the simulation column fitted to `hydrodynamics.xacro` (added mass = the xacro values, damping = secant linearisations of its quadratic drag). Plus `mpc_qp_iter_max` (**0**, meaning "derive as `max(50, 4·nu·N)`" = 240 at N = 30, 120 at N = 15) — the qpOASES **working-set budget**, and not optional: `FULL_CONDENSING_QPOASES` is a dense active-set solver, so `nv = mpc_horizon · 2`, and acados' own default of 50 sits *below* the 60 variables of the simulation horizon. That made a saturating solve fail by construction, which is finding **C6** |
 | Point following | `point_k_v` / `point_k_psi` (2.0 / 60.0 in simulation, 0.15 / 100.0 on the real boat), `safety_distance` (−1.0, which disables the arrival check — **pinger branch only** since the manual branch got its own hold) |
-| Manual keep-location | `manual_hold_radius` (1.0 m, `<= 0` disables the whole hold), `manual_reacquire_radius` (2.0 m), `manual_hold_kx` (15.0 simulation / 8.0 real, **Newtons per metre**, not the m/s that `los_hold_kx` is), `manual_hold_umax` (defaults to `kx × (reacquire − hold)`, so retuning a radius cannot silently break the handover), `manual_brake_time` (1.0 s) |
+| Manual keep-location | `manual_hold_radius` (1.0 m, `<= 0` disables the whole hold), `manual_reacquire_radius` (1.5 m, 2.0 before 2026-10-27), `manual_hold_kx` (15.0 simulation / 8.0 real, **Newtons per metre**, not the m/s that `los_hold_kx` is), `manual_hold_umax` (defaults to `kx × (reacquire − hold)`, so retuning a radius cannot silently break the handover), `manual_brake_time` (1.0 s) |
 | Thrust | `thrust_limit` (20.0 N) — feeds the allocator clamp, the MPC input bounds **and, since 2026-08-31, `publish_thrust`'s own uniform saturation**. `robot_interface` and `simulation_interface` each declare a parameter of the same name and default (§5) |
 | Arrow control | `arrow_timeout` (0.5 s) — dead-man on `/blueboat/arrow_thrust`: an older command is not applied (zero thrust, arrow control stays engaged). Session plumbing adds `session_mode` (False), not a tuning knob |
 | Dead zone | `min_thrust` (2.0 N) — the propeller-breakaway floor on `solve_LoS`'s surge term **and on the manual keep-location surge**. `0.0` disables both and restores the pre-2026-08-31 law exactly (§5) |
@@ -227,7 +227,7 @@ so the reference window and the solver's horizon cannot disagree.
   (starboard) and `thruster2` at `y = +0.295` (port), and the yaw moment of a body-x force at
   `y` is `-y*Fx`, reproducing `+0.295 / -0.295` exactly; `ROV.read_model` sorts thruster
   joints alphabetically, so `forces[0]` drives `thruster1`; `simulation_interface` unpacks
-  `r, l = thr_input`; `solve_LoS` builds `[v + 0.295*yaw_rate, v - 0.295*yaw_rate]`;
+  `r, l = thr_input`; `solve_LoS` builds `[v + 0.295*yaw_rate/2, v - 0.295*yaw_rate/2]` (halved 2026-10-27; was the full yaw_rate);
   `manualMove` treats `input[0]` as right; and the CLI's `move <left> <right> <s>` is stored
   as `[right, left]`.
 - **Saturation is uniform everywhere, and it is one number.** PWM still clamps to
@@ -289,7 +289,7 @@ so the reference window and the solver's horizon cannot disagree.
     inbound. With it the command is continuous in `d` (verified: the largest sample-to-sample
     jump scales linearly with sample spacing, slope `min_thrust/hold_radius` = 4 N/m).
 
-  **What is provably not touched.** The `± 0.295*yaw_rate` differential — and therefore the
+  **What is provably not touched.** The `± 0.295*yaw_rate` differential (as of the floor's change, 2026-09; halved on 2026-10-27 by the owner) — and therefore the
   yaw moment, which way the boat turns and how hard — is bit-identical across 865 200
   (range, bearing) grid points, and the floor never *lowers* the surge at any of them. The
   modified region is **0.61–3.27 m at |bearing| ≤ 69.5°, 5.7 % of the `d ≤ 12 m` plane**;

@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QDialog,
 
 from . import export as E
 from . import figures as F
+from . import pinger_bag as PB
 from . import poslog_bridge as pb
 from . import replay_video as V
 from .cursor import LinkedCursor, Overlay
@@ -382,6 +383,13 @@ class ReviewerWindow(QMainWindow):
         self.satellite_box.toggled.connect(self.track.set_tiles_enabled)
         row.addWidget(self.satellite_box)
 
+        self.pinger_box = QCheckBox("Pinger")
+        self.pinger_box.setChecked(False)
+        self.pinger_box.setEnabled(False)
+        self.pinger_box.setToolTip("Open a log first")
+        self.pinger_box.toggled.connect(lambda _on: self._rebuild())
+        row.addWidget(self.pinger_box)
+
         fit = QPushButton("Fit")
         fit.setToolTip("Frame the whole selection (double-click the track does this too)")
         fit.setFixedWidth(56)
@@ -437,6 +445,22 @@ class ReviewerWindow(QMainWindow):
                        self.start_spin, self.end_spin, self.play_button,
                        self.scrub, self.satellite_box):
             widget.setEnabled(enabled)
+        if not enabled:
+            self.pinger_box.setEnabled(False)
+
+    def _sync_pinger_box(self):
+        """The pinger comes from the run's ros2 bag, so the box is enabled only
+        when the bag was found, readable, on this run's clock and holds a
+        detection - and says which of those failed otherwise."""
+        found = self.run is not None and self.run.get("pinger") is not None
+        self.pinger_box.blockSignals(True)
+        # A pinger log's whole point is the pinger, so it opens ticked; for any
+        # other log the pinger is an addition, and (it changes the export) opt-in.
+        self.pinger_box.setChecked(bool(found and self.run["layout"] == "pinger"))
+        self.pinger_box.blockSignals(False)
+        self.pinger_box.setEnabled(found)
+        self.pinger_box.setToolTip(
+            (self.run or {}).get("pinger_note") or "Open a log first")
 
     # -- opening ----------------------------------------------------------
 
@@ -484,8 +508,14 @@ class ReviewerWindow(QMainWindow):
         self._sync_spins(t0, t1)
 
         self._set_enabled(True)
+        PB.attach(run)
+        self._sync_pinger_box()
         self.setWindowTitle("BlueBoat log reviewer — %s" % run["stem"])
         self._rebuild(fit=True)
+        if run.get("pinger") is not None and run["layout"] != "pinger":
+            self.statusBar().showMessage(
+                "A pinger was recorded in this run's bag - tick Pinger to show it "
+                "(and to put it in the export)")
 
     # -- selection --------------------------------------------------------
 
@@ -538,6 +568,8 @@ class ReviewerWindow(QMainWindow):
             return
         low, high = self.slider.values()
         self.crop = pb.crop_run(self.run, low, high)
+        self.crop["pinger_show"] = bool(self.pinger_box.isChecked()
+                                        and self.run.get("pinger") is not None)
         self.metrics = pb.compute_metrics(self.crop)
 
         distance, have = pb.distance_series(self.crop)

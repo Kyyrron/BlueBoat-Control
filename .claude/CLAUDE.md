@@ -315,7 +315,8 @@ against one run's bag (§6) — a playback of a real run, not a simulation (supe
 
 | Topic | Type | Direction | Contract |
 |---|---|---|---|
-| `/replay/state` | `std_msgs/String` (JSON) | out, TRANSIENT_LOCAL depth 1, 2 Hz | `{bag, t, duration, rate, paused, finished, frame: empty\|anchored, world, world_offset, pose_source, gazebo}` |
+| `/replay/state` | `std_msgs/String` (JSON) | out, TRANSIENT_LOCAL depth 1, 2 Hz | `{bag, t, duration, rate, paused, finished, frame: empty\|anchored, world, world_offset, pose_source, gazebo}` + additive (2026-10-27) `{placement, attitude_source, attitude_rate_hz, attitude_interp, heave: replayed\|pinned_noisy\|off, boat_pose}` |
+| `/sim/sea_state/boat_pose` | `geometry_msgs/TransformStamped` | out, only with `publish_boat_pose` (set by every `Replay_launch.py`), 100 Hz, reliable depth 50; z on the simulator's datum `boat_pose_waterline_z` (−0.111) | the replayed pose (frame `world`, child `blueboat`, sim-time stamp) — the simulator's own Gazebo-pose topic, which `sss_sim_node` renders every ping from; no other publisher runs in a replay |
 | `/replay/command` | `std_msgs/String` (JSON) | in | `{"cmd":"pause"\|"resume"}`, `{"cmd":"rate","rate":x}` |
 | `/blueboat/odom` | `nav_msgs/Odometry` | out | rebuilt from the recorded `/mavros/local_position/odom`: **full** attitude (the recorded `/blueboat/odom` is yaw-only), body twist, world frame |
 | `/monitoring_data`, `/set_path` | as live | out | target columns shifted into the world frame; the path from the run's `-path.yaml` |
@@ -331,6 +332,35 @@ the shared equirectangular formula). The mavros→launch-frame shift is measured
 10 s, clipped ±0.5 m (`heave:=false` pins the waterline). Measured on a synthetic 60 s bag:
 pose error 1 mm, attitude 0.01°, and under the simulator's `very_strong` current + `rough`
 waves 0.8 mm of drift over 2 s paused.
+
+**Replay attitude, heave gate and simulated sonar (2026-10-27, ordered by the user; additive
+parameters, ROS-free maths in `_custom_libraries/replay_attitude.py`).** Evidence: run
+`2026_10_27-16_10_14-HarbourMPC` — roll std 6°, ±20° at 0.6–2 Hz, recorded at **4.2 Hz**.
+- *Attitude source* (`attitude_source`, default `auto`): the autopilot's ATTITUDE (#30)
+  decoded from the recorded `/uas1/mavlink_source` and timed by its `time_boot_ms` (the
+  lower envelope of receive − boot; WiFi delays of up to 119 ms removed), NED/FRD → ENU/FLU.
+  It matches `/mavros/imu/data` to < 0.1°. Else the v1.1 choice.
+- *Interpolation* (`attitude_interp`, default `hermite`): a cubic Hermite on the Euler
+  angles, with the recorded body rates as tangents, and linear across gaps > 0.6 s. On that
+  bag's 25 Hz bursts decimated to 4 Hz it is 0.60° RMS / 1.5° max, against slerp's
+  1.30 / 3.2. `slerp` is v1.1, bit for bit.
+- *Heave gate* (`heave_gate`, default on with `heave`): the detrended EKF z is replayed only
+  when its std is ≤ `heave_max_std_m` (0.10) and ≤ 5 % clips. On that bag it is altitude
+  noise (std 1.73 m, 37 % clipped), so the waterline is pinned.
+- *Placement* (`placement:=origin`): the launch frame goes on the world's origin, so no GPS
+  is needed.
+- *Sonar*: never started by the replay (owner, 2026-10-27). Every `Replay_launch.py`
+  sets `publish_boat_pose`. The operator starts the simulator's sonar over the same world,
+  `ros2 launch blueboat_sss_sim sss_sim_launch.py world_dir:=<world> with_mavros_shim:=false auto_ping:=false`: the shim must be off, because the replay already publishes the recorded
+  `/mavros/*`. The GCS (Sonar: *Simulation*) then enables pinging at START. The pose's z
+  is on `boat_pose_waterline_z` (−0.111, the simulator's `GAZEBO_BASE_REST_Z_M`, cited),
+  and Gazebo's `waterline_z` is unchanged.
+- Measured end to end on that bag (`flat_5p0m`, `placement:=origin`):
+  - all 1201 pings used `pose_100hz`, age ≤ 20 ms;
+  - the replayed roll correlates with the bag's ATTITUDE at 0.9987 (0.9993 at `rate:=2`);
+  - the two transducer heights are antiphase, = 0.285·sin(roll), corr 1.000.
+- Tests: `python3 test/test_bag_replay_track.py` (18 ROS-free checks; 29 with ROS and the
+  bag, incl. the v1.1 bit-for-bit comparison).
 
 ### 2.4 MAVROS boundary
 
@@ -466,10 +496,12 @@ Launch arguments and defaults: the launch files. What they do not make obvious:
 - **`record_bag`** (default `True`, acts only with `session_mode`; v1.1): one ros2bag per run
   (§6). `robot_interface` also receives `trajectory`, to snapshot a `from_yaml` run's path.
 - **`Replay_launch.py`** (v1.1): `bag` (a run folder or its bag), `world_dir` (empty = stock
-  `ocean` world), `rate`, `heave`, `start_paused`, `gui`. Gazebo + clock bridge + the
+  `ocean` world), `rate`, `heave`, `heave_gate`, `start_paused`, `gui`, and since 2026-10-27
+  `placement` (`gps`/`origin`; §2.3). Gazebo + clock bridge + the
   `/world/<w>/set_pose` service bridge + the boat with `replay:=true` (§8) + `bag_replay` —
   no controller, no `simulation_interface`, no sea state, no `/current` bridge. A built world
-  is only read (`world.sdf`, `metadata.yaml` `geo_anchor`); no `blueboat_sss_sim` import.
+  is only read (`world.sdf`, `metadata.yaml` `geo_anchor`); no `blueboat_sss_sim` import
+  and no sonar (the operator starts one; `bag_replay` feeds it the pose, §2.3).
 - **`Sim_launch.py`** defaults `controller_type` to **`'MPC'`** and always launches a
   controller; it never starts `robot_interface`. `spawn_yaw` is **radians ENU** (spawn
   position stays (0, 0)); the Mission Control Station passes a random one for GPS-anchored
@@ -773,7 +805,7 @@ about before drawing a number off them. None is a bug in the logging: the logs f
 record what happened.
 
 **The manual-target and pinger thrust columns are not calibrated Newtons.** `solve_LoS`
-builds its command as `[v + 0.295·yaw_rate, v − 0.295·yaw_rate]` from a surge in **m/s** and a
+builds its command as `[v + 0.295·yaw_rate/2, v − 0.295·yaw_rate/2]` (halved 2026-10-27; the factor-5.75 comparison below was written for the full yaw_rate, so it is now 2.9) from a surge in **m/s** and a
 yaw rate in **rad/s**, and publishes that on `/thruster_input`, where every consumer reads it
 as force — including `robot_interface`'s bollard-pull interpolator, the CSV's
 `right_thr_in`/`left_thr_in` and the reviewer's thrust panel. It compounds: the allocator

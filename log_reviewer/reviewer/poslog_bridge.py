@@ -24,6 +24,7 @@ figure and every number is recomputed on the rows inside it.
 """
 
 import os
+import re
 import sys
 
 import numpy as np
@@ -70,6 +71,54 @@ SOURCE_MODULE = pr.__file__
 # Loading
 # ---------------------------------------------------------------------------
 
+_CONTROLLERS = ("PID", "LoS", "MPC")
+_STAMP = re.compile(r"^\d{4}_\d{2}_\d{2}-\d{2}_\d{2}_\d{2}")
+
+
+def find_controller(run, data_root=None):
+    """Which controller flew a run: "PID" / "LoS" / "MPC", or None if unknown.
+
+    Neither the poslog nor its sidecar records it. The controller's `.npy`
+    is named `<run-start stamp>-<ctrl>_<real|simulation>_data.npy` under
+    `<root>/<ctrl>_data/`, and carries the same stamp as the poslog, so a
+    directory LISTING is enough - the file is never opened (CM-7). A sidecar
+    `controller:` key wins if a writer ever adds one. `data_root` defaults to
+    the parent of the `Robot_data` folder the CSV sits under, else
+    `~/ros2_ws/data`.
+    """
+    origin = run.get("origin") or {}
+    declared = str(origin.get("controller", "")).strip()
+    for name in _CONTROLLERS:
+        if declared.lower() == name.lower():
+            return name
+
+    match = _STAMP.match(run.get("stem", ""))
+    if not match:
+        return None
+    if data_root is None:
+        data_root = os.path.join(os.path.expanduser("~"), "ros2_ws", "data")
+        probe = os.path.dirname(os.path.abspath(str(run.get("path", ""))))
+        while probe and probe != os.path.dirname(probe):
+            if os.path.basename(probe) == "Robot_data":
+                data_root = os.path.dirname(probe)
+                break
+            probe = os.path.dirname(probe)
+
+    wanted = re.compile(r"^%s-(PID|LoS|MPC)_(real|simulation)_data\.npy$"
+                        % re.escape(match.group(0)))
+    found = set()
+    for name in _CONTROLLERS:
+        try:
+            entries = os.listdir(os.path.join(data_root, name + "_data"))
+        except OSError:
+            continue
+        for entry in entries:
+            hit = wanted.match(entry)
+            if hit:
+                found.add(hit.group(1))
+    return found.pop() if len(found) == 1 else None
+
+
 def load(csv_path):
     """Read one poslog and tag it with what the cropper needs.
 
@@ -89,6 +138,7 @@ def load(csv_path):
     # the dict) and trimming into a no-fix stretch cannot flip the track panel
     # from degrees to metres halfway through a session.
     run["frame_mode"] = pr.track_series(run)["mode"]
+    run["controller"] = find_controller(run)
     run["row_index"] = np.arange(run["n_rows"], dtype=int)
     run["n_rows_full"] = run["n_rows"]
     t = run["t"]
@@ -183,6 +233,7 @@ def summary_rows(run, metrics):
         ("Right - left imbalance", fmt(m["thr_imbalance"], " N")),
         ("Thrust live (state 1)", "%.1f %% of the run" % live_pct),
         ("Layout", run["layout"].replace("_", "-")),
+        ("Controller", run.get("controller") or "unknown"),
         ("World origin (lat, lon)", origin_label(run)),
     ]
 
@@ -192,7 +243,8 @@ def subtitle_for(run, metrics):
     of_full = ""
     if run["n_rows"] != run.get("n_rows_full", run["n_rows"]):
         of_full = " of %d" % run["n_rows_full"]
-    return ("%d%s rows · %s · %s layout · target: %s%s" % (
+    return ("%d%s rows · %s · %s layout · target: %s%s%s" % (
         run["n_rows"], of_full, fmt_duration(metrics["duration_s"]),
         run["layout"].replace("_", "-"), run["spec"]["target_name"],
+        " · %s controller" % run["controller"] if run.get("controller") else "",
         " · simulation" if is_simulation(run) else ""))

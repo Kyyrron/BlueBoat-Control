@@ -11,7 +11,8 @@ the toolbar, which renames only the EXPORT. Everything written goes into
 
     ~/ros2_ws/data/Processed_Robot_data/<name>/
         <name>.csv            legend rows, then the rows inside the timeline,
-                              every column, verbatim
+                              every column, verbatim (with the pinger ticked: in
+                              the with-pinger layout, see `write_cropped_csv`)
         <name>.png            the report as framed in the app
         <name>.gif            the track replayed at x5-x20, as framed in the app
         <name>-origin.yaml    a COPY of the run's origin sidecar
@@ -36,6 +37,7 @@ import yaml
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 from . import figures as F
+from . import pinger_bag as PB
 from . import poslog_bridge as pb
 from . import replay_video as V
 
@@ -112,7 +114,14 @@ def export(source_csv, name, crop, texts, root=None, tile_provider=None,
 
     csv_out = os.path.join(folder, name + ".csv")
     png_out = os.path.join(folder, name + ".png")
-    written_rows, legend_from = write_cropped_csv(source_csv, csv_out, crop["row_index"])
+    pinger = crop["pinger"] if crop.get("pinger_show") and crop.get("pinger") else None
+    # A log that is already a with-pinger layout keeps its CSV verbatim (the raw
+    # pinger columns are field record); only the picture and video gain the
+    # filtered pinger.
+    add_columns = pinger is not None and crop["layout"] != "pinger"
+    written_rows, legend_from = write_cropped_csv(
+        source_csv, csv_out, crop["row_index"],
+        PB.export_columns(crop) if add_columns else None)
 
     figure = F.build_report_figure(crop, texts, tile_provider, track_limits)
     FigureCanvasAgg(figure)
@@ -141,11 +150,11 @@ def export(source_csv, name, crop, texts, root=None, tile_provider=None,
 
     write_manifest(os.path.join(folder, "export.yaml"), source_csv, sidecar_in,
                    crop, texts, written_rows, track_limits, name, video,
-                   legend_from)
+                   legend_from, PB.source_name(crop) if pinger else None)
     return folder
 
 
-def write_cropped_csv(source_csv, out_csv, row_index):
+def write_cropped_csv(source_csv, out_csv, row_index, pinger_columns=None):
     """Copy the legend, the header and the selected data rows, field for field.
 
     An export ALWAYS opens with the two legend rows (description, unit) of
@@ -159,6 +168,16 @@ def write_cropped_csv(source_csv, out_csv, row_index):
     blank lines - the same numbering `poslog_report.read_poslog` produces,
     which is what the crop carries.
 
+    `pinger_columns` (from `pinger_bag.export_columns`, one value per kept row
+    in order) turns the export into a WITH-PINGER log, so this same app reads it
+    back with no second code path: the header is `COLUMNS_PINGER`, the target
+    block is the pinger, the raw Water Linked packet fills `aco..filaco`, and
+    every source column the pinger layout does not have - the path target
+    (`target_x/y`, `target_latitude/longitude`) above all - follows at the end,
+    so nothing of the field record is dropped. The values of the columns both
+    layouts share are still copied verbatim; the legend is rebuilt from the
+    schema, because the source's no longer lines up with the new header.
+
     Returns (rows written, "source" or "schema" - where the legend came from).
     """
     wanted = set(int(i) for i in row_index)
@@ -170,23 +189,42 @@ def write_cropped_csv(source_csv, out_csv, row_index):
         raise pb.PoslogError("%s: not a poslog (no 'relative_x' column)" % source_csv)
     header = table[header_index]
     legend_from = "source" if legend else "schema"
+    out_header = header
+    if pinger_columns is not None:
+        out_header = list(pb.rls.COLUMNS_PINGER) + [
+            name for name in header if name not in pb.rls.COLUMNS_PINGER]
+        legend, legend_from = None, "schema"
     if legend is None:
-        legend = pb.rls.legend_rows(header)
+        legend = pb.rls.legend_rows(out_header)
+    order = sorted(int(i) for i in row_index)
+    place = {number: k for k, number in enumerate(order)}
 
     with open(out_csv, "w", newline="") as target:
         writer = csv.writer(target, lineterminator="\n")
         writer.writerows(legend)
-        writer.writerow(header)
+        writer.writerow(out_header)
         data_rows = (row for row in table[header_index + 1:] if row)
         for number, row in enumerate(data_rows):
-            if number in wanted:
-                writer.writerow(row)
-                written += 1
+            if number not in wanted:
+                continue
+            if pinger_columns is not None:
+                row = _pinger_row(header, row, out_header, pinger_columns,
+                                  place[number])
+            writer.writerow(row)
+            written += 1
     return written, legend_from
 
 
+def _pinger_row(header, row, out_header, pinger_columns, k):
+    """One data row in the with-pinger layout: pinger values from the bag, every
+    other column the source's own text."""
+    source = {name: (row[i] if i < len(row) else "") for i, name in enumerate(header)}
+    return [repr(float(pinger_columns[name][k])) if name in pinger_columns
+            else source.get(name, "") for name in out_header]
+
+
 def write_manifest(path, source_csv, sidecar_in, crop, texts, written_rows,
-                   track_limits, name, video=None, legend_from=None):
+                   track_limits, name, video=None, legend_from=None, pinger=None):
     """Everything needed to say what this export is and redo it."""
     t = crop["t"]
     rows = crop["row_index"]
@@ -226,6 +264,11 @@ def write_manifest(path, source_csv, sidecar_in, crop, texts, written_rows,
         "video": video,
         "texts": dict(texts),
     }
+    if pinger:
+        # What the CSV's pinger columns came from, and the filter that decided
+        # which samples to trust - so the numbers can be reproduced or doubted.
+        manifest["pinger"] = dict(pinger, csv_layout="pinger",
+                                  columns_added=crop["layout"] != "pinger")
     with open(path, "w") as handle:
         yaml.safe_dump(plain(manifest), handle, sort_keys=False,
                        allow_unicode=True, default_flow_style=False)
