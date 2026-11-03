@@ -72,7 +72,7 @@ behind, τ slows down or stops entirely, and waits. That mechanism is called the
 | `path_generation` | Evaluates the trajectory function | on demand | **yes** |
 | `master_control` | Advances τ, computes thrust | 20 Hz | **yes** |
 | `path_publisher` | Draws the whole path in RViz | re-requests every 5 s, republishes at 1 Hz | no |
-| `robot_interface` / `simulation_interface` | Motors + odometry | ~20 Hz | yes |
+| `robot_interface` / `simulation_interface` | Motors + odometry | thrust applied at 20 Hz (real) / 10 Hz (sim); odometry at the MAVROS rate (real, ~4–13 Hz) / 20 Hz (sim) | yes |
 
 ---
 
@@ -409,7 +409,7 @@ the default) are bit-identical to before (`test/mc_harness.py --compare`).
   │        LoS / PID / MPC   ->  u = [right, left]                        │
   │                                                                       │
   │  7. publish /thruster_input, log a row to /monitoring_data,           │
-  │     save the .npy file every 0.1 s                                    │
+  │     append a .npy row (the file is rewritten by a 2 s timer)          │
   └───────────────────────────────────────────────────────────────────────┘
 ```
 

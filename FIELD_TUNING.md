@@ -77,7 +77,7 @@ worker thread — about a second when cached, about a minute after any MPC knob 
 | `outer_gains_psi` | `[3.3,0.01,0]` / `[4.0,0.01,0]` | Heading error → yaw-rate reference. ↑ = snappier turn onto the path, weaving if too high. |
 | `inner_gains_u` | `[1.0,0,0]` / `[2.5,0,0]` | Surge-speed error → force (N per m/s). |
 | `inner_gains_r` | `[1.5,0,0]` / `[2.5,0,0]` | Yaw-rate error → moment. Too high = thruster chatter. |
-| `pid_lookahead` (Δ) | 2.5 m | `psi_d = gamma_p + atan2(e_y, Δ)`. Small = aggressive cut back to the line, large = damped. |
+| `pid_lookahead` (Δ) | 2.5 m | `psi_d = gamma_p + atan2(−e_y, Δ)` (`e_y` = cross-track error, positive with the boat left of the path; same law as §2). Small = aggressive cut back to the line, large = damped. |
 | `hold_speed` | 0.05 m/s | Below this authored speed the tangent is rotated toward the bearing to the point, so the along-track term can see the range. |
 | `hold_radius` | 0.5 m | On-station radius; the rotation fades out inside it. |
 
@@ -139,7 +139,7 @@ Active whenever `/blueboat/manual_target ≠ [0,0]`, in **any** `controller_type
 | Parameter | Default real / sim | Effect |
 |---|---|---|
 | `point_k_v` | 0.15 / 2.0 | Surge in `v = 5·ln(k_v·d + 1)`. |
-| `point_k_psi` | 100.0 / 60.0 | Yaw rate per rad of bearing; the differential is `±0.295·yaw_rate/2` (halved 2026-10-27, see the note under keep-location). |
+| `point_k_psi` | 100.0 / 60.0 | Yaw rate per rad of bearing; the pursuit differential is `±0.295·yaw_rate` (only the keep-location hold uses `±0.295·yaw_rate/2`, halved 2026-10-27 — see the note under keep-location). |
 | `min_thrust` | 2.0 N | Breakaway floor, faded over `hold_radius`, killed by `cos(bearing)`. |
 
 **Keep-location (on station)**
@@ -160,10 +160,13 @@ Active whenever `/blueboat/manual_target ≠ [0,0]`, in **any** `controller_type
 | `manual_hold_umax` | derived `kx·(reacq − hold)` = 4 / 7.5 N (was 8 / 15 with the 2.0 m radius) | Cap. Leave it derived, so retuning a radius cannot break the handover. |
 | `manual_brake_time` | 1.0 s | Reverse pulse on each **fresh** arrival; a repeated target does not re-arm it. |
 
-> **Yaw differential halved (2026-10-27).** `solve_LoS` — the manual-target **and** pinger laws —
-> now returns `[v ± 0.295·yaw_rate/2]` instead of `[v ± 0.295·yaw_rate]`, to stop the bow hunting.
-> Every yaw gain of these two laws (`point_k_psi`, the bearing term of the hold/pursuit law) now
-> acts at half strength: to get the old turning authority back, double them. Path following
+> **Yaw differential halved (2026-10-27) — keep-location hold only.** `manual_keep_location`
+> (on station at a manual target, and the replanner run's awaiting-path hold) now returns
+> `[v_hold ± 0.295·yaw_rate/2]` instead of `[v_hold ± 0.295·yaw_rate]`, to stop the bow hunting.
+> The manual-target **pursuit** law and the **pinger** law in `solve_LoS` still return
+> `[v ± 0.295·yaw_rate]` (`master_control.py`, `solve_LoS`; corrected 2026-11-03 against the
+> code, which never halved them). Inside the hold `point_k_psi` therefore acts at half strength;
+> off station it acts at full strength. Path following
 > (PID / LoS / MPC) goes through the allocator and is unaffected. This is **real and simulation
 > alike** (no split).
 
