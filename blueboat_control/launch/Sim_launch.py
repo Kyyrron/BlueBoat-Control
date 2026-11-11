@@ -62,7 +62,10 @@ def launch_setup():
                 'simulation_interface.py',
                 parameters={'controller_type' : sl_controller,
                             'note': sl_note,
-                            'data_dir': sl_data})
+                            'data_dir': sl_data,
+                            # sim-time watchdog / republish: one clock at
+                            # any Gazebo real-time factor (2026-11-07)
+                            'time_source': 'ros'})
 
         # Compute trajectory and target
         sl.node('blueboat_control',
@@ -85,7 +88,10 @@ def launch_setup():
                 parameters={'controller_type' : sl_controller,
                             'simulation' : True,
                             'data_dir': sl_data,
-                            'path_source': sl_path_source})
+                            'path_source': sl_path_source,
+                            # .npy / monitoring stamps, brakes and path
+                            # timeouts on /clock (2026-11-07)
+                            'time_source': 'ros'})
 
         return sl.launch_description()
 

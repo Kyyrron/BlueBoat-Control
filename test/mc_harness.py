@@ -14,6 +14,14 @@ Two jobs:
      tick. The proof that a refactor (or the live path update, unused) changes
      nothing. `--scenarios replanner,replanner_session` compares those too.
 
+  1b. CLOCK EQUIVALENCE (`--time-source ros`, 2026-11-07). Runs the same
+     scenarios with the working tree twice -- `time_source` 'wall' (the
+     default: `time.time()`) and 'ros' (the node clock, what every simulation
+     launch passes so a run slowed below real time keeps one clock) -- both
+     on one integer-nanosecond simulated clock, and requires the same four
+     streams bit-identical: the parameter changes the clock's source, never
+     what the node does with it.
+
   2. LIVE PATH UPDATE, offline (`--replanner`). Drives a replanner-owned run of
      the working tree through the real service callback: hold, first path,
      updates (one mid-turn, back-to-back), a refused update, end of path,
@@ -34,6 +42,7 @@ for MPC, the venv with acados:
     source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash
     source ~/ros2_ws/.venv/bin/activate
     python3 test/mc_harness.py --compare HEAD
+    python3 test/mc_harness.py --time-source ros
     python3 test/mc_harness.py --replanner
 """
 
@@ -69,6 +78,37 @@ class FakeTime:
 
     def sleep(self, _s):
         pass
+
+
+class FakeTimeNs(FakeTime):
+    """FakeTime on integer nanoseconds (the clock-equivalence runs): `time()`
+    and the fake node clock below read the same integer, so 'wall' and 'ros'
+    see the same floats."""
+
+    def __init__(self, t0=1_000_000.0):
+        self.ns = int(round(float(t0) * 1e9))
+
+    @property
+    def now(self):
+        return self.ns * 1e-9
+
+    @now.setter
+    def now(self, value):
+        self.ns = int(round(float(value) * 1e9))
+
+    def time(self):
+        return self.ns * 1e-9
+
+
+class FakeNodeClock:
+    """`node.get_clock()` for time_source 'ros': `now().nanoseconds`."""
+
+    def __init__(self, ft):
+        self._ft = ft
+
+    def now(self):
+        from rclpy.time import Time
+        return Time(nanoseconds=self._ft.ns)
 
 
 class Plant:
@@ -176,7 +216,7 @@ def _load(src_dir, filename, module_name):
 # ===========================================================================
 #  One run in this process (called in a subprocess per scenario)
 # ===========================================================================
-def run_one(src_root, scenario, controller, real, out_path):
+def run_one(src_root, scenario, controller, real, out_path, time_source=None):
     src = os.path.join(src_root, "blueboat_control", "src")
     for sub in ("_custom_libraries", "PID", "MPC", ""):
         sys.path.insert(0, os.path.join(src, sub))
@@ -198,13 +238,15 @@ def run_one(src_root, scenario, controller, real, out_path):
         args += ["-p", f"path_source:={sc['path_source']}"]
     if sc.get("use_pinger"):
         args += ["-p", "use_pinger:=true"]
+    if time_source == "ros":
+        args += ["-p", "time_source:=ros"]
     rclpy.init(args=args)
 
     pg_ns = _load(src, os.path.join("_custom_libraries", "path_generation.py"), "pg")
     server = pg_ns["PathGeneration"]()
 
     mc_ns = _load(src, "master_control.py", "mc")
-    clock = FakeTime()
+    clock = FakeTimeNs() if time_source else FakeTime()
     mc_ns["time"] = clock
 
     class Harnessed(mc_ns["Controller"]):
@@ -214,6 +256,8 @@ def run_one(src_root, scenario, controller, real, out_path):
             return super().create_client(srv_type, name, *a, **kw)
 
     node = Harnessed()
+    if time_source == "ros":
+        node.get_clock = lambda: FakeNodeClock(clock)
     for attr in ("thruster_input_publisher", "data_publisher", "target_publisher",
                  "pose_arrow_publisher", "run_state_publisher", "path_progress_publisher",
                  "path_event_publisher"):
@@ -390,24 +434,32 @@ except ImportError:                     # pragma: no cover
 # ===========================================================================
 #  Driver
 # ===========================================================================
-def _subprocess_run(src_root, scenario, controller, real, out):
+def _subprocess_run(src_root, scenario, controller, real, out, time_source=None):
     cmd = [sys.executable, os.path.abspath(__file__), "--one", "--src-root", src_root,
            "--scenario", scenario, "--controller", controller, "--out", out]
     if real:
         cmd.append("--real")
+    if time_source:
+        cmd += ["--one-time-source", time_source]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         raise RuntimeError(f"{scenario}/{controller} in {src_root} failed:\n"
                            f"{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}")
 
 
-def compare(rev, controllers, scenarios, real_too):
+def compare(rev, controllers, scenarios, real_too, time_sources=None):
+    """`rev` vs the working tree (time_sources None), or -- the clock
+    equivalence -- the working tree under two time sources."""
     tmp = tempfile.mkdtemp(prefix="mc_compare_")
-    head_root = os.path.join(tmp, "head")
-    os.makedirs(head_root)
-    archive = subprocess.run(["git", "-C", REPO, "archive", rev, "blueboat_control/src"],
-                             capture_output=True, check=True).stdout
-    subprocess.run(["tar", "-x", "-C", head_root], input=archive, check=True)
+    if time_sources is None:
+        head_root = os.path.join(tmp, "head")
+        os.makedirs(head_root)
+        archive = subprocess.run(["git", "-C", REPO, "archive", rev, "blueboat_control/src"],
+                                 capture_output=True, check=True).stdout
+        subprocess.run(["tar", "-x", "-C", head_root], input=archive, check=True)
+        runs = (("head", head_root, None), ("work", REPO, None))
+    else:
+        runs = tuple((ts, REPO, ts) for ts in time_sources)
     rows, failed = [], 0
     combos = [(s, c, False) for s in scenarios for c in controllers
               if c in SCENARIOS[s].get("controllers", CONTROLLERS)]
@@ -415,9 +467,9 @@ def compare(rev, controllers, scenarios, real_too):
         combos += [("kin_square", c, True) for c in controllers]
     for scenario, controller, real in combos:
         outs = []
-        for label, root in (("head", head_root), ("work", REPO)):
+        for label, root, ts in runs:
             out = os.path.join(tmp, f"{label}-{scenario}-{controller}-{int(real)}.json")
-            _subprocess_run(root, scenario, controller, real, out)
+            _subprocess_run(root, scenario, controller, real, out, ts)
             with open(out) as handle:
                 outs.append(json.load(handle))
         a, b = outs
@@ -436,8 +488,9 @@ def compare(rev, controllers, scenarios, real_too):
               f"non-zero-thrust={moving:5d}  thrust={'==' if same_thr else '!='}  "
               f"monitoring={'==' if same_mon else '!='}  tau={'==' if same_tau else '!='}  "
               f"max|dthrust|={max_thr:.3g}", flush=True)
-    print(f"\n{len(rows) - failed}/{len(rows)} scenario runs bit-identical "
-          f"({rev} vs working tree)")
+    what = (f"{rev} vs working tree" if time_sources is None
+            else " vs ".join(f"time_source {ts}" for ts in time_sources))
+    print(f"\n{len(rows) - failed}/{len(rows)} scenario runs bit-identical ({what})")
     return 1 if failed else 0
 
 
@@ -454,14 +507,21 @@ def main():
     ap.add_argument("--controller", help=argparse.SUPPRESS)
     ap.add_argument("--real", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--out", help=argparse.SUPPRESS)
+    ap.add_argument("--time-source", choices=("ros",),
+                    help="clock equivalence: the working tree with time_source wall vs ros")
+    ap.add_argument("--one-time-source", help=argparse.SUPPRESS)
     args = ap.parse_args()
     if args.one:
-        run_one(args.src_root, args.scenario, args.controller, args.real, args.out)
+        run_one(args.src_root, args.scenario, args.controller, args.real, args.out,
+                args.one_time_source)
         return 0
     controllers = [c for c in args.controllers.split(",") if c]
     if args.compare:
         return compare(args.compare, controllers, [s for s in args.scenarios.split(",") if s],
                        not args.no_real)
+    if args.time_source:
+        return compare(None, controllers, [s for s in args.scenarios.split(",") if s],
+                       not args.no_real, ("wall", args.time_source))
     if args.replanner:
         import mc_replanner_scenarios as rs
         return rs.main(controllers)

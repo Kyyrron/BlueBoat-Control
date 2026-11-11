@@ -195,7 +195,7 @@ class Controller(Node):
         self.run_active = not self.session_mode
         self.run_status = 'idle'        # idle | loading | running | error
         self.run_number = 0
-        self.run_t0 = None              # time.time() at the current run's start
+        self.run_t0 = None              # _world_clock() at the current run's start
         self.run_note = ''
         self.run_mission = ''
         self.cmd_seq = None             # last /blueboat/run_command handled
@@ -231,6 +231,13 @@ class Controller(Node):
 
     def _dbl(self, name, default):
         return self._param(name, float(default)).double_value
+
+    def _world_clock(self):
+        """Seconds on the world-timing clock (parameter ``time_source``):
+        ``time.time()`` for 'wall', the node clock for 'ros'."""
+        if self.time_source == 'ros':
+            return self.get_clock().now().nanoseconds * 1e-9
+        return time.time()
 
     def _int(self, name, default):
         return self._param(name, int(default)).integer_value
@@ -523,6 +530,17 @@ class Controller(Node):
         #    stays engaged (never hands back to autonomy by itself).
         self.arrow_timeout = dbl('arrow_timeout', 0.5)
 
+        # -- the clock of the world-timing logic (additive, 2026-11-07) ------
+        # 'wall' (default, every real-robot launch): time.time(), as before.
+        # 'ros': the node clock -- /clock in a simulation -- so a run slowed
+        # below real time (Gazebo real-time factor < 1, for the ray-cast
+        # sonar) brakes, retries and stamps /monitoring_data and the .npy
+        # exactly as at real speed. The arrow dead-man stays wall in both:
+        # it guards a human key stream sent at a wall 20 Hz.
+        self.time_source = self._param('time_source', 'wall').string_value
+        if self.time_source not in ('wall', 'ros'):
+            raise ValueError(f"unknown time_source '{self.time_source}' (wall | ros)")
+
     # ======================================================================
     #  3. THE CONTROL LOOP -- 1/dt (20 Hz), the entry point
     #  Every early return publishes zero rather than falling silent: a
@@ -538,11 +556,11 @@ class Controller(Node):
             return
 
         if not self.time_set:
-            self.initial_time = time.time()
+            self.initial_time = self._world_clock()
             self.tau = 0.0
             self.time_set = True
 
-        current_time = time.time() - self.initial_time
+        current_time = self._world_clock() - self.initial_time
 
         if self.current_pose is None or self.current_twist is None:
             self.publish_thrust([0.0, 0.0])
@@ -815,7 +833,7 @@ class Controller(Node):
         # In a session, t counts from the start of the run being recorded.
         t_m = current_time
         if self.session_mode and self.run_t0 is not None:
-            t_m = time.time() - self.run_t0
+            t_m = self._world_clock() - self.run_t0
 
         data_array = [t_m, current_state[0], current_state[1], current_state[2],
                       monitored[0], monitored[1], psi_d, u[0], u[1]]
@@ -1423,7 +1441,7 @@ class Controller(Node):
             self.controller.fail_count = 0
 
         self.run_number += 1
-        self.run_t0 = time.time()
+        self.run_t0 = self._world_clock()
         self.run_active = True
         self.run_status = 'running'
         # A new run never inherits a path (a replanner run starts holding).
@@ -1549,10 +1567,11 @@ class Controller(Node):
             boat = (float(self.current_pose[0]), float(self.current_pose[1]),
                     float(self.current_pose[5]))
         now = time.time()
+        clock = self._world_clock()          # == now under time_source 'wall'
         if self.session_mode:
-            run_time = now - self.run_t0 if self.run_t0 is not None else None
+            run_time = clock - self.run_t0 if self.run_t0 is not None else None
         else:
-            run_time = now - self.initial_time if self.initial_time is not None else None
+            run_time = clock - self.initial_time if self.initial_time is not None else None
         return pu.Context(
             # Not ready until the first ready tick has run: that tick sets
             # tau = 0 (timer_callback, time_set), which must never overwrite

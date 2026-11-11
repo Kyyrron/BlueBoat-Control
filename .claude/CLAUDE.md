@@ -87,7 +87,8 @@ session.
 **N8 — The reference advances from the boat's measured progress, never from wall-clock
 time.** The governor (`path_progress_errors` + `advance_governor`, §4) enforces it.
 `current_time` only timestamps `/monitoring_data` and the `.npy` (from the run's start in a
-session); never route it back into path generation.
+session) and times the brake holds and path-request timeouts; never route it back into path
+generation. Its clock is `time_source` (wall by default, the node clock in simulation).
 
 **N9 — Monitoring output is world-frame in every controller branch, and means the same
 quantity.** `/monitoring_data` and the `.npy` carry world-frame `x_d, y_d, psi_d` for
@@ -338,6 +339,7 @@ QT_QPA_PLATFORM=offscreen python3 log_reviewer/smoke_test.py   # skips without a
 python3 .claude/tools/interface_inventory.py --check .claude/tools/interface_baseline.json  # 0 = unchanged
 # deterministic tick-level harness (ROS sourced + install + venv with acados for MPC):
 python3 test/mc_harness.py --compare HEAD         # N11: HEAD vs working tree, bit-identical
+python3 test/mc_harness.py --time-source ros      # time_source wall vs ros, bit-identical (one ns clock)
 python3 test/mc_harness.py --replanner            # offline replanner scenarios, all controllers
 python3 test/gazebo_path_update.py --replanner --out-dir /tmp/gz   # Gazebo, headless
 ```
@@ -421,6 +423,12 @@ everything here: `blueboat_control/src/CLAUDE.md`; knobs: `FIELD_TUNING.md`.
   model, `manual_hold_kx` — N/m). Also: `path_request_timeout` / `path_stale_timeout`
   (1.0 s), `thruster_input_timeout` (0.5 s, both interface nodes), `param_sequence_timeout_s`
   (20 s, `param_set`).
+- **`time_source`** (`master_control`, `simulation_interface`; default `wall`, additive,
+  owner order 2026-11-07): `ros` = the node clock for every world-timing use (`src/CLAUDE.md`
+  parameter table). `Sim_launch.py` and SSS-Sim's `full_mission_launch.py` pass `ros` in every
+  simulation, so a run slowed below real time (Gazebo real-time factor < 1, for the ray-cast
+  sonar) keeps one clock: at 0.1 the wall-clock 0.5 s thrust watchdog tripped between
+  `master_control`'s sim-time 20 Hz commands, and the `.npy` `t` grew 10× per sim second.
 
 ---
 

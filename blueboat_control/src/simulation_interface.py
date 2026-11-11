@@ -60,6 +60,17 @@ class Controller(Node):
         self.declare_parameter('thrust_limit', 20.0)
         self.thrust_limit = self.get_parameter('thrust_limit').get_parameter_value().double_value
 
+        # Additive (2026-11-07): the clock of the thrust watchdog and the
+        # ready republish. 'wall' (default): time.time(), as before. 'ros':
+        # the node clock (/clock), so a simulation slowed below real time
+        # (Gazebo real-time factor < 1) does not trip the 0.5 s watchdog
+        # between master_control's sim-time 20 Hz commands. Every simulation
+        # launch passes 'ros'.
+        self.declare_parameter('time_source', 'wall')
+        self.time_source = self.get_parameter('time_source').get_parameter_value().string_value
+        if self.time_source not in ('wall', 'ros'):
+            raise ValueError(f"unknown time_source '{self.time_source}' (wall | ros)")
+
         self.declare_parameter('note', 'sim')
         self.note = self.get_parameter('note').get_parameter_value().string_value
 
@@ -155,7 +166,13 @@ class Controller(Node):
 
     def thr_input_callback(self, msg: Float32MultiArray):
         self.thr_input = msg.data
-        self.last_thr_rx = time.time()
+        self.last_thr_rx = self._world_clock()
+
+    def _world_clock(self):
+        """Seconds on the watchdog clock (parameter ``time_source``)."""
+        if self.time_source == 'ros':
+            return self.get_clock().now().nanoseconds * 1e-9
+        return time.time()
 
     def thruster_input_stale(self, now):
         """Loss-of-reference watchdog (robot_interface.thruster_input_stale)."""
@@ -173,12 +190,12 @@ class Controller(Node):
             self.ready_publisher.publish(msg)
             self.get_logger().info(f'Ready publishing: {msg.data}')
             self.sent_ready = True
-            self.last_ready_tx = time.time()
-        elif time.time() - self.last_ready_tx > self.ready_republish_period:
-            self.last_ready_tx = time.time()
+            self.last_ready_tx = self._world_clock()
+        elif self._world_clock() - self.last_ready_tx > self.ready_republish_period:
+            self.last_ready_tx = self._world_clock()
             self.ready_publisher.publish(Bool(data=True))
 
-        if self.thruster_input_stale(time.time()):
+        if self.thruster_input_stale(self._world_clock()):
             if not self.thr_watchdog_tripped:
                 self.thr_watchdog_tripped = True
                 self.get_logger().warn(
