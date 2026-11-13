@@ -519,6 +519,35 @@ def section_pinger(logs, workspace):
         check("a pinger log's CSV is exported verbatim (raw columns are field record)",
               a.read().splitlines()[2:] == b.read().splitlines()[2:])
 
+    # The run's bag travels with the export: copied whole, byte for byte.
+    import yaml
+    bag_in = PB.find_bag(csv_path)
+    bag_before = {f: digest(os.path.join(bag_in, f)) for f in os.listdir(bag_in)}
+    broot = os.path.join(workspace, "bagexp")
+    folder3 = E.export(csv_path, "with bag", crop, F.default_texts("x"), root=broot,
+                       video_speed=20)
+    bag_out = os.path.join(folder3, "with bag-bag")
+    copied = ({f: digest(os.path.join(bag_out, f)) for f in os.listdir(bag_out)}
+              if os.path.isdir(bag_out) else {})
+    check("the export carries a byte-identical copy of the run's bag (hidden mcap too)",
+          copied == bag_before and any(f.startswith(".run-bag-") for f in copied),
+          str(sorted(copied)))
+    check("the source bag is copied, not moved",
+          {f: digest(os.path.join(bag_in, f)) for f in os.listdir(bag_in)} == bag_before)
+    check("no staging folder is left behind", not os.path.exists(bag_out + ".part"))
+    with open(os.path.join(folder3, "export.yaml")) as handle:
+        bag_entry = yaml.safe_load(handle)["bag"]
+    check("export.yaml records the bag", bag_entry.get("source") == bag_in
+          and bag_entry.get("folder") == "with bag-bag" and bag_entry.get("cropped") is False,
+          str(bag_entry))
+    # Overwritten by an export of a log with no bag: the old bag must go.
+    E.export(out, "with bag", crop2, F.default_texts("x"), root=broot,
+             overwrite=True, video_speed=20)
+    with open(os.path.join(folder3, "export.yaml")) as handle:
+        bag_entry = yaml.safe_load(handle)["bag"]
+    check("re-exporting a log without a bag removes the stale copy and says why",
+          not os.path.exists(bag_out) and "skipped" in bag_entry, str(bag_entry))
+
 
 def section_frames(logs, workspace):
     print("\n[1b] simulation is drawn in world coordinates")

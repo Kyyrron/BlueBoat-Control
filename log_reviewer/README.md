@@ -54,6 +54,7 @@ repository's `requirements.txt`.
   | `<name>.csv` | a description row and a unit row, the column names, then the rows inside the timeline, every column, copied field for field |
   | `<name>.png` | the report as you framed it — your text, your zoom, your tiles |
   | `<name>-origin.yaml` | a copy of the run's world-frame origin sidecar |
+  | `<name>-bag/` | a copy of the run's whole ros2 bag, untrimmed (only when the run has one) |
   | `<name>.gif` | the track replayed at the chosen speed over the whole selection, framed as on screen |
   | `export.yaml` | the source, the crop, the wall-clock span and every edited string |
 

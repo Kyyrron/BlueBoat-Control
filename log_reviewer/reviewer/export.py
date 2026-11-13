@@ -16,6 +16,7 @@ the toolbar, which renames only the EXPORT. Everything written goes into
         <name>.png            the report as framed in the app
         <name>.gif            the track replayed at x5-x20, as framed in the app
         <name>-origin.yaml    a COPY of the run's origin sidecar
+        <name>-bag/           a COPY of the run's whole ros2 bag, when it has one
         export.yaml           what was cropped, from what, with which text
 
 which is derived data: re-exporting the same window is expected, and
@@ -95,7 +96,7 @@ def safe_name(name, fallback="log"):
 
 def export(source_csv, name, crop, texts, root=None, tile_provider=None,
            track_limits=None, overwrite=False, video_speed=V.DEFAULT_SPEED):
-    """Write the five files. Returns the folder path.
+    """Write the five files, plus a copy of the run's bag. Returns the folder path.
 
     `root` resolves at CALL time, not at import time. A default argument of
     `DEFAULT_ROOT` binds the value once, so anything that redirects the root
@@ -148,10 +149,46 @@ def export(source_csv, name, crop, texts, root=None, tile_provider=None,
     if "file" not in video and os.path.isfile(gif_out):
         os.remove(gif_out)                  # a stale or partial video would lie
 
+    bag = copy_bag(source_csv, os.path.join(folder, name + "-bag"))
+
     write_manifest(os.path.join(folder, "export.yaml"), source_csv, sidecar_in,
                    crop, texts, written_rows, track_limits, name, video,
-                   legend_from, PB.source_name(crop) if pinger else None)
+                   legend_from, PB.source_name(crop) if pinger else None, bag)
     return folder
+
+
+def copy_bag(source_csv, bag_out):
+    """Copy the run's ros2 bag (found beside its poslog) to `bag_out`, whole.
+
+    The bag is field record (CM-7): it is COPIED, never moved, and never cut
+    to the timeline - trimming an MCAP means rewriting it, and the export's
+    rule is verbatim or nothing. `export.yaml` `crop` says which window of it
+    the rest of the export covers. Copied into `<bag_out>.part` and renamed
+    once complete, so an interrupted copy never sits under the final name.
+
+    Like the video, a failure is returned for the manifest, never raised, and a
+    bag left by an earlier export of the same name is removed first: an export
+    of a run with no bag must not carry another run's.
+    Returns the manifest's `bag` entry.
+    """
+    staging = bag_out + ".part"
+    for stale in (bag_out, staging):
+        if os.path.isdir(stale):
+            shutil.rmtree(stale)
+    bag_in = PB.find_bag(source_csv)
+    if bag_in is None:
+        return {"skipped": "no ros2 bag beside the source log"}
+    try:
+        shutil.copytree(bag_in, staging)       # hidden `.run-bag-*.mcap` included
+        os.replace(staging, bag_out)
+    except Exception as exc:                                    # noqa: BLE001
+        if os.path.isdir(staging):
+            shutil.rmtree(staging, ignore_errors=True)
+        return {"source": bag_in, "error": "%s: %s" % (type(exc).__name__, exc)}
+    files = sorted(os.listdir(bag_out))
+    size = sum(os.path.getsize(os.path.join(bag_out, f)) for f in files)
+    return {"source": bag_in, "folder": os.path.basename(bag_out),
+            "files": files, "bytes": size, "cropped": False}
 
 
 def write_cropped_csv(source_csv, out_csv, row_index, pinger_columns=None):
@@ -224,7 +261,8 @@ def _pinger_row(header, row, out_header, pinger_columns, k):
 
 
 def write_manifest(path, source_csv, sidecar_in, crop, texts, written_rows,
-                   track_limits, name, video=None, legend_from=None, pinger=None):
+                   track_limits, name, video=None, legend_from=None, pinger=None,
+                   bag=None):
     """Everything needed to say what this export is and redo it."""
     t = crop["t"]
     rows = crop["row_index"]
@@ -262,6 +300,7 @@ def write_manifest(path, source_csv, sidecar_in, crop, texts, written_rows,
                         "lat_max": round(float(track_limits[3]), 8)}
                        if track_limits else {"framed": "fit to selection"}),
         "video": video,
+        "bag": bag,
         "texts": dict(texts),
     }
     if pinger:

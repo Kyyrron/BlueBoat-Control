@@ -174,6 +174,7 @@ only for path separators:
 | `<name>.csv` | the two legend rows (description, unit), the source header, then the rows inside the timeline, every column, verbatim — or, with **Pinger** ticked, the with-pinger layout (§9.7). The legend is copied from a source written since 2026-10-08, built from `robot_log_schema` for an older one (`export.yaml` `source.legend`: `source` / `schema`) |
 | `<name>.png` | the report **as framed in the app**: edited text, current zoom, current tile setting, no actuation strip |
 | `<name>-origin.yaml` | a **copy** of the run's origin sidecar, so the world-frame columns stay georeferenceable |
+| `<name>-bag/` | a **copy** of the run's whole ros2 bag (`pinger_bag.find_bag`, beside the source poslog), byte for byte, hidden `.run-bag-*.mcap` name included — never cut to the timeline (that would rewrite field record); staged as `-bag.part` and renamed when complete. Absent for a log with no bag (an export, a renamed or pre-v1.1 log); a stale one from an earlier export of the same name is removed. `export.yaml` `bag`: `source`, `folder`, `files`, `bytes`, `cropped: false`, or `skipped` / `error` (a failed copy never costs the export its manifest) |
 | `<name>.gif` | the track panel **as framed in the app** (zoom, tiles) replayed over the whole selection at the speed chosen in the export dialog (**×5–×20**, default ×10), ~576×504 px |
 | `export.yaml` | `schema: blueboat_processed_log/1` — source csv/stem/sidecar/layout/target and row count, the crop (`t_start_s`, `t_end_s`, first/last source row, rows, wall-clock span), the track framing, the video (`speed`, `frame_ms`, `frames`, `duration_s`, or why there is none), and every edited string |
 
@@ -291,7 +292,10 @@ track, in the replay and in the export.
   diamonds beside it, and the box opens ticked. Its CSV is exported verbatim (the raw columns are
   field record); only the PNG and GIF gain the filtered pinger (`export.yaml` `pinger.columns_added:
   false`).
-* **Where it does not apply:** a no-pinger log with no bag beside it (an exported or renamed CSV),
+* **Where it does not apply:** a no-pinger log with no bag beside it (an exported or renamed CSV —
+  an export's `<name>-bag/` copy is deliberately not found, since `find_bag` keys on the
+  `-poslog.csv` name, and a crop starting more than `MAX_START_GAP_S` in would not align with
+  the whole bag's first message anyway),
   an unreadable or unaligned bag, or a pinger log that never detected the pinger.
 * **The gate's corpus assumption.** Several sections treat the *last* log as a pre-2026-10-08
   one (header on line 1) and build the new format from it; `find_logs` now guarantees that

@@ -1,6 +1,6 @@
 # Live path update — design
 
-Lets another node, the future **BlueBoat-Replanner**, do two things:
+Lets another node, **BlueBoat-Replanner**, do two things:
 - replace the rest of the followed path **during a run**;
 - load the **first** path of a run that starts with the boat holding position.
 

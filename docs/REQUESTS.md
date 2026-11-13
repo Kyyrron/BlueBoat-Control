@@ -78,7 +78,7 @@ Nothing else is needed. The simulator's acquisition and sea-state paths are unaf
 
 ## R-4 Superproject root `.claude/CLAUDE.md` — interface tables (for the user to apply)
 
-**Status 2026-10-19: applied** by the user's order. The rows went into root §4.1 (plus a §4.2 note), the §3 paragraph into root §3, and D8 into root §6. The pathlog went into the `file-interfaces` skill's mission-report row. The `/blueboat/update_path` row names today's clients honestly: only this module's tests. The replanner and an MCS Replanner mode do not exist yet.
+**Status 2026-10-19: applied** by the user's order. The rows went into root §4.1 (plus a §4.2 note), the §3 paragraph into root §3, and D8 into root §6. The pathlog went into the `file-interfaces` skill's mission-report row. The `/blueboat/update_path` row names today's clients honestly: only this module's tests. The replanner and an MCS Replanner mode do not exist yet. (2026-11-13: BlueBoat-Replanner exists and is a client; it has not yet run against `master_control`. The MCS Replanner mode is still R-1.)
 
 **§4.1, new rows:**
 
@@ -126,3 +126,7 @@ The followed reference is in the poslog target columns and the events.
 
 If MCS or the GCS want the geometry, Control can add a latched `nav_msgs/Path` topic of the
 plan, e.g. `/blueboat/path_update/plan`. Ask, and it will be a small additive change.
+
+Since 2026-11-12, in a replanner-owned run, BlueBoat-Replanner publishes `/replanner/plan`
+(latched `nav_msgs/Path`, frame `world`): its mirror of the path Control holds, republished on
+every accepted change. Display only; Control's own topic would still be the authority.

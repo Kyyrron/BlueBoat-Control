@@ -782,7 +782,7 @@ class ReviewerWindow(QMainWindow):
             finally:
                 QApplication.restoreOverrideCursor()
         except Exception as exc:                                # noqa: BLE001
-            # Deliberately broad. An export writes five files through three
+            # Deliberately broad. An export writes five files and a bag through three
             # libraries; whatever one of them raises, the operator must be told
             # in the window rather than in a terminal they may not be watching,
             # and the app must survive to let them try again.
@@ -792,12 +792,15 @@ class ReviewerWindow(QMainWindow):
                 % (type(exc).__name__, exc, folder))
             return
         video = os.path.isfile(os.path.join(written, name + ".gif"))
+        bag = os.path.isdir(os.path.join(written, name + "-bag"))
         duration, _ = V.video_timing(t[0], t[-1], self._video_speed) if len(t) else (0, 0)
         QMessageBox.information(
             self, "Exported",
-            "%d of %d rows written to\n\n%s\n\n%s" % (
+            "%d of %d rows written to\n\n%s\n\n%s\n%s" % (
                 self.crop["n_rows"], self.run["n_rows_full"], written,
                 "With a \u00d7%d replay video (%s)." % (self._video_speed,
                                                         fmt_duration(duration))
-                if video else "No replay video (export.yaml says why)."))
+                if video else "No replay video (export.yaml says why).",
+                "With a copy of the run's whole ros2 bag." if bag
+                else "No ros2 bag (export.yaml says why)."))
         self.statusBar().showMessage("Exported to %s" % written)
