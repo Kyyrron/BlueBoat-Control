@@ -217,8 +217,12 @@ def regression(controllers, out_dir, duration, head_setup):
             data_dir = os.path.join(out_dir, f"regr-{ctrl}-{label}")
             os.makedirs(data_dir, exist_ok=True)
             env = prefix
+            # sim_config:=legacy (2026-11-13): the before/after comparison is made
+            # on the plant and tuning every earlier build had; a build that
+            # predates the argument ignores it.
             proc = launch([f"controller_type:={ctrl}", "trajectory:=kin_square",
-                           f"data_dir:={data_dir}"], os.path.join(data_dir, "launch.log"),
+                           f"data_dir:={data_dir}", "sim_config:=legacy"],
+                          os.path.join(data_dir, "launch.log"),
                           env_prefix=env)
             time.sleep(duration)
             stop(proc)

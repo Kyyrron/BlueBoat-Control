@@ -9,10 +9,24 @@ ros2 launch blueboat_control BlueBoat_launch.py controller_type:='PID' \
 ros2 param list /blueboat/master_control      # the whole set
 ```
 
-Defaults are given **real / sim**, selected by the `simulation` parameter (`Sim_launch.py`
-sets it True). A single value means both are the same. All of them are declared in one place,
-`Controller._declare_tuning_parameters`; the **Used in** column names the method that reads
-it, not a line number — lines move, methods do not.
+Defaults are given **real / sim**. A single value means both are the same. All of them are
+declared in one place, `Controller._declare_tuning_parameters`; the **Used in** column names
+the method that reads it, not a line number — lines move, methods do not.
+
+**Which column runs (2026-11-13).** "real" is the real boat's column. "sim" is the column
+tuned on the old Gazebo plant (BlueROV2 hull coefficients). The parameter `gain_profile`
+chooses:
+
+| `gain_profile` | Column | Where |
+|---|---|---|
+| `''` (default) or `field` | **real** | the real boat, always; and simulation by default: the **field-equivalent** configuration |
+| `sim` | **sim** | simulation only (refused with `simulation:=false`): the **legacy** configuration |
+
+So a simulation now runs the real boat's gains, MPC model, horizon and weights unless asked
+otherwise. `simulation` itself still decides the log file name, `/pose_arrow` and nothing else
+in this file. Proof that the two spellings of the real column are one: `simulation:=false`
+and `simulation:=true gain_profile:=field` are bit-identical on the harness (9 runs, 3
+controllers). See "Simulation configurations" at the end.
 
 Branch priority in `timer_callback`: arrow keys → manual target → path following → pinger →
 zero thrust. A manual target overrides the path in **every** `controller_type`; the station's
@@ -184,6 +198,39 @@ Active whenever `/blueboat/manual_target ≠ [0,0]`, in **any** `controller_type
 With `PID` + pinger, the §1 gains apply in a zeroed body frame.
 
 ---
+
+## Simulation configurations (2026-11-13)
+
+One switch on `Sim_launch.py`, two named configurations. `docs/PARAMETER_REGISTER.md` has the
+origin and interval of every number.
+
+| | `sim_config:=field_equivalent` (default) | `sim_config:=legacy` |
+|---|---|---|
+| Plant (`plant`) | `identified`: the BlueBoat hull and actuator identified on field logs | `bluerov2_legacy`: the BlueROV2 table |
+| Gains, MPC model, horizon, weights (`gain_profile`) | the real boat's column (N 15, T 2.5 s, R 0.015) | the sim-tuned column (N 30, T 6 s, R 0.10) |
+| Thrust applied (`thrust_rate_hz`) | 20 Hz, as `robot_interface` | 10 Hz |
+| `/blueboat/odom` (`odom_profile`) | field timing `field_13hz`: 25 Hz bursts and 4 Hz stretches, link delay | Gazebo's own 20 Hz, no delay |
+| Use | any simulated result meant to transfer to the boat | reproducing a simulation made before 2026-11-13 |
+
+```bash
+ros2 launch blueboat_control Sim_launch.py controller_type:=MPC trajectory:=from_yaml:<route>          # field-equivalent
+ros2 launch blueboat_control Sim_launch.py controller_type:=MPC trajectory:=<…> sim_config:=legacy    # as before
+# single pieces, on top of either: plant:=identified|bluerov2_legacy  odom_profile:=passthrough|field_3hz|field_4hz|field_13hz  odom_seed:=<n>
+# the gains of a field day (blueboat_control/config/field_runs/README.md):
+ros2 launch blueboat_control Sim_launch.py controller_type:=PID trajectory:=<…> \
+  tuning_file:=$(ros2 pkg prefix blueboat_control)/share/blueboat_control/config/field_runs/2026_09_07_PID.yaml
+```
+
+What to expect from the identified plant (measured in Gazebo against the pool run): 0.61 /
+0.99 / 1.40 m/s at 2 × 4 / 10 / 20 N; about 20 N for 1.0 m/s; a time constant in yaw of
+1.5 s at rest, and far less turn per Newton under way than the old plant gave (1.3 °/s for a
+12.7 N differential at 1.1 m/s, against 14 °/s). The sim-tuned column was tuned on a hull
+that needed three times the thrust: do not pair it with the identified plant and read
+anything into the result.
+
+The simulator's own launch (`full_mission_launch.py`) and MCS's world runs get the
+field-equivalent configuration from the defaults of each piece; they cannot select `legacy`
+until that launch forwards the argument (`docs/REQUESTS.md` R-6).
 
 ## Symptom → knob
 

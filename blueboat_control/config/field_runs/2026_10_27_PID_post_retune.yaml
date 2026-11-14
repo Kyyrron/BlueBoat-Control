@@ -1,0 +1,9 @@
+# Controller configuration as flown in the field - for re-flying that run in simulation:
+#   ros2 launch blueboat_control Sim_launch.py controller_type:=PID tuning_file:=<this file> trajectory:=<route>
+# (sim_config:=field_equivalent, the default, supplies the identified plant, the real MPC model and 20 Hz thrust).
+# Day: 2026-10-27.  Status: UNCERTAIN - see the pre_retune file
+# Source of the values: today's real-boat defaults (FIELD_TUNING.md: retuned 2026-10-27; PID outer x kp 3.0->3.5, outer psi kp 3.0->3.3; LoS ku 20->30, kpsi 10->4.5)
+# Only what differed from today's real-boat defaults is listed, plus the odometry timing of that day.
+/**:
+  ros__parameters:
+    odom_profile: field_4hz

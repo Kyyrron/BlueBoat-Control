@@ -64,6 +64,12 @@ install(PROGRAMS src/bag_replay.py
 install(PROGRAMS src/_custom_libraries/replay_attitude.py
         DESTINATION lib/${PROJECT_NAME})
 
+# 2026-11-13: field odometry timing for simulation (ROS-free, imported by simulation_interface).
+install(PROGRAMS src/_custom_libraries/odom_emulation.py
+        DESTINATION lib/${PROJECT_NAME})
+# 2026-11-13: per-run controller configurations (gains flown on a given field day).
+install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
+
 install(PROGRAMS src/robot_interaction/robot_interface.py
         DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS src/robot_interaction/param_set.py

@@ -156,6 +156,60 @@ class Plant:
         return msg
 
 
+class IdentifiedPlant(Plant):
+    """The identified BlueBoat plant (2026-11-13) as Gazebo integrates it with
+    blueboat_description plant:=identified: hull of hydrodynamics_identified.xacro
+    plus the actuator model simulation_interface applies. For offline checks of
+    the field-equivalent configuration (`--plant identified`, or the two ends of
+    the 95 % interval, `identified_slow` / `identified_fast`); never the
+    `--compare` plant. docs/PARAMETER_REGISTER.md has every number's origin.
+
+    Applied thrust per side: kappa * (T - kp * sqrt|T| * u).
+      (m+A11) u' =  (m-A22) v r + X - Xuu u|u|
+      (m+A22) v' = -(m-A11) u r - Yvv v|v|
+       Izz    r' = (A22-A11) u v + arm (F_R - F_L) - Nr r - Nur |u| r
+    (the sign of the added-mass coupling is the plugin's, gz-sim 8.15).
+    """
+
+    VARIANTS = {
+        # identified values (surge: ident/bootstrap.json; yaw: ident/yaw_fit5.json)
+        "identified":      dict(m=16.01, A11=1.60, A22=14.0, Izz=9.48, Xuu=4.23, Yvv=108.0,
+                                Nr=6.31, Nur=4.76, kappa=0.493, kp=1.83),
+        # slow end of the 95 % interval: 23.7 N for 1 m/s instead of 20.2, the
+        # largest surge and yaw inertia and yaw damping
+        "identified_slow": dict(m=16.01, A11=10.87, A22=14.0, Izz=10.95, Xuu=4.96, Yvv=108.0,
+                                Nr=7.10, Nur=15.1, kappa=0.493, kp=2.15),
+        # fast end: 18.6 N for 1 m/s, the smallest inertias and yaw damping.
+        # The smallest identified surge inertia (22.2 kg per commanded N) is
+        # below the rigid mass at kappa 0.493, so this end carries kappa 0.793
+        # and its force coefficients are scaled with it.
+        "identified_fast": dict(m=16.01, A11=1.60, A22=14.0, Izz=13.04, Xuu=6.26, Yvv=108.0,
+                                Nr=4.96, Nur=2.18, kappa=0.793, kp=1.68),
+    }
+
+    def __init__(self, x=0.0, y=0.0, psi=0.0, variant="identified"):
+        super().__init__(x, y, psi)
+        self.p = self.VARIANTS[variant]
+
+    def step(self, thrust, dt, substeps=10):
+        p = self.p
+        m11, m22 = p["m"] + p["A11"], p["m"] + p["A22"]
+        h = dt / substeps
+        for _ in range(substeps):
+            x, y, psi, u, v, r = self.s
+            fr = p["kappa"] * (float(thrust[0]) - p["kp"] * math.sqrt(abs(float(thrust[0]))) * u)
+            fl = p["kappa"] * (float(thrust[1]) - p["kp"] * math.sqrt(abs(float(thrust[1]))) * u)
+            du = ((p["m"] - p["A22"]) * v * r + fr + fl - p["Xuu"] * u * abs(u)) / m11
+            dv = (-(p["m"] - p["A11"]) * u * r - p["Yvv"] * v * abs(v)) / m22
+            dr = ((p["A22"] - p["A11"]) * u * v + self.ARM * (fr - fl)
+                  - p["Nr"] * r - p["Nur"] * abs(u) * r) / p["Izz"]
+            u, v, r = u + h * du, v + h * dv, r + h * dr
+            x += h * (u * math.cos(psi) - v * math.sin(psi))
+            y += h * (u * math.sin(psi) + v * math.cos(psi))
+            psi = math.atan2(math.sin(psi + h * r), math.cos(psi + h * r))
+            self.s = [x, y, psi, u, v, r]
+
+
 class Recorder:
     def __init__(self):
         self.msgs = []
@@ -240,12 +294,27 @@ def run_one(src_root, scenario, controller, real, out_path, time_source=None):
         args += ["-p", "use_pinger:=true"]
     if time_source == "ros":
         args += ["-p", "time_source:=ros"]
+    # Extra parameter overrides (`--param k:=v`, or MC_HARNESS_PARAMS="k:=v;k:=v"):
+    # the field-equivalent profile, per-run gains. A parameter the node does not
+    # declare is ignored by ROS, so the same list can be given to an older tree.
+    for override in [o for o in os.environ.get("MC_HARNESS_PARAMS", "").split(";") if o]:
+        if real and override.startswith("gain_profile:="):
+            continue        # the real-parameter runs ARE the real column; 'sim' is refused there
+        args += ["-p", override]
     rclpy.init(args=args)
 
     pg_ns = _load(src, os.path.join("_custom_libraries", "path_generation.py"), "pg")
     server = pg_ns["PathGeneration"]()
 
     mc_ns = _load(src, "master_control.py", "mc")
+    if os.environ.get("MC_HARNESS_NO_REBRANCH") and hasattr(mc_ns["ur_mpc"].MPCController, "rebranch_iterate"):
+        # test_yaw_wrap.py: the solver as it was before the +-180 deg fix
+        # "1" = both off; "rebranch" / "seed" = that one only
+        which = os.environ["MC_HARNESS_NO_REBRANCH"]
+        if which in ("1", "rebranch"):
+            mc_ns["ur_mpc"].MPCController.rebranch_iterate = False
+        if which in ("1", "seed"):
+            mc_ns["ur_mpc"].MPCController.seed_cold_iterate = False
     clock = FakeTimeNs() if time_source else FakeTime()
     mc_ns["time"] = clock
 
@@ -264,7 +333,11 @@ def run_one(src_root, scenario, controller, real, out_path, time_source=None):
         if hasattr(node, attr):
             setattr(node, attr, Recorder())
 
-    plant = Plant(*sc.get("start", (0.0, 0.0, 0.0)))
+    variant = os.environ.get("MC_HARNESS_PLANT", "")
+    if variant:
+        plant = IdentifiedPlant(*sc.get("start", (0.0, 0.0, 0.0)), variant=variant)
+    else:
+        plant = Plant(*sc.get("start", (0.0, 0.0, 0.0)))
     dt = node.dt
     trace = {"thrust": [], "monitoring": [], "tau": [], "answers": [], "events": [],
              "tick_cost_ms": [], "progress": [], "controller_target": []}
@@ -423,6 +496,25 @@ SCENARIOS["pinger"] = dict(use_pinger=True, ticks=1200, controllers=("PID", "LoS
 
 REGRESSION = ("circle", "kin_square", "fsin", "manual", "arrow", "session", "pinger")
 
+# One-off offline run of any route file: MC_HARNESS_ROUTE=<yaml>[:ticks[:x,y,psi]]
+# registers the scenario "route" (used for the hull-interval mission durations).
+if os.environ.get("MC_HARNESS_ROUTE"):
+    _r = os.environ["MC_HARNESS_ROUTE"].split(":")
+    SCENARIOS["route"] = dict(trajectory="from_yaml:" + _r[0],
+                              ticks=int(_r[1]) if len(_r) > 1 else 6000,
+                              start=tuple(float(v) for v in _r[2].split(",")) if len(_r) > 2 else (0.0, 0.0, 0.0),
+                              actions=_actions((0, _ready)))
+
+# Heading at +-180 deg (test_yaw_wrap.py; fixtures written by that test). Each
+# west-going scenario has a twin rotated by pi that never comes near +-pi; the
+# closed loop is rotation-equivariant, so the two thrust traces must agree.
+_FIX = os.path.join(HERE, "fixtures")
+for _name, _start in (("west_line", (0.0, 0.5, math.pi - 0.2)), ("east_line", (0.0, -0.5, -0.2)),
+                      ("west_weave", (0.0, 0.0, math.pi)), ("east_weave", (0.0, 0.0, 0.0))):
+    SCENARIOS["yaw_" + _name] = dict(
+        trajectory="from_yaml:" + os.path.join(_FIX, "yaw_wrap_%s.yaml" % _name),
+        ticks=1200, start=_start, actions=_actions((0, _ready)))
+
 try:                                    # the live-path-update scenarios
     sys.path.insert(0, HERE)
     import mc_replanner_scenarios as _rs
@@ -484,10 +576,22 @@ def compare(rev, controllers, scenarios, real_too, time_sources=None):
         rows.append((scenario + (" (real params)" if real else ""), controller,
                      len(a["thrust"]), moving, same_thr, same_mon, same_tau, max_thr,
                      max(b["tick_cost_ms"]) - max(a["tick_cost_ms"])))
+        note = ""
+        if not ok:
+            # Where a run stops being identical, and whether the measured yaw
+            # had wrapped across +-180 deg by then (the 2026-11-13 MPC fix
+            # changes a run from its first crossing, or from a run start away
+            # from the zero state, and nowhere else).
+            first = next((k for k in range(min(len(a["thrust"]), len(b["thrust"])))
+                          if a["thrust"][k] != b["thrust"][k] or a["monitoring"][k] != b["monitoring"][k]), None)
+            psi = [m[3] if m else None for m in a["monitoring"]]
+            wrap = next((k for k in range(1, len(psi)) if psi[k] is not None and psi[k - 1] is not None
+                         and abs(psi[k] - psi[k - 1]) > math.pi), None)
+            note = f"  first-differing-tick={first}  first-yaw-wrap-tick={wrap}"
         print(f"{rows[-1][0]:<26} {controller:<4} ticks={len(a['thrust']):5d} "
               f"non-zero-thrust={moving:5d}  thrust={'==' if same_thr else '!='}  "
               f"monitoring={'==' if same_mon else '!='}  tau={'==' if same_tau else '!='}  "
-              f"max|dthrust|={max_thr:.3g}", flush=True)
+              f"max|dthrust|={max_thr:.3g}{note}", flush=True)
     what = (f"{rev} vs working tree" if time_sources is None
             else " vs ".join(f"time_source {ts}" for ts in time_sources))
     print(f"\n{len(rows) - failed}/{len(rows)} scenario runs bit-identical ({what})")
@@ -510,7 +614,18 @@ def main():
     ap.add_argument("--time-source", choices=("ros",),
                     help="clock equivalence: the working tree with time_source wall vs ros")
     ap.add_argument("--one-time-source", help=argparse.SUPPRESS)
+    ap.add_argument("--param", action="append", default=[], metavar="K:=V",
+                    help="extra master_control parameter for every run (repeatable), "
+                         "e.g. --param gain_profile:=sim")
+    ap.add_argument("--plant", choices=tuple(IdentifiedPlant.VARIANTS), default=None,
+                    help="offline plant for --one / --replanner runs (default: the legacy "
+                         "BlueROV2 plant, the only one --compare uses)")
     args = ap.parse_args()
+    if args.plant and not args.compare:
+        os.environ["MC_HARNESS_PLANT"] = args.plant
+    if args.param:
+        os.environ["MC_HARNESS_PARAMS"] = ";".join(
+            [o for o in os.environ.get("MC_HARNESS_PARAMS", "").split(";") if o] + args.param)
     if args.one:
         run_one(args.src_root, args.scenario, args.controller, args.real, args.out,
                 args.one_time_source)

@@ -13,6 +13,13 @@ sl.declare_arg('thr','thrusters_ur')
 # force-free description, no odometry bridge (bag_replay publishes
 # /blueboat/odom from the recording) and no thruster bridges.
 sl.declare_arg('replay', False)
+# Hull and actuator model of the description (2026-11-13): identified (the BlueBoat plant
+# identified on field logs, default) | bluerov2_legacy (every simulation before that date).
+sl.declare_arg('plant', 'identified')
+# Where Gazebo's odometry goes (2026-11-13). True (default): the raw topic <ns>/odom_gz, and
+# blueboat_control's simulation_interface republishes <ns>/odom at the field rate and delay
+# (or unchanged, its odom_profile:=passthrough). False: straight to <ns>/odom, the graph of before.
+sl.declare_arg('odom_raw', True)
 
 sl.declare_gazebo_axes(x=0., y=0., z=-0.15, roll=0.,pitch=0., yaw=0.)
 
@@ -21,6 +28,7 @@ def launch_setup():
     ns = sl.arg('namespace')
     thr = sl.arg('thr')
     replay = sl.arg('replay')
+    odom_topic = 'odom_gz' if sl.arg('odom_raw') else 'odom'
 
     if sl.arg('gazebo_world_name') != 'none':
         GazeboBridge.set_world_name(sl.arg('gazebo_world_name'))
@@ -28,7 +36,7 @@ def launch_setup():
     # robot state publisher
     sl.include('blueboat_description', 'state_publisher_launch.py',
                launch_arguments={'namespace': ns, 'use_sim_time': sl.sim_time, 'jsp': False,
-                                 'thr': thr, 'replay': replay})
+                                 'thr': thr, 'replay': replay, 'plant': sl.arg('plant')})
                
     with sl.group(ns=ns):
                     
@@ -49,7 +57,7 @@ def launch_setup():
             sl.node('pose_to_tf',parameters={'child_frame': ns + '/base_link'})
         elif sl.arg('ground_truth'):
             bridges.append(GazeboBridge(f'/model/{ns}/odometry',
-                                     'odom', 'nav_msgs/Odometry', GazeboBridge.gz2ros,
+                                     odom_topic, 'nav_msgs/Odometry', GazeboBridge.gz2ros,
                                      'gz.msgs.Odometry'))
             sl.node('pose_to_tf',parameters={'child_frame': ns + '/base_link'})
         else:

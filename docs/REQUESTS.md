@@ -130,3 +130,103 @@ plan, e.g. `/blueboat/path_update/plan`. Ask, and it will be a small additive ch
 Since 2026-11-12, in a replanner-owned run, BlueBoat-Replanner publishes `/replanner/plan`
 (latched `nav_msgs/Path`, frame `world`): its mirror of the path Control holds, republished on
 every accepted change. Display only; Control's own topic would still be the authority.
+
+---
+
+# Requests to other modules — identified plant and field-equivalent simulation (2026-11-13)
+
+Session 04 of the simulator completion round changed BlueBoat-Control only. Evidence:
+`~/ros2_ws/sim_runs/sim_acceptance/04_control/` (`handoff_04.md`); numbers:
+[PARAMETER_REGISTER.md](PARAMETER_REGISTER.md).
+
+## R-6 BlueBoat-SSS-Sim — `full_mission_launch.py`: forward the simulation configuration
+
+**File.** `blueboat_sss_sim/launch/full_mission_launch.py` (it builds Control's stack itself).
+
+**Today.** It includes `upload_rov_launch.py` with `{sliders, thr}` and starts
+`simulation_interface` and `master_control` with fixed parameter lists. Every piece therefore
+takes its new default: identified plant, raw odometry bridge, real-boat column, 20 Hz thrust,
+`field_13hz` odometry. That is the field-equivalent configuration, coherent, with nothing to
+change. What cannot be had from that launch is the **legacy** configuration.
+
+**Change.** Declare `sim_config` (`field_equivalent` | `legacy`) and pass, for `legacy`:
+`plant:=bluerov2_legacy` and `odom_raw:=false` to `upload_rov_launch.py`;
+`thrust_rate_hz: 10.0`, `odom_profile: passthrough` to `simulation_interface`;
+`gain_profile: sim` to `master_control`. Optionally `tuning_file`, `odom_profile`,
+`odom_seed` as `Sim_launch.py` does (`SIM_CONFIGS` there is the reference).
+
+**Reason.** Reproducing a pre-2026-11-13 world run; re-flying a field run with that day's gains.
+
+## R-7 BlueBoat-SSS-Sim — pose fallbacks now see field-rate odometry
+
+**Files.** `ros/sea_state_node.py`, `ros/sss_sim_node.py` (parameter `odom_topic`, default
+`/blueboat/odom`), `ros/mavros_shim_node.py`.
+
+**What changed.** In the field-equivalent configuration `/blueboat/odom` is no longer Gazebo's
+clean 20 Hz: it arrives as on the boat (4 Hz stretches, 25 Hz bursts, a few ms to 160 ms late).
+Gazebo's own odometry is on the new sim-only topic **`/blueboat/odom_gz`** (same type, 20 Hz).
+
+**Change.** Where a node needs the boat's true pose rather than what the boat's software sees
+(the sea-state wrench and the sonar renderer when `/sim/sea_state/boat_pose` is stale), point
+its `odom_topic` at `/blueboat/odom_gz`. The MAVROS shim should stay on `/blueboat/odom`: the
+real `/mavros/*` stream is what `/blueboat/odom` is made from.
+
+**Reason.** The simulator's own note: a stale pose fed to the hydrostatic wrench pumps heave.
+
+## R-8 BlueBoat-SSS-Sim — heave / roll / pitch entries and the mirrored hull numbers
+
+**Files.** `config/sea_states.yaml` (`hull:`), `sea/motion.py` (`URDF_*`, `PLUGIN_*`),
+`docs/sea_state_model.md`.
+
+1. The identified plant keeps `zDotW`, `kDotP`, `mDotQ`, `zW`, `kP`, `mQ`, `zWabsW`, `kPabsP`,
+   `mQabsQ` at the BlueROV2 values **only because** `hull.damping` is sized as their complement
+   and `sea/motion.py` mirrors them. They are another vehicle's numbers (acceptance test I4).
+   Once the simulator owns the whole vertical model, tell Control which values to carry (zero is
+   the natural choice) and they will be changed in `hydrodynamics_identified.xacro` together.
+2. **Yaw inertia of the link changed**: `iyy` (the link's yaw axis, the inertial frame being
+   rolled by π/2) is 7.50 kg·m² in the identified plant, 3.9235025 in the legacy one. The
+   first `<inertial>` block of `blueboat.xacro` is still the legacy literal, so smoke test
+   `[10]` passes unchanged; `URDF_LINK_INERTIA` in `sea/motion.py` describes the legacy plant.
+3. **Mass.** 16.01 kg stays (the box buoyancy is subtracted with it). The vendor's figures
+   put a survey-ready boat at 17.5 kg (two battery packs, two sonar heads) to 19.8 kg (four
+   packs) before mounts and cables. It will not be weighed (R-10): 16.01 kg stays, 16–20 kg is
+   the bracket.
+4. **Demihull spacing.** The vendor CAD gives keels 583 mm apart (±10 mm, measured on the mesh);
+   the simulator's catamaran hydrostatics use 0.76 m. To check on the boat.
+5. **Plugin sign.** gz-sim 8.15's hydrodynamics plugin applies the added-mass Coriolis terms
+   with the opposite sign to Fossen's `C_A` in every plane (`HydrodynamicsUtils.hh`,
+   `buildCoriolisMatrix`, applied as `+Cmat·ν`). In the horizontal plane Control fitted its yaw
+   damping on the plant as integrated, so the response is the identified one. In the vertical
+   plane the same terms act on the simulator's heave / pitch (`zDotW` 14.57 kg × surge speed).
+
+## R-9 Session 03 (sea state) — what is left to the disturbance
+
+- The plant carries **no** right/left thrust asymmetry: not identifiable in the pool
+  (−0.24 … +0.07 by model form). Every 2026-09-07 FIT run needed +2.2 to +3.8 N more on the
+  right, in wind. A refit on them gives an asymmetry of −0.19 … −0.68 or, as well, a constant
+  yaw torque of −0.13 … −0.31 N·m (physical units, right-turning). That bias belongs to the
+  field-matched disturbance. Knobs on Control's side: the two `thrust_gain_*` tags, or the
+  `thrust_gain` parameter of `simulation_interface`.
+- The pool surge model over-predicts the 2026-09-07 mean speeds by 3–14 % (PID, MPC) and
+  24–41 % (LoS, 3–4 N of total thrust) without wind; a constant world force of 1–3 N towards
+  S/SW brings all six to 0.08–0.12 m/s rms.
+- κ (0.493, bracket 0.45–0.85) sets how hard a wave or current force moves the boat for a given
+  response to thrust. If the roll / yaw disturbance fit wants a different κ, it is a legitimate
+  free parameter of that fit: change both `thrust_gain_*` tags and scale `xUabsU`, `nR`,
+  `nRabsU`, `iyy + nDotR`, `xDotU + m` by the same factor (the response to commands is then
+  unchanged).
+
+## R-10 No further field measurement is planned (owner, 2026-11-14)
+
+The boat will not be weighed and no new run will be recorded. What the logs could not fix therefore stays
+a **bracket**, to be varied in the sensitivity study rather than closed:
+
+| Quantity | Carried value | Bracket | Knob |
+|---|---|---|---|
+| κ, commanded → applied Newton (rests on the mass) | 0.493 | 0.45 – 0.85 | `thrust_gain_*` tags, coefficients scaled with it (R-9) |
+| Right/left thrust asymmetry `a` | 0 | −0.25 … +0.10 | `thrust_gain` |
+| Sway added mass / drag | 14 kg / 108 N·s²/m² | 8 – 30 / 54 – 240 | `yDotV`, `yVabsV` (then refit `nR`, `nRabsU`: `ident/yaw_fit5.py`) |
+| Mass | 16.01 kg | 16 – 20 kg | not to be changed alone (the simulator mirrors it) |
+| Constant odometry delay | 0 s | 0 – 0.10 s | `odom_base_delay` |
+
+None of them moves the response to commanded thrust, which is what was identified.

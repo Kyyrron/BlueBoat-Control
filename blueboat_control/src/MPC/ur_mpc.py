@@ -194,7 +194,14 @@ def export_underwater_model(
     return model
 
 class MPCController:
-    def __init__(self, robot_mass=10, 
+    # Heading handling of the warm start (`_align_iterate`): the +-180 deg
+    # branch correction and the cold-start seed. Class attributes, not
+    # parameters: False reproduces the pre-2026-11-13 solver for the
+    # regression test that shows each fault.
+    rebranch_iterate = True
+    seed_cold_iterate = True
+
+    def __init__(self, robot_mass=10,
         iz=5, 
         a_u = 0.,
         a_v = 0.,
@@ -261,6 +268,49 @@ class MPCController:
         for i in range(self.N):
             self.solver.set(i, 'yref', np.concatenate((x_refs[i], u_refs[i])))
         self.solver.set(self.N, 'yref', np.array(x_refs[-1]))
+
+    def _align_iterate(self, x_current):
+        """Put the stored iterate where one SQP_RTI step from it makes sense.
+
+        SQP_RTI takes ONE Newton step per call, linearised about the stored
+        iterate of stages 1..N. Two situations leave that iterate a half turn
+        or a whole turn away from the boat's heading (both 2026-11-13):
+
+        1. Cold iterate (fresh solver, or `solver.reset()` at a run start):
+           every stage is exactly zero, so the first step was linearised about
+           heading 0 wherever the boat pointed - half a turn off for a start
+           heading west. The stages are seeded at the measured state with zero
+           input, as the failure path already does. A boat at the zero state
+           is left alone (seeding it would write the same zeros).
+
+        2. The measured yaw is wrapped to (-pi, pi]; `solve` shifts the
+           heading reference onto its branch and stage 0 is pinned to it. When
+           the boat crosses +-180 deg the previous solution stays a whole turn
+           away. psi itself is linear in the dynamics, but the step is
+           linearised about the old iterate, so the 2*pi correction is
+           multiplied by d(x, y)/d(psi): a fictitious lateral displacement the
+           QP answers with full differential thrust for one tick (measured:
+           +-40 N at every crossing). The iterate is moved by the same turns.
+
+        Nothing is written otherwise, so a run that starts at the zero state
+        and never crosses +-180 deg is bit-identical to the solver before.
+        """
+        x1 = np.array(self.solver.get(1, 'x'))
+        if (self.seed_cold_iterate and not x1.any()
+                and not np.any(self.solver.get(self.N, 'x'))
+                and not np.any(self.solver.get(0, 'u'))):
+            if np.any(x_current):
+                self._seed_all_stages(x_current)
+            return 0
+        turns = round((float(x_current[2]) - float(x1[2])) / (2.0 * math.pi))
+        if turns == 0 or not self.rebranch_iterate:
+            return 0
+        shift = 2.0 * math.pi * turns
+        for i in range(1, self.N + 1):
+            x = np.array(self.solver.get(i, 'x'))
+            x[2] += shift
+            self.solver.set(i, 'x', x)
+        return turns
 
     def _seed_all_stages(self, x_current):
         """Cold, feasible seed after a reset: hold the measured state, zero input."""
@@ -374,6 +424,7 @@ class MPCController:
 
         x_refs = np.array(x_refs)  # shape (N+1, nx)
 
+        self._align_iterate(x_current)
         self._apply_reference(x_refs, x_current)
         status = self.solver.solve()
         self.last_solve_time = self._stat('time_tot') or 0.0

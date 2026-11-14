@@ -10,7 +10,42 @@ The URDF/xacro model, meshes, Gazebo world, and the spawn/bridge launch chain
 `ros_gz_sim create … -Y <yaw>`; its old `spawn_pose` argument was dead (never read
 downstream) and is removed.
 
-Hull: `mass = 16.01` kg (`blueboat.xacro:18`), `izz = 5.6403125` (`blueboat.xacro:42`).
+**Two plants (2026-11-13), xacro argument `plant`**, threaded `world_launch.py` →
+`upload_rov_launch.py` → `state_publisher_launch.py` like `replay`:
+
+- `identified` (**default**) — `urdf/hydrodynamics_identified.xacro`: surge and yaw identified
+  on field logs, sway derived from the hull geometry, heave / roll / pitch entries kept from the
+  legacy table because the simulator's hull wrench is sized on them. It also states the
+  **actuator model** (`thrust_gain_right/left`, `prop_speed_loss`) inside the plugin element:
+  Gazebo ignores those tags, `blueboat_control`'s `simulation_interface` reads them from
+  `robot_description` and applies them to every command. The link's yaw inertia is the second
+  `<inertial>` block of `blueboat.xacro`.
+- `bluerov2_legacy` — `urdf/hydrodynamics.xacro` and the first `<inertial>` block: the
+  description of before, identical apart from xacro's banner line (checked on its three
+  variants). A `replay:=true` description carries no plant and is the same for both.
+
+Numbers, origins and intervals: `docs/PARAMETER_REGISTER.md`. Three things to know before
+touching either file:
+
+1. **The inertial frame is rolled by π/2** (`rpy="${pi/2} 0 0"`), so the link's **yaw** inertia
+   is the attribute `iyy`, and `izz` (5.64) is **pitch**. The simulator's smoke test reads the
+   **first** `<inertial>` block's literals: keep that block first and literal.
+2. **Gazebo rejects a link whose inertia breaks `iyy ≤ ixx + izz`** ("invalid inertia", the boat
+   then simply does not spawn). The identified total yaw inertia (9.48 kg·m²) is therefore
+   split: 7.50 rigid + 1.98 as `nDotR`.
+3. **gz-sim 8.15's hydrodynamics plugin applies the added-mass Coriolis terms with the opposite
+   sign to Fossen's** (`buildCoriolisMatrix`, applied as `+Cmat·ν`): the sway–yaw coupling
+   restores instead of destabilising. `nR` / `nRabsU` were fitted on the plant as integrated;
+   changing `yDotV`, `yVabsV`, the plugin version or `<disable_coriolis>` needs a refit. The
+   plugin accepts cross terms (`nRabsU` = yaw damping per m/s of surge).
+
+`upload_rov_launch.py odom_raw` (default True) bridges Gazebo's odometry to `<ns>/odom_gz`
+instead of `<ns>/odom`; `simulation_interface` republishes `/blueboat/odom` from it. False
+restores the direct bridge.
+
+Hull (legacy block): `mass = 16.01` kg (`blueboat.xacro:36`), `iyy = 3.9235025` — the yaw
+value Gazebo integrates — and `izz = 5.6403125` (`blueboat.xacro:61`), which is pitch and which
+the lines below (written before the frame was noticed) call the yaw inertia.
 `master_control` hands the MPC `robot_mass = 16.01` and `iz = 5.64` — the mass agrees exactly,
 the yaw inertia is the URDF value rounded (0.006 % low). `hydrodynamics.xacro` carries the
 BlueROV2 table (`xDotU -5.5`, `xU -25.15`, plus quadratic damping). `master_control`'s

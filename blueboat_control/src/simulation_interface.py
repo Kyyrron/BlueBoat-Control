@@ -8,10 +8,19 @@
 # only), MAVROS / the enable_motors gate / the parameter mode (a command always
 # reaches Gazebo), and the IMU (attitude and rates come from /blueboat/odom).
 #
+# Since 2026-11-13 it also carries the two things the real boat has between
+# master_control and the water that Gazebo did not: the ACTUATOR MODEL of the
+# identified plant (what a commanded Newton becomes at the propeller; read from
+# the robot description, absent in the legacy plant) and the FIELD ODOMETRY
+# TIMING (Gazebo's 20 Hz odometry republished on /blueboat/odom at the field
+# rate and delay, as robot_interface republishes MAVROS odometry).
+#
 # FILE MAP (class Controller):
 #   1. WIRING            __init__
-#   2. MAIN LOOP         thr_input_callback, thruster_input_stale, move
-#   3. STATE/TELEMETRY   odom_callback, gps_callback, monitoring_data_callback
+#   2. MAIN LOOP         thr_input_callback, thruster_input_stale, move,
+#                        description_callback, applied_thrust
+#   3. STATE/TELEMETRY   raw_odom_callback, release_odom, odom_callback,
+#                        gps_callback, monitoring_data_callback
 #   4. CSV LOGGING       actuation_state, write_origin_sidecar, build_log_row,
 #                        to_gps, log_timer_callback, path_event_callback
 #   5. SHUTDOWN          shutdown
@@ -22,9 +31,12 @@ from rclpy.executors import ExternalShutdownException
 import rclpy
 
 import json
+import math
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
+from collections import deque
 from datetime import datetime
 import numpy as np
 
@@ -38,6 +50,7 @@ import custom_functions as cf
 import robot_log_schema as rls   # CSV column layout (ROS-free)
 import thrust_limits as tl       # uniform thrust saturation (ROS-free)
 import path_update_log as pul    # the run's -pathlog.csv (ROS-free)
+import odom_emulation as oe      # field odometry timing (ROS-free)
 
 
 class Controller(Node):
@@ -78,12 +91,72 @@ class Controller(Node):
         self.data_root = cf.data_root(
             self.get_parameter('data_dir').get_parameter_value().string_value)
 
+        # ---- field-equivalent loop timing and actuator model (2026-11-13) ----
+        # All additive. The values that reproduce the simulation before that
+        # date are thrust_rate_hz 10, odom_profile passthrough (with the Gazebo bridge
+        # on /blueboat/odom) and the legacy plant, whose description carries no
+        # actuator model: Sim_launch.py sim_config:=legacy sets them together.
+        #
+        # Rate at which the latest /thruster_input is applied to the
+        # thrusters. robot_interface streams RC override at 20 Hz.
+        self.declare_parameter('thrust_rate_hz', 20.0)
+        self.thrust_rate_hz = self.get_parameter('thrust_rate_hz').get_parameter_value().double_value
+        if not self.thrust_rate_hz > 0.0:
+            raise ValueError(f"thrust_rate_hz must be positive, got {self.thrust_rate_hz}")
+        # Odometry timing applied when Gazebo's odometry arrives on the raw
+        # topic /blueboat/odom_gz (upload_rov_launch.py odom_raw:=true):
+        # passthrough (forwarded as is) | field_3hz | field_4hz | field_13hz
+        # (odom_emulation.py: where each comes from).
+        self.declare_parameter('odom_profile', 'field_13hz')
+        self.odom_profile = self.get_parameter('odom_profile').get_parameter_value().string_value
+        if self.odom_profile not in oe.profile_names():
+            raise ValueError(f"unknown odom_profile '{self.odom_profile}' "
+                             f"({' | '.join(oe.profile_names())})")
+        self.declare_parameter('odom_seed', 0)
+        self.declare_parameter('odom_base_delay', 0.0)
+        self.odom_emulator = None
+        if self.odom_profile != oe.OFF:
+            self.odom_emulator = oe.OdomEmulator(
+                self.odom_profile,
+                self.get_parameter('odom_seed').get_parameter_value().integer_value,
+                self.get_parameter('odom_base_delay').get_parameter_value().double_value)
+        # Actuator model: applied = gain_side * (T - prop_speed_loss * sqrt|T| * surge).
+        # Negative values (the defaults) mean "what the robot description
+        # says" - the identified plant states its own, the legacy plant none
+        # (gain 1, no loss: a commanded Newton is an applied Newton).
+        self.declare_parameter('thrust_gain', [-1.0, -1.0])        # [right, left]
+        self.declare_parameter('prop_speed_loss', -1.0)            # sqrt(N).s/m per thruster
+        self.declare_parameter('esc_deadband', 0.0)                # N, |command| below it gives no thrust
+        self.declare_parameter('thrust_lag_tau', 0.0)              # s, first-order spin-up lag
+        self.thrust_gain_param = list(self.get_parameter('thrust_gain').get_parameter_value().double_array_value)
+        if len(self.thrust_gain_param) != 2:
+            raise ValueError("thrust_gain expects [right, left]")
+        self.prop_speed_loss_param = self.get_parameter('prop_speed_loss').get_parameter_value().double_value
+        self.esc_deadband = self.get_parameter('esc_deadband').get_parameter_value().double_value
+        self.thrust_lag_tau = self.get_parameter('thrust_lag_tau').get_parameter_value().double_value
+        self.actuator = None              # (gain_right, gain_left, speed_loss), set by the description
+        self.actuator_identity = True     # nothing to apply: the legacy path, untouched
+        self.lag_state = [0.0, 0.0]
+        self.true_surge = 0.0             # body surge speed the propellers see [m/s]
+
         # No Water Linked UGPS in simulation: fixed, not a parameter.
         self.use_UWgps = False
 
         self.rov = ROV(self, thrust_visual = True)
+        self.description_sub = self.create_subscription(
+            String, 'robot_description', self.description_callback,
+            QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL))
 
         self.odom_sim_subscriber = self.create_subscription(Odometry, '/blueboat/odom', self.odom_callback, 10)
+        # Raw Gazebo odometry, when the bridge is retargeted to it. The
+        # /blueboat/odom publisher is created at the first raw message, so a
+        # launch that keeps the bridge on /blueboat/odom is untouched.
+        self.raw_odom_seen = False
+        self.odom_relay_refused = False
+        self.odom_publisher = None
+        self.odom_queue = deque()         # (release time on the node clock, message)
+        self.raw_odom_sub = self.create_subscription(Odometry, '/blueboat/odom_gz', self.raw_odom_callback, 50)
+        self.odom_release_timer = self.create_timer(0.005, self.release_odom)
         self.thruster_input_sub = self.create_subscription(Float32MultiArray, "/thruster_input", self.thr_input_callback,10)
 
         # Logging inputs. The NavSatFix (BEST_EFFORT like every consumer)
@@ -103,7 +176,7 @@ class Controller(Node):
         self.ready_publisher = self.create_publisher(Bool, '/blueboat/controller_ready', latched)
         self.data_publisher = self.create_publisher(Float32MultiArray, "/monitoring_data", 10)
 
-        self.timer = self.create_timer(0.1, self.move)
+        self.timer = self.create_timer(1.0 / self.thrust_rate_hz, self.move)
         self.log_timer = self.create_timer(0.33, self.log_timer_callback)
 
         self.thr_input = [0,0]
@@ -180,8 +253,64 @@ class Controller(Node):
             return True
         return (now - self.last_thr_rx) > self.thruster_input_timeout
 
+    def description_callback(self, msg: String):
+        """The actuator model the robot description states for its plant.
+
+        hydrodynamics_identified.xacro carries <thrust_gain_right>,
+        <thrust_gain_left> and <prop_speed_loss> inside its Hydrodynamics
+        plugin element (Gazebo ignores them); the legacy description has none.
+        A non-negative parameter overrides the description.
+        """
+        if self.actuator is not None:
+            return
+        found = {}
+        try:
+            for plugin in ET.fromstring(msg.data).iter('plugin'):
+                if 'Hydrodynamics' in (plugin.get('name') or ''):
+                    for tag in ('thrust_gain_right', 'thrust_gain_left', 'prop_speed_loss', 'plant_name'):
+                        node = plugin.find(tag)
+                        if node is not None and node.text:
+                            found[tag] = node.text.strip()
+        except ET.ParseError as exc:
+            self.get_logger().error(f"robot_description unreadable ({exc}): no actuator model applied.")
+        gain = [float(found.get('thrust_gain_right', 1.0)), float(found.get('thrust_gain_left', 1.0))]
+        loss = float(found.get('prop_speed_loss', 0.0))
+        for i in range(2):
+            if self.thrust_gain_param[i] >= 0.0:
+                gain[i] = self.thrust_gain_param[i]
+        if self.prop_speed_loss_param >= 0.0:
+            loss = self.prop_speed_loss_param
+        self.actuator = (gain[0], gain[1], loss)
+        self.actuator_identity = (gain == [1.0, 1.0] and loss == 0.0
+                                  and self.esc_deadband <= 0.0 and self.thrust_lag_tau <= 0.0)
+        self.get_logger().info(
+            f"Plant '{found.get('plant_name', 'bluerov2_legacy (no actuator model)')}': thrust gain "
+            f"[right {gain[0]:.3f}, left {gain[1]:.3f}], propeller speed loss {loss:.2f} sqrt(N).s/m, "
+            f"deadband {self.esc_deadband:.1f} N, lag {self.thrust_lag_tau:.2f} s; "
+            f"thrust applied at {self.thrust_rate_hz:.0f} Hz.")
+
+    def applied_thrust(self, r, l):
+        """What the commanded [right, left] Newtons become at the propellers.
+
+        Per thruster, in this order: ESC deadband, first-order spin-up lag,
+        loss of thrust with the boat's surge speed (a propeller at a given
+        speed of rotation pulls less the faster the water arrives), side gain.
+        The CSV and /monitoring_data keep the COMMAND, as on the real boat.
+        """
+        gain_r, gain_l, loss = self.actuator
+        out = []
+        for i, (cmd, gain) in enumerate(((r, gain_r), (l, gain_l))):
+            if self.esc_deadband > 0.0 and abs(cmd) < self.esc_deadband:
+                cmd = 0.0
+            if self.thrust_lag_tau > 0.0:
+                a = min(1.0, (1.0 / self.thrust_rate_hz) / self.thrust_lag_tau)
+                self.lag_state[i] += a * (cmd - self.lag_state[i])
+                cmd = self.lag_state[i]
+            out.append(gain * (cmd - loss * math.sqrt(abs(cmd)) * self.true_surge))
+        return out[0], out[1]
+
     def move(self):
-        if not self.rov.ready():
+        if not self.rov.ready() or self.actuator is None:
             return
 
         if not self.sent_ready:
@@ -216,17 +345,66 @@ class Controller(Node):
                 throttle_duration_sec=2.0)
 
         r, l = float(limited[0]), float(limited[1])
+        if not self.actuator_identity:
+            r, l = self.applied_thrust(r, l)
         self.rov.move([r,l])
 
     # ======================================================================
     #  3. STATE / TELEMETRY -- nothing here commands anything
     # ======================================================================
 
+    def raw_odom_callback(self, msg: Odometry):
+        """Gazebo's own odometry (/blueboat/odom_gz) -> /blueboat/odom.
+
+        Forwarded as is with odom_profile 'passthrough', else thinned and delayed to
+        the field pattern (odom_emulation.py). The header stamp is kept: it is
+        the time the pose was true, as on the real boat.
+        """
+        self.true_surge = float(msg.twist.twist.linear.x)
+        if self.odom_relay_refused:
+            return
+        if not self.raw_odom_seen:
+            self.raw_odom_seen = True
+            others = self.count_publishers('/blueboat/odom')
+            if others > 0:
+                self.odom_relay_refused = True
+                self.get_logger().error(
+                    f"/blueboat/odom already has {others} publisher(s) while raw odometry arrives on "
+                    "/blueboat/odom_gz: the odometry is NOT relayed (two sources would alternate). "
+                    "Launch with either odom_raw:=true or the bridge on /blueboat/odom, not both.")
+                return
+            self.odom_publisher = self.create_publisher(Odometry, '/blueboat/odom', 10)
+            self.get_logger().info(
+                "Relaying /blueboat/odom_gz -> /blueboat/odom, "
+                + ("unchanged (odom_profile passthrough)." if self.odom_emulator is None
+                   else f"at the field timing '{self.odom_profile}'."))
+        if self.odom_emulator is None:
+            self.odom_publisher.publish(msg)
+            return
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        now = self.get_clock().now().nanoseconds * 1e-9
+        release = self.odom_emulator.offer(stamp)
+        if release is None:
+            return
+        # the delay is counted from the arrival of the raw sample
+        self.odom_queue.append((now + (release - stamp), msg))
+
+    def release_odom(self):
+        """Publish the queued odometry samples whose delay has elapsed."""
+        if not self.odom_queue:
+            return
+        now = self.get_clock().now().nanoseconds * 1e-9
+        while self.odom_queue and self.odom_queue[0][0] <= now:
+            self.odom_publisher.publish(self.odom_queue.popleft()[1])
+
     def odom_callback(self, msg: Odometry):
         pose, twist = cf.odometry(msg)
 
         self.rov.current_pose = pose
         self.rov.current_twist = twist
+        if not self.raw_odom_seen:
+            # bridge on /blueboat/odom: this IS Gazebo's odometry
+            self.true_surge = float(msg.twist.twist.linear.x)
 
         # --- the rest is for the log only (odom is already local ENU) -------
         roll, pitch, yaw = cf.quaternion_to_rpy(msg.pose.pose.orientation)

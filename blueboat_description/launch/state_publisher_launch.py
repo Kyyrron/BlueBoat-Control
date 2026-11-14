@@ -8,6 +8,8 @@ sl.declare_arg('jsp', True)
 sl.declare_arg('rviz', True)
 sl.declare_arg('thr','thrusters_ur')
 sl.declare_arg('replay', False)     # kinematic bag replay description (blueboat.xacro)
+# Hull and actuator model (blueboat.xacro): identified (default) | bluerov2_legacy
+sl.declare_arg('plant', 'identified')
 
 
 def launch_setup():
@@ -18,7 +20,7 @@ def launch_setup():
 
         # xacro parsing + change moving joints to fixed if no Gazebo here
         xacro_args = {'namespace': namespace, 'simulation': sl.sim_time, 'thrusters': sl.arg('thr'),
-                      'replay': sl.arg('replay')}
+                      'replay': sl.arg('replay'), 'plant': sl.arg('plant')}
         sl.robot_state_publisher('blueboat_description', 'blueboat.xacro', xacro_args=xacro_args)
 
         with sl.group(if_arg='jsp'):

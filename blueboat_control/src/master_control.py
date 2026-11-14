@@ -374,6 +374,10 @@ class Controller(Node):
             self.controller = controller
 
         self.get_logger().info('Controller node initiated')
+        self.get_logger().info(
+            "Tuning defaults: %s column (gain_profile '%s', simulation %s); MPC N=%d T=%.1f s R=%.3f." % (
+                'sim-tuned legacy' if self.tuning_sim else 'real-boat', self.gain_profile,
+                self.isSimulation, self.mpc_horizon, self.mpc_time, float(self.R_weight[0, 0])))
 
     # ======================================================================
     #  2. TUNING KNOBS -- every gain, all in one place
@@ -389,6 +393,29 @@ class Controller(Node):
         (ROS 2 has no tuple type). Read once, at construction.
         """
         dbl, integer = self._dbl, self._int
+
+        # -- which column of the split defaults below (additive, 2026-11-13) --
+        # Several defaults exist twice: the REAL BOAT's (gains, MPC model,
+        # horizon and weights as flown) and a set tuned on the old Gazebo
+        # plant (BlueROV2 hull coefficients). `gain_profile`:
+        #   ''  or 'field'  the real boat's column. On the boat this is what
+        #                   always ran. In simulation it is the field-equivalent
+        #                   configuration, meant for the identified plant
+        #                   (blueboat_description plant:=identified).
+        #   'sim'           the sim-tuned column: simulation only, the legacy
+        #                   configuration (with plant:=bluerov2_legacy it
+        #                   reproduces every simulated run made before this date;
+        #                   test/mc_harness.py --compare HEAD --param gain_profile:=sim).
+        # Only these defaults follow it. File names, /pose_arrow and the clock
+        # keep following `simulation`. An explicitly passed parameter wins over
+        # either column, as before.
+        self.gain_profile = self._param('gain_profile', '').string_value
+        if self.gain_profile not in ('', 'field', 'sim'):
+            raise ValueError(f"unknown gain_profile '{self.gain_profile}' ('' | field | sim)")
+        if self.gain_profile == 'sim' and not self.isSimulation:
+            raise ValueError("gain_profile 'sim' is the legacy SIMULATION tuning: "
+                             "refused with simulation:=false (the real boat keeps its own column).")
+        self.tuning_sim = self.gain_profile == 'sim'
 
         def arr(name, default):
             value = list(self._param(name, [float(v) for v in default]).double_array_value)
@@ -411,7 +438,7 @@ class Controller(Node):
         self.gov_Emax = dbl('gov_Emax', 0.0)
 
         # -- PID (split simulation/real) -------------------------------------
-        if not self.isSimulation:
+        if not self.tuning_sim:
             self.outer_gains = {'x':   tuple(arr('outer_gains_x',   [3.5, 0.01, 0.0])),
                                 'psi': tuple(arr('outer_gains_psi', [3.3, 0.01, 0.0]))}
             self.inner_gains = {'u': tuple(arr('inner_gains_u', [1.0, 0.0, 0.0])),
@@ -429,7 +456,7 @@ class Controller(Node):
         self.los_ku          = dbl('los_ku', 30.0)
         self.los_kpsi        = dbl('los_kpsi', 4.5)
         self.los_kd          = dbl('los_kd', 1.0)
-        self.los_speed_scale = dbl('los_speed_scale', 1.0 if not self.isSimulation else 2.0)
+        self.los_speed_scale = dbl('los_speed_scale', 1.0 if not self.tuning_sim else 2.0)
         # Zero-authored-speed hold, shared by PID and LoS: a stationary
         # reference (U_d = 0) blends to steering at the point below hold_speed.
         # Inert on real paths: every library shape runs >= 0.28 m/s, so the
@@ -440,10 +467,10 @@ class Controller(Node):
         self.los_hold_umax   = dbl('los_hold_umax', 0.8)
 
         # -- point following (manual target and pinger; split sim/real) ------
-        self.k_v   = dbl('point_k_v',   2.0  if self.isSimulation else 0.15)
-        self.k_psi = dbl('point_k_psi', 60.0 if self.isSimulation else 100.0)
+        self.k_v   = dbl('point_k_v',   2.0  if self.tuning_sim else 0.15)
+        self.k_psi = dbl('point_k_psi', 60.0 if self.tuning_sim else 100.0)
         # Pinger-branch arrival check only; negative disables it.
-        self.safety_distance = dbl('safety_distance', 1.0 if self.isSimulation else -1.0)
+        self.safety_distance = dbl('safety_distance', 1.0 if self.tuning_sim else -1.0)
 
         # -- manual-target keep-location hold (manual_keep_location) ---------
         # On station inside manual_hold_radius, pursuit again beyond
@@ -453,7 +480,7 @@ class Controller(Node):
         # disables the hold and restores the old arrival latch exactly.
         self.manual_hold_radius      = dbl('manual_hold_radius', 1.0)
         self.manual_reacquire_radius = dbl('manual_reacquire_radius', 1.5)
-        self.manual_hold_kx   = dbl('manual_hold_kx', 15.0 if self.isSimulation else 8.0)
+        self.manual_hold_kx   = dbl('manual_hold_kx', 15.0 if self.tuning_sim else 8.0)
         # Derived by default, so retuning a radius cannot break the handover.
         self.manual_hold_umax = dbl(
             'manual_hold_umax',
@@ -469,7 +496,7 @@ class Controller(Node):
         # linear-only):  d_u = 25.15 + 33.800*0.45 m/s,
         # d_v = 7.364 + 54.269*0.10 m/s,  d_r = 3.744 + 40.000*0.15 rad/s.
         # Refit if the xacro changes or missions cruise far from 0.45 m/s.
-        if not self.isSimulation:
+        if not self.tuning_sim:
             self.mpc_model = {'robot_mass': 16.01,   # blueboat.xacro mass
                               'iz':          5.64,   # blueboat.xacro izz
                               'a_u': -26.77, 'a_v':  -7.55, 'a_r': -21.77,
@@ -487,8 +514,8 @@ class Controller(Node):
         # Horizon: 6.0 s / 30 in simulation (measured: circle offset -1.019 ->
         # -0.011 m); the real boat stays at 2.5 s / 15 until the solve time has
         # been timed in a field run (a longer horizon risks the 50 ms budget).
-        self.mpc_horizon = integer('mpc_horizon', 30 if self.isSimulation else 15)
-        self.mpc_time    = dbl('mpc_time', 6.0 if self.isSimulation else 2.5)
+        self.mpc_horizon = integer('mpc_horizon', 30 if self.tuning_sim else 15)
+        self.mpc_time    = dbl('mpc_time', 6.0 if self.tuning_sim else 2.5)
 
         self.Q_weight = np.diag(arr('mpc_Q_diag', [50.0,   # x
                                                    50.0,   # y
@@ -499,7 +526,7 @@ class Controller(Node):
         # Absolute effort penalty (u_ref = 0, no rate term). At Q_pos = 50 full
         # throttle on both thrusters costs what a position error of 0.49 m
         # (R 0.015) / 1.26 m (R 0.10) does.
-        self.R_weight = np.diag(arr('mpc_R_diag', [0.10, 0.10] if self.isSimulation
+        self.R_weight = np.diag(arr('mpc_R_diag', [0.10, 0.10] if self.tuning_sim
                                                   else [0.015, 0.015]))
 
         # qpOASES working-set budget; 0 = derive max(50, 4*nu*N) in ur_mpc.
@@ -1064,7 +1091,7 @@ class Controller(Node):
         else:
             manual = bool(keep_location)
         if manual:
-            v = 10*np.log(v+1) if not self.isSimulation else 7*np.log(v+1)  # If manual target, go faster. Don't need to be that precise here.
+            v = 10*np.log(v+1) if not self.tuning_sim else 7*np.log(v+1)  # If manual target, go faster. Don't need to be that precise here. (real / sim-tuned column, gain_profile)
 
         # Propeller breakaway floor on the common-mode SURGE only (the yaw
         # differential is untouched): on the real boat 5*ln(k_v*d + 1) stays

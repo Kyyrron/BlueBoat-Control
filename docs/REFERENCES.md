@@ -141,6 +141,52 @@ Data Quality*, OCEANS 2023 (in the provided folder).
 **Status: `[abstract]`.** It is a controller-design paper and says nothing on replacing a path
 in motion.
 
+## Plant identification (2026-11-13)
+
+Sources behind `PARAMETER_REGISTER.md`. Every URL was opened on 2026-11-13; the reading notes, tables and
+what could not be opened are in `~/ros2_ws/sim_runs/sim_acceptance/04_control/inventory/web_sources.md`
+(outside the repository). Marks: **[full]** read in full, **[part]** the named parts, **[abs]** abstract or
+landing page only, **[unread]** found, not opened. Regime of interest: a 16–20 kg twin-hull surface vehicle,
+1.2 m long, at 0.5–1.0 m/s.
+
+### V — Vendor data
+
+| # | Source | URL | Mark | Used for |
+|---|---|---|---|---|
+| V1 | Blue Robotics, BlueBoat product page, "Technical Details" | https://bluerobotics.com/store/boat/blueboat/blueboat/ | [part] | 14.5 kg bare; 15 kg of batteries + payload; 2.4 kg per two battery packs; 2 × M200 motor with weedless propeller on Basic ESC 500; 3 m/s; 8.2 kgf static; ≈ 30 W at 1 m/s |
+| V2 | BlueBoat public drawing BR-101447 Rev A | https://bluerobotics.com/wp-content/uploads/2023/03/BR-101447_RevA_PUBLIC_DRAWING.pdf | [full] | 1195 × 910 mm, hull height 376 mm |
+| V3 | BlueBoat CAD (hull set, full vessel) | https://cad.bluerobotics.com/BLUEBOAT_HULL_SET_BR-101652.zip | geometry measured on the mesh, ±10 mm (not a vendor statement) | demihull 177 × 376 × 1195 mm, keels 583 mm apart, motor axes ≈ 589 mm apart; no mass properties in the files |
+| V4 | M200 + weedless propeller chart data | https://docs.bluerobotics.com/thrusters/m200weedless_force_plot.js | [full] | **the thrust table of `custom_functions.generate_interpolator`**: 32 of 33 values identical, 16 V, bollard |
+| V5 | Weedless propeller product page | https://bluerobotics.com/store/thrusters/t100-t200-thrusters/weedless-propeller-set/ | [part] | 112 mm, 2 blades, pitch 14° at 75 % diameter; 5.63 / 2.81 kgf forward / reverse at 16 V |
+| V6 | T200 public performance data, 10–20 V (2019) | https://cad.bluerobotics.com/T200-Public-Performance-Data-10-20V-September-2019.xlsx | [full] | voltage sensitivity of the same motor (proxy): +18–35 % thrust at fixed PWM from 14 V to 16.8 V; does **not** match the stack's table at any voltage |
+| V7 | Basic ESC (30 A) and Basic ESC 500 pages | https://bluerobotics.com/store/thrusters/speed-controllers/besc30-r3/ , https://bluerobotics.com/store/thrusters/speed-controllers/besc500/ | [part] | deadband ±25 µs stated for the 30 A ESC only |
+| V8 | Blue Robotics Li-ion 4S batteries; Cerulean Omniscan 450 specifications | https://bluerobotics.com/store/comm-control-power/powersupplies-batteries/battery-li-4s-18ah-r3/ , https://docs.ceruleansonar.com/c/omniscan-450/specifications.md | [part] / [full] | 1152 g per pack; 300 g per transducer in air |
+| V9 | gz-sim 8.15.0 hydrodynamics system, source | https://raw.githubusercontent.com/gazebosim/gz-sim/gz-sim8_8.15.0/src/systems/hydrodynamics/HydrodynamicsUtils.hh | [part] `buildCoriolisMatrix`, `buildDampingMatrix` | what the simulated plant integrates (sign of the added-mass coupling, cross terms such as `nRabsU`) |
+
+Transfer: V1–V8 are this boat's own parts. V4 is a bollard figure at one voltage: it transfers to the boat
+under way only through the identified `kp` and κ.
+
+### L — Literature (compared with, never copied from)
+
+| # | Reference | DOI / URL | Mark | Finding and transfer to our regime |
+|---|---|---|---|---|
+| L1 | Sonnenburg & Woolsey, "Modeling, Identification, and Control of an Unmanned Surface Vehicle", J. Field Robotics 30(3), 371–398, 2013 | 10.1002/rob.21452 (resolves) | [abs] | "Nomoto's first‐order steering model provides the best compromise between simplicity and fidelity at higher speeds"; a sideslip lag helps at low speed. Vessel: a 4.8 m rigid-hull inflatable, planing, 22 kn (from the first author's dissertation, [part]). **Structure transfers, numbers do not.** Our yaw is first-order with a gain that falls with speed, in line with a speed-scheduled Nomoto model |
+| L2 | von Benzon et al., "An Open-Source Benchmark Simulator: Control of a BlueROV2 Underwater Robot", J. Mar. Sci. Eng. 10(12), 1898, 2022 | 10.3390/jmse10121898 (resolves) | [part] Table A1, §4.2–4.3 | The legacy plant's source. Table A1 (BlueROV2 **Heavy**): Xu 13.7, Xu\|u\| 141, Xu̇ 6.36 kg … — these are the values *commented out* in `hydrodynamics.xacro`; the active block (xU −25.15, xUabsU −33.8, xDotU −5.5) is not Table A1; where it comes from was not located [UNCERTAIN]. A submerged box-frame ROV: **does not transfer** to a surface catamaran |
+| L3 | Fossen, Handbook of Marine Craft Hydrodynamics and Motion Control, 1st ed. 2011 / 2nd ed. 2021 | 10.1002/9781119994138 , 10.1002/9781119575016 (both resolve) | [unread] | Notation of the plant; the bilinear thruster model (thrust falling with advance speed) that `prop_speed_loss` is a form of — chapter not opened, to be requested |
+| L4 | Fossen, MSS toolbox, `otter.m` (Maritime Robotics Otter USV) | https://github.com/cybergalactic/MSS/blob/master/CRAFT/USV/models/otter.m | [full] | 55 kg, 2.0 × 1.08 m twin hull; time constants set by the author, not identified: surge 5 s, sway 0.5 s, yaw 1 s. Comparable craft, three times heavier: our yaw time constant at rest (1.5 s [1.3, 3.0]) is of the same order; our surge transient (≈ 1.2 s at 1 m/s: 35.7 kg over a local drag slope of 28.7 N·s/m) is faster |
+| L5 | Paine & Benjamin, online estimation of 1-DOF models, eight Clearpath Heron USVs | arXiv 2308.00782 | [abs] | Surge only, mass + linear / quadratic / cross drag; no coefficient table seen. Same structure as our surge model |
+| L6 | Liu et al., "MOSAIC-SV", adaptive identification with field trials on a BlueBoat | arXiv 2610.03898 | [abs] | A BlueBoat study; no coefficient set seen in the abstract |
+| L7 | Lievore, M., Padova master's thesis (the source named in `hydrodynamics.xacro`) | https://thesis.unipd.it/handle/20.500.12608/93733 | [unread] (archive refuses automated access) | Title from search snippets only; whether it holds BlueBoat hull coefficients is unknown |
+
+**No published, experimentally identified surge / sway / yaw model was found for the BlueBoat, the Heron, or
+any catamaran of 10–40 kg.** Nothing in the plant comes from another vehicle; sway is derived from this hull's
+geometry and bracketed.
+
+**Papers to request** (not in `/home/kyyrron/Downloads/research_paper`): L1 full text; L3 chapters 6–7
+(manoeuvring models) and the thruster-model section; L7 (to open in a browser); the dissertation behind L1 if
+low-speed sideslip matters; a US technical report on a Clearpath USV, https://apps.dtic.mil/sti/pdfs/AD1046879.pdf
+([unread], HTTP 403).
+
 ## Project documents
 
 ### P1 — `project_synthesis.md` (superproject)

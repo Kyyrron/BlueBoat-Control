@@ -12,9 +12,21 @@
        the boat - sea state, wind and current cannot move it, and the replay's
        /world/<w>/set_pose calls are clean teleports. -->
   <xacro:arg name="replay" default="false"/>
+  <!-- Hull and actuator model (2026-11-13):
+         identified        the BlueBoat plant identified on field logs (hydrodynamics_identified.xacro) - default
+         bluerov2_legacy   the BlueROV2 table every simulation used before that date (hydrodynamics.xacro);
+                           with it this description is the one of before, element for element.
+       A replay description (replay:=true) carries no plant at all and is the same for both. -->
+  <xacro:arg name="plant" default="identified"/>
   
   <xacro:property name="ns" value="$(arg namespace)"/>
   <xacro:property name="density" value="$(arg density)"/>
+  <xacro:property name="plant" value="$(arg plant)"/>
+  <xacro:property name="replay_description" value="$(arg replay)"/>
+  <xacro:if value="${plant not in ('identified', 'bluerov2_legacy')}">
+    <xacro:element xacro:name="${xacro.fatal('blueboat.xacro: plant must be identified or bluerov2_legacy')}"/>
+  </xacro:if>
+  <xacro:property name="legacy_inertial" value="${plant == 'bluerov2_legacy' or str(replay_description).lower() == 'true'}"/>
 
   <!-- Main body -->    
   <xacro:property name="x_size" value="1.2"/>
@@ -38,6 +50,7 @@
 
   <!-- Vehicle base link -->
     <link name="${ns}/base_link">
+    <xacro:if value="${legacy_inertial}">
     <inertial>
         <mass value="${mass}"/>
         <origin xyz="0 0 ${z_cog}" rpy = "${pi/2} 0 0"/>
@@ -48,6 +61,19 @@
         <inertia ixx="2.42369" ixy="0" ixz="0" iyy="3.9235025" iyz="0" izz="5.6403125"/>
         
     </inertial>
+    </xacro:if>
+    <xacro:unless value="${legacy_inertial}">
+    <!-- Identified plant. The inertial frame is rolled by pi/2, so the link's YAW axis is this block's iyy
+         (roll = ixx, pitch = izz: both unchanged). The identified TOTAL yaw inertia is 9.48 kg.m2 (rigid +
+         added, 95 % [8.11, 10.95]). A rigid tensor must satisfy iyy <= ixx + izz = 8.06 (Gazebo rejects the
+         link otherwise), so 7.50 is carried here and the other 1.98 as added inertia (nDotR) in
+         hydrodynamics_identified.xacro. -->
+    <inertial>
+        <mass value="${mass}"/>
+        <origin xyz="0 0 ${z_cog}" rpy = "${pi/2} 0 0"/>
+        <inertia ixx="2.42369" ixy="0" ixz="0" iyy="7.50" iyz="0" izz="5.6403125"/>
+    </inertial>
+    </xacro:unless>
     <visual>
         <origin xyz="0 -0.01 ${z_cog+0.25}" rpy = "${pi/2} 0 0"/>
         <geometry>
@@ -78,7 +104,12 @@
     </link>
   
 <xacro:unless value="$(arg replay)">
+<xacro:if value="${plant == 'bluerov2_legacy'}">
 <xacro:include filename="hydrodynamics.xacro"/>
+</xacro:if>
+<xacro:unless value="${plant == 'bluerov2_legacy'}">
+<xacro:include filename="hydrodynamics_identified.xacro"/>
+</xacro:unless>
 </xacro:unless>
 <xacro:include filename="$(arg thrusters).xacro"/>
 

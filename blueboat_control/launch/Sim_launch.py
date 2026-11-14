@@ -13,6 +13,26 @@ sl_note = sl.declare_arg('note', default_value = 'sim')                         
 sl_spawn_yaw = sl.declare_arg('spawn_yaw', default_value = 0.)                  # Boat spawn heading, RADIANS ENU (0 = East). Spawn stays at (0,0).
 sl_path_source = sl.declare_arg('path_source', default_value = 'mission')       # 'mission' = follow `trajectory` (today's behaviour). 'replanner' = live path update: hold at the spawn pose until /blueboat/update_path loads the first path (docs/PATH_UPDATE_INTERFACE.md).
 
+# --- which simulation (2026-11-13; docs/PARAMETER_REGISTER.md, FIELD_TUNING.md) ---------------
+# sim_config = field_equivalent (default): the identified BlueBoat plant, the real boat's gains / MPC
+#              model / horizon / weights, thrust applied at 20 Hz and /blueboat/odom at the field rate
+#              and delay. What a simulated result that must transfer to the boat is run with.
+#            = legacy: the BlueROV2 plant, the sim-tuned gains, 10 Hz thrust, Gazebo's clean 20 Hz
+#              odometry - every simulation made before 2026-11-13, reproduced.
+# The four arguments below override single pieces of the chosen configuration ('' = keep it).
+sl_sim_config = sl.declare_arg('sim_config', default_value = 'field_equivalent')
+sl_plant = sl.declare_arg('plant', default_value = '')                 # identified | bluerov2_legacy
+sl_odom_profile = sl.declare_arg('odom_profile', default_value = '')   # passthrough | field_3hz | field_4hz | field_13hz
+sl_odom_seed = sl.declare_arg('odom_seed', default_value = 0)          # seed of the odometry timing draws
+sl_tuning_file = sl.declare_arg('tuning_file', default_value = '')     # ROS parameter file of gains flown on a given day (config/field_runs/*.yaml)
+
+SIM_CONFIGS = {
+        'field_equivalent': dict(plant='identified', odom_raw=True, gain_profile='field',
+                                 thrust_rate_hz=20.0, odom_profile='field_13hz'),
+        'legacy':           dict(plant='bluerov2_legacy', odom_raw=False, gain_profile='sim',
+                                 thrust_rate_hz=10.0, odom_profile='passthrough'),
+}
+
 
 def _path_window(trajectory):
         """path_publisher's `total_time` for a from_yaml mission, else None.
@@ -50,22 +70,48 @@ def _path_window(trajectory):
 
 def launch_setup():
 
+        name = str(sl.arg('sim_config'))
+        if name not in SIM_CONFIGS:
+                raise RuntimeError(f"sim_config:={name}: expected {' | '.join(SIM_CONFIGS)}")
+        cfg = dict(SIM_CONFIGS[name])
+        if str(sl.arg('plant')):
+                cfg['plant'] = str(sl.arg('plant'))
+        tuning_file = str(sl.arg('tuning_file'))
+        odom_profile = {'odom_profile': cfg['odom_profile']}
+        if str(sl.arg('odom_profile')):
+                odom_profile = {'odom_profile': str(sl.arg('odom_profile'))}
+        elif tuning_file:
+                # a field-run file states the odometry timing of its day
+                odom_profile = {}
+        if tuning_file and not Path(tuning_file).expanduser().is_file():
+                raise RuntimeError(f"tuning_file:={tuning_file}: no such file")
+
+        def with_tuning(parameters):
+                # The file first, the launch's own values last: controller_type,
+                # simulation, data_dir, path_source and time_source always win.
+                return [str(Path(tuning_file).expanduser()), parameters] if tuning_file else parameters
+
         # Launch gazebo and related simulation nodes
         sl.include('blueboat_description',
                    'world_launch.py',
                    launch_arguments={'sliders': False,
                                      'thr': sl_robot,
-                                     'yaw': sl_spawn_yaw})
+                                     'yaw': sl_spawn_yaw,
+                                     'plant': cfg['plant'],
+                                     'odom_raw': cfg['odom_raw']})
 
         # Simulation interaction
         sl.node('blueboat_control',
                 'simulation_interface.py',
-                parameters={'controller_type' : sl_controller,
+                parameters=with_tuning({'controller_type' : sl_controller,
                             'note': sl_note,
                             'data_dir': sl_data,
                             # sim-time watchdog / republish: one clock at
                             # any Gazebo real-time factor (2026-11-07)
-                            'time_source': 'ros'})
+                            'time_source': 'ros',
+                            'thrust_rate_hz': cfg['thrust_rate_hz'],
+                            'odom_seed': int(sl.arg('odom_seed')),
+                            **odom_profile}))
 
         # Compute trajectory and target
         sl.node('blueboat_control',
@@ -85,13 +131,14 @@ def launch_setup():
         # Load controller
         sl.node('blueboat_control',
                 'master_control.py',
-                parameters={'controller_type' : sl_controller,
+                parameters=with_tuning({'controller_type' : sl_controller,
                             'simulation' : True,
                             'data_dir': sl_data,
                             'path_source': sl_path_source,
                             # .npy / monitoring stamps, brakes and path
                             # timeouts on /clock (2026-11-07)
-                            'time_source': 'ros'})
+                            'time_source': 'ros',
+                            'gain_profile': cfg['gain_profile']}))
 
         return sl.launch_description()
 

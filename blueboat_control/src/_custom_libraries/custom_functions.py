@@ -173,12 +173,16 @@ def compute_target(path, dt):
 
     psi_prev = get_yaw_from_quaternion(present.orientation)
 
-    psi_mid = (psi + psi_prev) / 2.0
-    dy_b = -np.sin(psi_mid) * dx + np.cos(psi_mid) * dy
-    v = dy_b / dt 
-
     dpsi = (psi - psi_prev + np.pi) % (2 * np.pi) - np.pi
     r = dpsi / dt
+
+    # Mid heading along the SHORT way (2026-11-13): the arithmetic mean of
+    # +179 deg and -179 deg is 0 deg, which reversed the sign of v on a
+    # west-going window. No controller reads v today (PID and LoS use
+    # elements 0-3), so nothing published changes.
+    psi_mid = psi_prev + dpsi / 2.0
+    dy_b = -np.sin(psi_mid) * dx + np.cos(psi_mid) * dy
+    v = dy_b / dt
     
     return [x, y, psi, u, v, r]
 

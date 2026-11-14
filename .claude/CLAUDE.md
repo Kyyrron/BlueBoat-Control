@@ -9,7 +9,10 @@ their directory: `blueboat_control/src/` (measurements and derivations behind §
 `blueboat_description/` (§8), `log_reviewer/` (§9). The **live path update** (the
 BlueBoat-Replanner entry point) is documented in `docs/`: `PATH_UPDATE_DESIGN.md` (why),
 `PATH_UPDATE_INTERFACE.md` (the client contract), `REFERENCES.md`, `REQUESTS.md` (what other
-modules need), `PATH_UPDATE_REAL_WATER_TEST.md`. Open items: `.claude/TODO.md`.
+modules need), `PATH_UPDATE_REAL_WATER_TEST.md`. The **simulated plant and its configurations**
+(2026-11-13): `docs/PARAMETER_REGISTER.md` (every number, its origin and interval),
+`FIELD_TUNING.md` "Simulation configurations", `docs/REFERENCES.md` "Plant identification".
+Open items: `.claude/TODO.md`.
 
 Frozen at `v1.0` and **add-only** (superproject §3): additions, or refactors shown identical
 by the gates of §3.
@@ -140,8 +143,8 @@ sources import each other as bare modules (`import custom_functions`, `import PI
 **ROS-free by construction** (numpy or stdlib only; keep them so — anything needing `rclpy`
 goes in `custom_functions.py`): `frame_math.py`, `robot_log_schema.py`, `thrust_limits.py`,
 `path_stamp.py`, `poslog_report.py`, `run_bag.py`, `path_update.py`, `path_update_log.py`,
-`replay_attitude.py`, `yaml_trajectory.py` (all `src/_custom_libraries/`), plus `MPC/ur_mpc.py`
-(acados, no ROS).
+`replay_attitude.py`, `yaml_trajectory.py`, `odom_emulation.py` (all `src/_custom_libraries/`),
+plus `MPC/ur_mpc.py` (acados, no ROS).
 
 `poslog_report.py` (also a CLI) files a finished run: creates `Robot_data/<csv stem>/` and
 **moves** the CSV, its `-origin.yaml`, a PNG report and, from a session, the `-path.yaml`
@@ -162,7 +165,8 @@ change; what file a thing lives in may not (N1). The `fsin` table must stay at
 
 | Topic | Type | Published by | Subscribed by |
 |---|---|---|---|
-| `/blueboat/odom` | `nav_msgs/Odometry` | `robot_interface` (real) · Gazebo bridge (sim, §8) · `bag_replay` | `master_control`, `simulation_interface` — **local ENU** on both: origin = launch point (real) / Gazebo origin (sim), yaw **absolute ENU** |
+| `/blueboat/odom` | `nav_msgs/Odometry` | `robot_interface` (real) · `simulation_interface` (sim, field-equivalent: relayed from `/blueboat/odom_gz` at the field rate and delay) · Gazebo bridge (sim, `odom_raw:=false`: legacy, §8) · `bag_replay` | `master_control`, `simulation_interface` — **local ENU** on both: origin = launch point (real) / Gazebo origin (sim), yaw **absolute ENU** |
+| `/blueboat/odom_gz` | `nav_msgs/Odometry` | Gazebo bridge — **simulation only**, `odom_raw:=true` (default): Gazebo's own 20 Hz odometry | `simulation_interface` (the relay; also the surge speed its actuator model uses) |
 | `/blueboat/pinger_coordinates` | `Float32MultiArray` | `robot_interface` | `master_control` |
 | `/blueboat/controller_ready` | `Bool` | `robot_interface` · `simulation_interface` | `master_control` |
 | `/thruster_input` | `Float32MultiArray` `[right, left]` N | `master_control` | `robot_interface`, `simulation_interface` |
@@ -323,6 +327,14 @@ What the launch files do not make obvious:
   `rate`, `heave`, `heave_gate`, `start_paused`, `gui`, `placement` (`gps`/`origin`). Gazebo +
   clock and `set_pose` bridges + the boat with `replay:=true` (§8) + `bag_replay`; no
   controller, no sea state, no sonar, no `blueboat_sss_sim` import.
+- **`Sim_launch.py` runs one of two simulations** (`sim_config`, 2026-11-13):
+  `field_equivalent` (default) = identified plant + the real boat's column (`gain_profile`
+  field) + thrust applied at 20 Hz + `/blueboat/odom` at the field timing; `legacy` =
+  BlueROV2 plant + sim-tuned column + 10 Hz thrust + Gazebo's 20 Hz odometry, i.e. every
+  simulation before that date. Single pieces: `plant`, `odom_profile`, `odom_seed`,
+  `tuning_file` (a day's gains, `config/field_runs/`). Each piece defaults to field-equivalent
+  on its own, so the simulator's `full_mission_launch.py` gets that set without forwarding
+  anything; it cannot select `legacy` yet (`docs/REQUESTS.md` R-6).
 - **`Sim_launch.py`** defaults `controller_type` to `'MPC'`, never starts `robot_interface`;
   `spawn_yaw` is radians ENU (position stays (0, 0)). For a `from_yaml:` trajectory it sizes
   `path_publisher`'s `total_time` as duration × 1.1 + 30 s (`_path_window`).
@@ -333,12 +345,14 @@ No lint or type-check target. Scripts with exit codes, pytest-compatible:
 
 ```bash
 /usr/bin/python3 test/test_path_update.py         # ROS-free path-update core (102 checks)
+python3 test/test_yaw_wrap.py                     # heading at +-180 deg, MPC/PID/LoS (32 checks; needs what mc_harness needs)
 /usr/bin/python3 test/test_path_update_log.py     # ROS-free pathlog + filing (24 checks)
 python3 test/test_bag_replay_track.py             # 18 ROS-free checks; 29 with ROS + the recorded bag
 QT_QPA_PLATFORM=offscreen python3 log_reviewer/smoke_test.py   # skips without a poslog under ~/ros2_ws/data
 python3 .claude/tools/interface_inventory.py --check .claude/tools/interface_baseline.json  # 0 = unchanged
 # deterministic tick-level harness (ROS sourced + install + venv with acados for MPC):
-python3 test/mc_harness.py --compare HEAD         # N11: HEAD vs working tree, bit-identical
+python3 test/mc_harness.py --compare HEAD --param gain_profile:=sim   # N11: HEAD vs working tree, LEGACY column, bit-identical
+python3 test/mc_harness.py --one --scenario kin_square --controller MPC --plant identified --out /tmp/x.json  # offline run on the identified plant
 python3 test/mc_harness.py --time-source ros      # time_source wall vs ros, bit-identical (one ns clock)
 python3 test/mc_harness.py --replanner            # offline replanner scenarios, all controllers
 python3 test/gazebo_path_update.py --replanner --out-dir /tmp/gz   # Gazebo, headless
@@ -347,7 +361,11 @@ python3 test/gazebo_path_update.py --replanner --out-dir /tmp/gz   # Gazebo, hea
 `mc_harness --compare` runs `circle`, `kin_square`, `fsin`, `manual`, `arrow`, `session`
 and `pinger` (PID/LoS only) for PID/LoS/MPC plus a real-parameter `kin_square` (23 runs),
 requiring `/thruster_input`, `/monitoring_data`, `/controller_target` and τ bit-identical
-tick by tick; `--scenarios replanner,replanner_session` adds the path-update runs. The
+tick by tick; `--scenarios replanner,replanner_session` adds the path-update runs. Since
+2026-11-13 the gate is run with `--param gain_profile:=sim` (a simulation's default column is
+now the real boat's; a revision that predates the parameter ignores it), and a run that
+differs prints its first differing tick beside the first tick at which the measured yaw
+wraps. The
 interface guard (stdlib, also a `PostToolUse` hook) compares every publisher, subscriber,
 service, client, declared parameter and the `blueboat_interfaces` field lists to a baseline;
 it is **not committed** (`.claude/tools/` is gitignored), so a fresh clone has no contract
@@ -386,6 +404,12 @@ everything here: `blueboat_control/src/CLAUDE.md`; knobs: `FIELD_TUNING.md`.
   never under `cf.data_root()`. Any change to model coefficients, horizon, weights,
   `thrust_limit` or `mpc_qp_iter_max` regenerates it once (~1 min, logs `generated and
   compiled`) — expected; do not delete the cache.
+- **The MPC warm start follows the boat's heading** (`ur_mpc.MPCController._align_iterate`,
+  2026-11-13, runs on the real boat too). SQP_RTI takes one step from the stored iterate: a
+  cold iterate (all zeros) is seeded at the measured state, and when the measured yaw wraps
+  at ±180° the iterate is moved by the same whole turn. Before, every crossing gave one tick
+  of full differential thrust (±40 N), and a start heading west began half a turn off.
+  Regression: `test/test_yaw_wrap.py`.
 - **A failed acados solve is not a command (C6).** Non-zero status → reset, cold re-seed,
   one retry, else zeros; reported through the ROS logger (never `print`); no early return,
   so `/thruster_input` and the `.npy` keep flowing. `mpc_qp_iter_max` 0 derives
@@ -419,7 +443,10 @@ everything here: `blueboat_control/src/CLAUDE.md`; knobs: `FIELD_TUNING.md`.
   so raising `hold_speed` above 0.28 would alter path following.
 - **Tuning knobs** are all declared unconditionally in `_declare_tuning_parameters` and read
   once at construction; gain triples are double arrays. Several defaults are **split
-  simulation/real** (PID gains, point gains, LoS speed scale, MPC horizon/time/R and plant
+  real / sim-tuned**, chosen by `gain_profile` (`''` or `field` = the real boat's column, on
+  the boat and, since 2026-11-13, in simulation; `sim` = the legacy column, simulation only)
+  — no longer by `simulation`, which now decides only the log name and `/pose_arrow`. The
+  split covers (PID gains, point gains, LoS speed scale, MPC horizon/time/R and plant
   model, `manual_hold_kx` — N/m). Also: `path_request_timeout` / `path_stale_timeout`
   (1.0 s), `thruster_input_timeout` (0.5 s, both interface nodes), `param_sequence_timeout_s`
   (20 s, `param_set`).
@@ -581,9 +608,14 @@ record and known defects (`square`'s 4 m discontinuity): `TRAJECTORY_SYSTEM.md`.
 URDF/xacro, meshes, Gazebo world, spawn chain `world_launch.py` → `upload_rov_launch.py` →
 `state_publisher_launch.py`; details in `blueboat_description/CLAUDE.md`. Gazebo plugins
 still carry Fortress names (Harmonic's deprecated-name shim — superproject §4.6). In
-simulation `/blueboat/odom` comes from `upload_rov_launch.py`'s bridge (20 Hz,
-`odom_frame: world`). The **simulation** MPC model is fitted to `hydrodynamics.xacro`
-(secant damping); the **real-boat** model shares only the rigid body with it. A `replay`
+simulation Gazebo's odometry (20 Hz, `odom_frame: world`) is bridged by
+`upload_rov_launch.py` to `/blueboat/odom_gz` (`odom_raw:=true`, default) or straight to
+`/blueboat/odom` (`odom_raw:=false`). **Two plants** (`plant`, 2026-11-13): `identified`
+(default; `hydrodynamics_identified.xacro` + the yaw-axis inertia + an actuator model that
+`simulation_interface` reads from the description and applies) and `bluerov2_legacy`
+(`hydrodynamics.xacro`, the description of before, element for element). The **sim-tuned** MPC
+model is fitted to the legacy plant (secant damping); the **real-boat** model is what the
+field-equivalent configuration runs. A `replay`
 xacro argument (default false, default description byte-identical) builds the force-free
 boat a bag replay moves by `set_pose`.
 

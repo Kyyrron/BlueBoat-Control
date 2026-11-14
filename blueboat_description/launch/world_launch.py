@@ -13,6 +13,10 @@ def generate_launch_description():
     # make the boat transit there. (Replaces the old dead 'spawn_pose' arg,
     # which upload_rov_launch never read.)
     sl.declare_arg('yaw', default_value=0.)
+    # Forwarded to upload_rov_launch.py (2026-11-13): the plant of the description
+    # (identified | bluerov2_legacy) and where Gazebo's odometry is bridged.
+    sl.declare_arg('plant', default_value='identified')
+    sl.declare_arg('odom_raw', default_value=True)
 
     with sl.group(if_arg='gui'):
         sl.gz_launch(sl.find('blueboat_description', 'world.sdf'), "-r")
@@ -28,5 +32,6 @@ def generate_launch_description():
 
     with sl.group(if_arg='spawn'):
         sl.include('blueboat_description', 'upload_rov_launch.py',
-                   launch_arguments={'thr': sl.arg('thr'), 'yaw': sl.arg('yaw')})
+                   launch_arguments={'thr': sl.arg('thr'), 'yaw': sl.arg('yaw'),
+                                     'plant': sl.arg('plant'), 'odom_raw': sl.arg('odom_raw')})
     return sl.launch_description()
