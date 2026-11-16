@@ -199,6 +199,26 @@ real `/mavros/*` stream is what `/blueboat/odom` is made from.
    damping on the plant as integrated, so the response is the identified one. In the vertical
    plane the same terms act on the simulator's heave / pitch (`zDotW` 14.57 kg × surge speed).
 
+**Answered 2026-11-15 (session 04b; session 03's `03_sea_state/R8_request_for_control.md`;
+`~/ros2_ws/sim_runs/sim_acceptance/04b_control_r8/handoff_04b.md`).** Applied, with three
+values the plugin cannot integrate carried differently:
+- `zDotW` is −14.5, not −16.15 (FORCED: at 16.15 the boat diverged in Gazebo).
+- A44 1.79 and A55 0.93 are rigid roll / pitch inertia (`ixx` 4.21369, `izz` 6.5703125) with
+  `kDotP` / `mDotQ` 0 (FORCED: the coupled sway-roll mode diverged).
+- The vertical damping is 0 under the new xacro argument `vertical_model:=sea_node` (default: the
+  sea node owns it) and carried by the plugin under `standalone` (`Sim_launch.py`).
+
+Also changed: the CoG under `sea_node` is the derived physical one, +0.1376 at link z (was −0.129,
+below the keel), and the sway drag is re-derived at the CAD draft (`yVabsV` −319.1, `nR` −6.35,
+`nRabsU` −5.12). Register §3–§4.
+
+What the simulator has to follow up:
+- `sea/plant.py` `IDENTIFIED` mirror and `plant_from_xacro` (CoG property `z_cog_physical`, the
+  inertia block now differs from the legacy one in `ixx` / `izz` too);
+- smoke `[10]`;
+- `derive_r8.py` (CoG, the A33 cap);
+- the free-decay proxy and the `harbour_chop` estimate.
+
 ## R-9 Session 03 (sea state) — what is left to the disturbance
 
 - The plant carries **no** right/left thrust asymmetry: not identifiable in the pool
@@ -225,7 +245,9 @@ a **bracket**, to be varied in the sensitivity study rather than closed:
 |---|---|---|---|
 | κ, commanded → applied Newton (rests on the mass) | 0.493 | 0.45 – 0.85 | `thrust_gain_*` tags, coefficients scaled with it (R-9) |
 | Right/left thrust asymmetry `a` | 0 | −0.25 … +0.10 | `thrust_gain` |
-| Sway added mass / drag | 14 kg / 108 N·s²/m² | 8 – 30 / 54 – 240 | `yDotV`, `yVabsV` (then refit `nR`, `nRabsU`: `ident/yaw_fit5.py`) |
+| Sway added mass / drag | 14 kg / 319.1 N·s²/m² (2026-11-15: drag re-derived at the CAD draft) | 8 – 133 (Gazebo ≤ 14, plugin stability) / 213 – 426 | `yDotV`, `yVabsV` (then refit `nR`, `nRabsU`: `04b_control_r8/fit/yaw_fit5_r8_fixIzz.py`) |
+| CoG height (`vertical_model:=sea_node`) | link z +0.1376 (0.239 m above the keel) | +0.097 … +0.178 | `z_cog_physical` (`blueboat.xacro`) |
+| Heave added mass | 14.5 kg (FORCED cap) | R-8: 8.1 – 24.2 kg; Gazebo < 16.15 | `zDotW_identified` |
 | Mass | 16.01 kg | 16 – 20 kg | not to be changed alone (the simulator mirrors it) |
 | Constant odometry delay | 0 s | 0 – 0.10 s | `odom_base_delay` |
 

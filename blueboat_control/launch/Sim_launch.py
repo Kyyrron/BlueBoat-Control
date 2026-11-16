@@ -24,6 +24,7 @@ sl_sim_config = sl.declare_arg('sim_config', default_value = 'field_equivalent')
 sl_plant = sl.declare_arg('plant', default_value = '')                 # identified | bluerov2_legacy
 sl_odom_profile = sl.declare_arg('odom_profile', default_value = '')   # passthrough | field_3hz | field_4hz | field_13hz
 sl_odom_seed = sl.declare_arg('odom_seed', default_value = 0)          # seed of the odometry timing draws
+sl_vertical_model = sl.declare_arg('vertical_model', default_value = 'standalone')  # identified plant (R-8, 2026-11-15): standalone = this launch starts no sea node, so Gazebo's box + plugin damping + box CoG | sea_node = a sea node is started beside it (CAD hydrostatics, its damping, physical CoG)
 sl_tuning_file = sl.declare_arg('tuning_file', default_value = '')     # ROS parameter file of gains flown on a given day (config/field_runs/*.yaml)
 
 SIM_CONFIGS = {
@@ -98,7 +99,8 @@ def launch_setup():
                                      'thr': sl_robot,
                                      'yaw': sl_spawn_yaw,
                                      'plant': cfg['plant'],
-                                     'odom_raw': cfg['odom_raw']})
+                                     'odom_raw': cfg['odom_raw'],
+                                     'vertical_model': sl_vertical_model})
 
         # Simulation interaction
         sl.node('blueboat_control',

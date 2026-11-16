@@ -615,7 +615,11 @@ simulation Gazebo's odometry (20 Hz, `odom_frame: world`) is bridged by
 `simulation_interface` reads from the description and applies) and `bluerov2_legacy`
 (`hydrodynamics.xacro`, the description of before, element for element). The **sim-tuned** MPC
 model is fitted to the legacy plant (secant damping); the **real-boat** model is what the
-field-equivalent configuration runs. A `replay`
+field-equivalent configuration runs. Since 2026-11-15 (R-8) the identified plant's heave / roll
+/ pitch depend on the xacro argument `vertical_model`: `sea_node` (default, world runs: the
+sea node owns damping and hydrostatics, physical CoG) or `standalone` (`Sim_launch.py`'s
+default: box + plugin damping + box CoG). The plugin's explicit added mass bounds every added
+inertia: `blueboat_description/CLAUDE.md` item 4. A `replay`
 xacro argument (default false, default description byte-identical) builds the force-free
 boat a bag replay moves by `set_pose`.
 

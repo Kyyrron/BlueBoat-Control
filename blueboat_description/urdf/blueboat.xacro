@@ -18,11 +18,23 @@
                            with it this description is the one of before, element for element.
        A replay description (replay:=true) carries no plant at all and is the same for both. -->
   <xacro:arg name="plant" default="identified"/>
+  <!-- Who owns heave / roll / pitch of the identified plant (2026-11-15, session 04b, R-8). The legacy plant ignores it.
+         sea_node (default)  BlueBoat-SSS-Sim's sea-state node: the CAD catamaran's hydrostatics and all of the vertical
+                             damping (every world run, full_mission_launch.py). The CoG is the derived physical one.
+         standalone          no sea node (blueboat_control Sim_launch.py): Gazebo's buoyancy box is the hull, the
+                             Hydrodynamics plugin carries the damping, and the CoG stays at the box construction,
+                             which keeps that box upright (on the box the physical CoG has a roll GM of -0.025 m).
+                             A sea node started beside it (MCS) sizes its damping as the complement: damped once. -->
+  <xacro:arg name="vertical_model" default="sea_node"/>
   
   <xacro:property name="ns" value="$(arg namespace)"/>
   <xacro:property name="density" value="$(arg density)"/>
   <xacro:property name="plant" value="$(arg plant)"/>
   <xacro:property name="replay_description" value="$(arg replay)"/>
+  <xacro:property name="vertical_model" value="$(arg vertical_model)"/>
+  <xacro:if value="${vertical_model not in ('sea_node', 'standalone')}">
+    <xacro:element xacro:name="${xacro.fatal('blueboat.xacro: vertical_model must be sea_node or standalone')}"/>
+  </xacro:if>
   <xacro:if value="${plant not in ('identified', 'bluerov2_legacy')}">
     <xacro:element xacro:name="${xacro.fatal('blueboat.xacro: plant must be identified or bluerov2_legacy')}"/>
   </xacro:if>
@@ -44,6 +56,12 @@
   <xacro:property name="z_cob" value="${-buoyant_correction*z_size/4}"/>
   <!-- Center of gravity -->
   <xacro:property name="z_cog" value="${-buoyant_correction*z_size}"/>
+  <!-- Identified plant, vertical_model:=sea_node: the physical CoG (2026-11-15, session 04b), DERIVED from a mass budget
+       (vendor masses, CAD hull shell, ASSUMED densities and placements; docs/PARAMETER_REGISTER.md s3):
+       0.239 m above the keel [0.198, 0.279], keel at link z -0.101 (link origin 0.111 m below the waterline,
+       CAD draft 0.212 m) -> +0.138 [+0.097, +0.178]. -->
+  <xacro:property name="z_cog_physical" value="0.1376"/>
+  <xacro:property name="z_cog_identified" value="${z_cog_physical if vertical_model == 'sea_node' else z_cog}"/>
   
   <xacro:property name="visual_mesh_file" value="package://blueboat_description/meshes/BlueBoat.dae"/>
   <xacro:property name="collision_mesh_file" value="package://blueboat_description/meshes/BlueBoat.stl"/>
@@ -63,15 +81,18 @@
     </inertial>
     </xacro:if>
     <xacro:unless value="${legacy_inertial}">
-    <!-- Identified plant. The inertial frame is rolled by pi/2, so the link's YAW axis is this block's iyy
-         (roll = ixx, pitch = izz: both unchanged). The identified TOTAL yaw inertia is 9.48 kg.m2 (rigid +
-         added, 95 % [8.11, 10.95]). A rigid tensor must satisfy iyy <= ixx + izz = 8.06 (Gazebo rejects the
-         link otherwise), so 7.50 is carried here and the other 1.98 as added inertia (nDotR) in
-         hydrodynamics_identified.xacro. -->
+    <!-- Identified plant. The inertial frame is rolled by pi/2, so the link's YAW axis is this block's iyy,
+         roll = ixx, pitch = izz (link frame = R_x(pi/2) diag(ixx, iyy, izz) R_x^T = (ixx, izz, iyy)).
+         YAW: the identified TOTAL is 9.48 kg.m2 (rigid + added, 95 % [8.11, 10.95]); Gazebo rejects a rigid tensor with
+         iyy > ixx + izz, so 7.50 is carried here and 1.98 as nDotR (session 04, unchanged).
+         ROLL / PITCH (2026-11-15, R-8, FORCED): rigid 2.42369 / 5.6403125 (third-party model file) + R-8's added
+         inertias A44 1.79 / A55 0.93 = 4.21369 / 6.5703125. Carried here, not as kDotP / mDotQ, because the plugin's
+         explicit added-mass term is unstable with them (spectral radius 1.15 - 1.30 at the link origin; roll diverged
+         in Gazebo at 12 s). I + A is R-8's; lost: the Coriolis terms of A44 and A55. -->
     <inertial>
         <mass value="${mass}"/>
-        <origin xyz="0 0 ${z_cog}" rpy = "${pi/2} 0 0"/>
-        <inertia ixx="2.42369" ixy="0" ixz="0" iyy="7.50" iyz="0" izz="5.6403125"/>
+        <origin xyz="0 0 ${z_cog_identified}" rpy = "${pi/2} 0 0"/>
+        <inertia ixx="4.21369" ixy="0" ixz="0" iyy="7.50" iyz="0" izz="6.5703125"/>
     </inertial>
     </xacro:unless>
     <visual>

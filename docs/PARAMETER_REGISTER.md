@@ -2,12 +2,15 @@
 
 Every result-affecting number of the simulated plant, of its actuator and timing models, and of the
 controller columns: value, unit, origin, interval or bracket, where it lives. Written 2026-11-13/14
-(session 04 of the simulator completion round, acceptance test I6).
+(session 04 of the simulator completion round, acceptance test I6); heave / roll / pitch, CoG and sway revised
+2026-11-15 (session 04b, R-8; evidence `~/ros2_ws/sim_runs/sim_acceptance/04b_control_r8/`, `handoff_04b.md`).
 
 **Origin tags.** MEASURED = read from our own field logs. IDENTIFIED = fitted on FIT field logs (a kind of
 MEASURED; the interval is a 95 % bootstrap interval over segments). VENDOR = the manufacturer's published
 figure (URL in `REFERENCES.md` §V). DERIVED = computed from other entries by a stated rule. ASSUMED = neither,
-always with a bracket. LEGACY = carried over unchanged from the BlueROV2 table, owned elsewhere (see §4).
+always with a bracket. LEGACY = carried over unchanged from the BlueROV2 table or the third-party model file.
+FORCED = a value the physics engine cannot integrate is carried in another form or capped (reason, what is lost and
+the evidence are in the row).
 
 **Evidence.** Scripts and outputs are outside the repository, under
 `~/ros2_ws/sim_runs/sim_acceptance/04_control/` (`ident/`, `timing/`, `runs/`, `r4/`, `gates/`); the file named
@@ -40,7 +43,7 @@ section `motion:`.
 | Coast decay `X_u\|u\| / (m − X_u̇)` (free of the thrust map) | 0.240 1/m | [0.12, 0.48] | same |
 | Linear surge drag | 0 | fits to 0.00 when free | `ident/surge_fit2.py` |
 | Fit residual, surge | 0.075 m on the along-track distance (0.079 m without `kp`; ΔAIC 18 for `kp`) | — | `ident/surge_fit2_scan.json` |
-| Yaw: time constant at rest | 1.50 s | [1.30, 2.99] | `ident/yaw_fit5.json` |
+| Yaw: time constant at rest | 1.50 s (1.49 s [1.34, 2.87] with the 2026-11-15 sway drag) | [1.30, 2.99] | `ident/yaw_fit5.json`; `04b_control_r8/fit/yaw_fit5_r8_fixIzz.json` |
 | Fit residual, yaw rate | 4.5 °/s (0.079 rad/s) | — | same |
 
 Drag and `kp` are poorly separated one by one and tightly determined together: the three derived rows at the top
@@ -90,19 +93,32 @@ opposite sign to Fossen's in the horizontal plane — read in its source, `inven
  Izz    r' = +(A22−A11) u v + ℓ (F_R − F_L) − Nr r − Nur |u| r
 ```
 
+**Stability bound of the plugin's added mass (2026-11-15) [VERIFIED].** gz-sim 8.15 applies the added-mass force
+from the previous step's acceleration, `stateDot = (state − prevState)/dt`
+(`04_control/inventory/downloads/gz_sim8_hydrodynamics/Hydrodynamics.cc`; the plugin warns about it at load). One
+step multiplies an acceleration error by −M_rb⁻¹M_A, so the description is integrable only while the spectral
+radius ρ(M_rb⁻¹M_A) < 1, with M_rb taken at the **link origin** (the CoG offset couples sway and roll). R-8's set
+in the plugin gave ρ = 1.15–1.30 over the CoG bracket. In Gazebo the boat diverged in 12–15 s with zDotW −16.15,
+and in roll at 12 s with zDotW −14.5 (`04b_control_r8/gz/r8_zDotW_16p15_external`, `r8_zDotW_14p5_external`). The
+carried set has ρ = 0.930 (box CoG) and 0.937 (physical CoG). Hence three FORCED rows below.
+
 | Coefficient | Tag | Value | Unit | Origin | Interval / bracket | Where |
 |---|---|---|---|---|---|---|
-| Rigid mass `m` | `mass` | 16.01 | kg | LEGACY (the simulator's hull wrench mirrors it) | vendor: 14.5 kg bare + 2.4 kg per two battery packs + 0.3 kg per sonar head = 17.5 kg (2 packs) to 19.8 kg (4 packs), before mounts and cables; survey loading never weighed → 16 – 20 kg | `blueboat.xacro:36` |
+| Rigid mass `m` | `mass` | 16.01 | kg | LEGACY (the simulator reads it from the robot description) | vendor: 14.5 kg bare + 2.4 kg per two battery packs + 0.3 kg per sonar head = 17.5 kg (2 packs) to 19.8 kg (4 packs), before mounts and cables; survey loading never weighed → 16 – 20 kg | `blueboat.xacro:36` |
 | Surge added mass `A11` | `xDotU` | −1.60 | kg | ASSUMED: 10 % of the rigid mass (slender hull) | 5 – 15 %; with κ it reproduces the identified 35.7 kg per commanded N | `hydrodynamics_identified.xacro:48` |
 | Surge drag, linear | `xU` | 0.0 | N·s/m | IDENTIFIED (fits to zero) | — | `:56` |
 | Surge drag, quadratic `Xuu` | `xUabsU` | −4.23 | N·s²/m² | IDENTIFIED: κ × 8.58 | κ × [2.6, 19.7]; tied to `kp` (§1.1) | `:64` |
-| Sway added mass `A22` | `yDotV` | −14.0 | kg | DERIVED: strip theory, two demihulls 1.2 m long, draft 0.06 m | 8 – 30 kg (draft 0.045 – 0.10 m) | `:49` |
+| Sway added mass `A22` | `yDotV` | −14.0 | kg | FORCED (2026-11-15). The same rule at the CAD draft, ρπT(x)²/2 per demihull over the CAD stations at 0.212 m, gives **132.6 kg** (13.6 kg was the 0.06 m draft). That is 8 × the rigid mass and not integrable by the plugin (bound above), so 14.0 is kept. Lost: sway inertia and the (A22−A11) u v coupling above 14 kg. The FIT data do not constrain sway: yaw-rate rms 0.0789–0.0805 rad/s over 8–30 kg (`ident/yaw_fit5.json`, `04b/fit/yaw_fit5_r8.json`) | 8 – 133 kg (Gazebo: ≤ 14) | `hydrodynamics_identified.xacro` `yDotV` |
 | Sway drag, linear | `yV` | 0.0 | N·s/m | ASSUMED (no lift term) | — | `:57` |
-| Sway drag, quadratic `Yvv` | `yVabsV` | −108.0 | N·s²/m² | DERIVED: cross-flow, C_d 1.5 on 0.144 m² | 54 – 240 | `:65` |
-| Yaw inertia, total `Izz` | `iyy` + `nDotR` | 7.50 + 1.98 = 9.48 | kg·m² | IDENTIFIED (total). The split is forced: a rigid tensor needs `iyy ≤ ixx + izz = 8.06` | [8.11, 10.95] | `blueboat.xacro:74`, `hydrodynamics_identified.xacro:53` |
-| Yaw damping at rest `Nr` | `nR` | −6.31 | N·m·s/rad | IDENTIFIED | [3.08, 7.10] | `:61` |
+| Sway drag, quadratic `Yvv` | `yVabsV` | −319.1 | N·s²/m² | DERIVED (2026-11-15): cross-flow ½ρC_dA, C_d 1.5 on the CAD lateral area 2 × 0.2127 m² at 0.212 m draft (`03_sea_state/r8/cad_hydrostatics.json` stations). Was 108.0 on 0.144 m² (draft 0.06 m, outside the CAD draft) | C_d 1.0 – 2.0: 213 – 426 | `yVabsV` |
+| Yaw inertia, total `Izz` | `iyy` + `nDotR` | 7.50 + 1.98 = 9.48 | kg·m² | IDENTIFIED (total). The split was forced by `iyy ≤ ixx + izz` (8.06 in session 04; 10.78 since the roll / pitch rows below, the split is kept unchanged). Held at 9.48 in the 2026-11-15 refit (a free refit gives 9.50 [8.22, 10.71]) | [8.11, 10.95] | `blueboat.xacro` identified `<inertial>` `iyy`, `nDotR` |
+| Yaw damping at rest `Nr` | `nR` | −6.35 | N·m·s/rad | IDENTIFIED; refit 2026-11-15 for the new `yVabsV`, Izz held (`04b/fit/yaw_fit5_r8_fixIzz.json`; was −6.31) | [3.30, 7.08] | `nR` |
 | Yaw damping, quadratic | `nRabsR` | 0.0 | N·m·s² | IDENTIFIED (fits to zero) | — | `:69` |
-| Yaw damping per m/s of surge `Nur` | `nRabsU` | −4.76 | N·m·s/rad per m/s | IDENTIFIED, together with the sway coupling above | [1.36, 15.1]; 3.9 – 5.7 across the sway bracket | `:70` |
+| Yaw damping per m/s of surge `Nur` | `nRabsU` | −5.12 | N·m·s/rad per m/s | IDENTIFIED together with the sway coupling above; refit 2026-11-15 (was −4.76). Yaw prediction on the six FIT runs unchanged: correlation 0.907–0.942 (was 0.907–0.940; `04b/fit/yaw_crosscheck_r8.json`) | [1.33, 15.5]; 4.73 – 5.53 across the Yvv bracket, 7.40 at A22 8 kg | `nRabsU` |
+| Heave added mass `A33` | `zDotW` | −14.5 | kg | FORCED (2026-11-15). R-8 derives 16.15 kg (1.0 × displacement, MSS `otter_legacy.m` rule; `03_sea_state/R8_request_for_control.md` §2.3). At 16.15 = the moving mass the plugin diverges (bound above), so the value is capped at 0.9 × 16.15. Heave f_n 1.35 Hz on the CAD hull (K33 2199 N/m), 1.02 Hz on Gazebo's box (1264 N/m) | R-8: 8.1 – 24.2 kg (Gazebo: < 16.15) | `zDotW_identified` |
+| Roll inertia, rigid + added | `ixx` (link roll) + `kDotP` | 4.21369 + 0 | kg·m² | FORCED (2026-11-15): rigid 2.42369 (LEGACY, third-party model file) + R-8's A44 1.79 (DERIVED: A33 · y², y = 0.333 m CAD waterplane centroid), carried as **rigid** inertia because the plugin term is unstable with it (bound above; roll diverged at 12 s). I + A is R-8's. Lost: the Coriolis terms of A44 | A44 0.90 – 2.69 | `blueboat.xacro` identified `<inertial>` `ixx`; `kDotP` 0 |
+| Pitch inertia, rigid + added | `izz` (link pitch) + `mDotQ` | 6.5703125 + 0 | kg·m² | FORCED (2026-11-15): rigid 5.6403125 (LEGACY, third-party) + R-8's A55 0.93 (DERIVED: strip a33(x) ∝ b(x)², CAD stations), as for roll. The inertial frame is rolled by π/2, so attribute `izz` is the link's pitch axis and `iyy` its yaw: link diag = R_x(π/2) diag(ixx, iyy, izz) R_xᵀ = (ixx, izz, iyy) (`04b/gates/inertia_axis_proof.txt`). Lost: the Coriolis terms of A55. Rigid pitch KEPT (finding c): no source for another value; the 2.3 – 3.3 kg·m² inferred from corpus spectra came from HELD-OUT files and cannot change a value | A55 0.47 – 1.40; rigid pitch: no sourced bracket | `izz`; `mDotQ` 0 |
+| Centre of gravity height | identified `<inertial>` origin z | `vertical_model:=sea_node` **+0.1376**; `standalone` −0.12915 | m (link z) | sea_node: DERIVED (2026-11-15) from a mass budget (`04b/tools/cog_budget.py`, `04b/fit/cog_budget.json`): vendor masses (14.5 kg bare, motors, ESCs, batteries, Omniscan heads), CAD hull shell (3.733 L, area centroid 0.218 m above the keel), CAD motor height 0.105 m; ASSUMED: PE density 0.91–0.97, batteries 0.17–0.26 m above the keel, the remaining 6.8 kg (crossbars, tube, lids, electronics) at 0.22–0.38 m. 0.239 m above the keel; keel at link z −0.101 (link origin 0.111 m below the waterline at Gazebo's trim, CAD draft 0.212 m). The old −0.129 is the buoyancy-box construction, 0.028 m below the CAD keel. standalone: kept at that construction, because Gazebo's box is then the only hull and the physical CoG puts its roll GM at −0.025 m (capsizes) | +0.097 … +0.178 (0.198 – 0.279 m above the keel) | `blueboat.xacro` `z_cog_physical`, `z_cog_identified` |
 | Thruster lever arm ℓ | joint origins | 0.295 | m | VENDOR-consistent: motor axes 589 mm apart on the vendor CAD (±10 mm) | — | `thrusters_ur.xacro` |
 
 **Yaw inertia from a mass distribution — not possible.** The vendor publishes no component masses and its
@@ -118,18 +134,31 @@ identified secants at 0.5 m/s (≈ 10 N·s/m; ≈ 18 N·m·s/rad in commanded un
 
 ---
 
-## 4. Not this module's to set (kept numerically, change request to the simulator)
+## 4. Heave, roll and pitch: who owns what (R-8, 2026-11-15)
 
-| Tags | Value | Why kept |
+The nine vertical plugin entries left the LEGACY table on 2026-11-15. Added inertias are §3's (DERIVED by the
+simulator's session 03, FORCED where the plugin cannot integrate them). Damping and hydrostatics depend on the
+xacro argument **`vertical_model`** (`blueboat.xacro`, threaded `world_launch.py` → `upload_rov_launch.py` →
+`state_publisher_launch.py`):
+
+| `vertical_model` | Used by | Hydrostatics | Damping in the plugin (`zW`, `kP`, `mQ`; quadratic all 0) | CoG |
+|---|---|---|---|---|
+| `sea_node` (default) | every world run (`full_mission_launch.py` includes `upload_rov_launch.py`) | the simulator's CAD catamaran (`sea/hull.py`, H_cat − H_gz) | **0, 0, 0**: the sea node carries all of it, b = 2ζ√(K(I+A)) on its own hull (`sea/motion.py:damping_from_ratios`) | physical, +0.1376 |
+| `standalone` | `blueboat_control` `Sim_launch.py` (its default; it starts no sea node) | Gazebo's buoyancy box | **−118.09, −5.086, −6.952** (same rule, ζ 0.30 / 0.20 / 0.20 of R-8 §2.4, on the box: K 1264 N/m, 38.4, 46.0 N·m/rad; I + A 30.65 kg, 4.214, 6.570) | box construction, −0.12915 |
+
+Exactly once, every path [VERIFIED in code]: the sea node reads the plugin's linear damping from
+`/blueboat/robot_description` (`ros/sea_state_node.py` → `sea/plant.py:parse_urdf`) and adds
+`max(0, b_target − b_plugin)` (`sea/motion.py:damping_for_zeta`). With `sea_node` it carries the whole damping,
+and with `standalone` + an MCS companion only the complement. Without a sea node, the plugin's damping is all
+there is.
+
+| Still LEGACY | Value | Why kept |
 |---|---|---|
-| `zDotW`, `kDotP`, `mDotQ` | −14.57, −0.12, −0.12 | BlueROV2 values. `BlueBoat-SSS-Sim` `config/sea_states.yaml` (`hull.damping`) and `sea/motion.py` mirror them by hand, and the simulator's heave / roll / pitch damping is sized as the complement of `zW`, `kP`, `mQ` |
-| `zW`, `kP`, `mQ` | −17.955, −10.888, −20.761 | same |
-| `zWabsW`, `kPabsP`, `mQabsQ` | −73.37135, −40.0, −40.0 | same |
-| `ixx`, `izz`, mass, buoyancy box | 2.42369, 5.6403125, 16.01 kg, 1.2 × 0.91 × 0.376 m | the simulator's smoke test reads the first `<inertial>` block and subtracts the box buoyancy with these numbers |
+| `ixx`, `izz` rigid parts, mass, buoyancy box | 2.42369, 5.6403125, 16.01 kg, 1.2 × 0.91 × 0.376 m | no source for other values. The simulator's smoke test reads the first (legacy) `<inertial>` block literally |
 
-Ownership of the degrees of freedom: surge, sway, yaw — this module (above). Heave, roll, pitch — the
-simulator's hull wrench (hydrostatics and damping) on top of the nine values of this table. The simulator adds no
-surge, sway or yaw damping (read in `sea/hull.py`, `docs/sea_state_model.md`), so nothing is counted twice there.
+Ownership of the degrees of freedom: surge, sway, yaw: this module (§3). Heave, roll, pitch: this module's
+inertias, plus the simulator's hull wrench (hydrostatics and, under `sea_node`, all of the damping). The simulator
+adds no surge, sway or yaw damping (`sea/hull.py`, `docs/sea_state_model.md`), so nothing is counted twice.
 
 ---
 
@@ -175,6 +204,10 @@ Per-day gains for re-flying field runs: `blueboat_control/config/field_runs/` (i
 ---
 
 ## 8. Mission-duration effect of the hull interval (R4)
+
+Computed 2026-11-14 with the sway of session 04 (`Yvv` 108, `Nr` 6.31, `Nur` 4.76). Not re-run on the
+2026-11-15 sway (the harness's `identified` variant now mirrors it; `identified_slow` / `_fast` are still session
+04's).
 
 20-minute lawnmower at 1.0 m/s (10 lines of 100 m, 10 m apart, 5 m half-circle turns; route time 1139 s), MPC,
 field-equivalent column, offline harness plant (`test/mc_harness.py --plant …`), calm, ideal odometry. `r4/`.

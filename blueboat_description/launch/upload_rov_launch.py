@@ -16,6 +16,8 @@ sl.declare_arg('replay', False)
 # Hull and actuator model of the description (2026-11-13): identified (the BlueBoat plant
 # identified on field logs, default) | bluerov2_legacy (every simulation before that date).
 sl.declare_arg('plant', 'identified')
+# Who owns heave / roll / pitch of the identified plant (2026-11-15, R-8; blueboat.xacro): sea_node (default) | standalone
+sl.declare_arg('vertical_model', 'sea_node')
 # Where Gazebo's odometry goes (2026-11-13). True (default): the raw topic <ns>/odom_gz, and
 # blueboat_control's simulation_interface republishes <ns>/odom at the field rate and delay
 # (or unchanged, its odom_profile:=passthrough). False: straight to <ns>/odom, the graph of before.
@@ -36,7 +38,8 @@ def launch_setup():
     # robot state publisher
     sl.include('blueboat_description', 'state_publisher_launch.py',
                launch_arguments={'namespace': ns, 'use_sim_time': sl.sim_time, 'jsp': False,
-                                 'thr': thr, 'replay': replay, 'plant': sl.arg('plant')})
+                                 'thr': thr, 'replay': replay, 'plant': sl.arg('plant'),
+                                 'vertical_model': sl.arg('vertical_model')})
                
     with sl.group(ns=ns):
                     

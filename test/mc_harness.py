@@ -172,9 +172,12 @@ class IdentifiedPlant(Plant):
     """
 
     VARIANTS = {
-        # identified values (surge: ident/bootstrap.json; yaw: ident/yaw_fit5.json)
-        "identified":      dict(m=16.01, A11=1.60, A22=14.0, Izz=9.48, Xuu=4.23, Yvv=108.0,
-                                Nr=6.31, Nur=4.76, kappa=0.493, kp=1.83),
+        # identified values (surge: ident/bootstrap.json; yaw: ident/yaw_fit5.json; sway drag re-derived at
+        # the CAD draft and Nr / Nur refitted with Izz held, 2026-11-15: 04b_control_r8/fit/yaw_fit5_r8_fixIzz.json)
+        "identified":      dict(m=16.01, A11=1.60, A22=14.0, Izz=9.48, Xuu=4.23, Yvv=319.1,
+                                Nr=6.35, Nur=5.12, kappa=0.493, kp=1.83),
+        # The two ends below are session 04's (sway drag 108, Nr / Nur of its interval), not rebuilt on the
+        # 2026-11-15 sway: register s8 (R4) states its numbers with them.
         # slow end of the 95 % interval: 23.7 N for 1 m/s instead of 20.2, the
         # largest surge and yaw inertia and yaw damping
         "identified_slow": dict(m=16.01, A11=10.87, A22=14.0, Izz=10.95, Xuu=4.96, Yvv=108.0,

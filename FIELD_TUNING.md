@@ -232,6 +232,14 @@ The simulator's own launch (`full_mission_launch.py`) and MCS's world runs get t
 field-equivalent configuration from the defaults of each piece; they cannot select `legacy`
 until that launch forwards the argument (`docs/REQUESTS.md` R-6).
 
+**Heave / roll / pitch (2026-11-15, R-8): `vertical_model`.** `Sim_launch.py` defaults to
+`standalone`: it starts no sea node, so the hull is Gazebo's buoyancy box, the Hydrodynamics plugin
+carries the vertical damping, and the CoG stays at the box construction. World runs
+(`full_mission_launch.py`) get `sea_node`: the simulator's sea node owns hydrostatics and damping,
+and the CoG is the physical one. On the box, the physical CoG capsizes the boat (roll GM −0.025 m).
+So `Sim_launch.py vertical_model:=sea_node` only makes sense with a sea node started beside it.
+Register §4.
+
 ## Symptom → knob
 
 | Symptom | Mode | Try, in order |

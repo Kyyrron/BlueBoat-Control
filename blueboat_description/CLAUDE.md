@@ -14,8 +14,9 @@ downstream) and is removed.
 `upload_rov_launch.py` → `state_publisher_launch.py` like `replay`:
 
 - `identified` (**default**) — `urdf/hydrodynamics_identified.xacro`: surge and yaw identified
-  on field logs, sway derived from the hull geometry, heave / roll / pitch entries kept from the
-  legacy table because the simulator's hull wrench is sized on them. It also states the
+  on field logs, sway derived from the vendor CAD hull, heave / roll / pitch added inertias from
+  R-8 (2026-11-15, the simulator's derivation) with the vertical damping and the CoG selected by
+  the xacro argument `vertical_model` (below). It also states the
   **actuator model** (`thrust_gain_right/left`, `prop_speed_loss`) inside the plugin element:
   Gazebo ignores those tags, `blueboat_control`'s `simulation_interface` reads them from
   `robot_description` and applies them to every command. The link's yaw inertia is the second
@@ -38,6 +39,19 @@ touching either file:
    restores instead of destabilising. `nR` / `nRabsU` were fitted on the plant as integrated;
    changing `yDotV`, `yVabsV`, the plugin version or `<disable_coriolis>` needs a refit. The
    plugin accepts cross terms (`nRabsU` = yaw damping per m/s of surge).
+4. **The plugin's added mass is explicit, and diverges once it is large** (2026-11-15). It is
+   applied from the previous step's acceleration, so the description integrates only while the
+   spectral radius of M_rb⁻¹·M_A **at the link origin** is < 1. The CoG offset couples sway and
+   roll there. R-8's set gave 1.15–1.30, and the boat diverged in Gazebo within 15 s. Hence
+   `zDotW` is capped at −14.5, A44 / A55 are rigid inertia in `ixx` / `izz` (`kDotP`, `mDotQ`
+   0), and `yDotV` stays −14 (the CAD derivation gives 133 kg). Check ρ before raising any
+   added mass (`docs/PARAMETER_REGISTER.md` §3).
+5. **`vertical_model`** (`sea_node` default | `standalone`; threaded like `plant`). `sea_node`:
+   the simulator's sea node owns hydrostatics and all of the vertical damping (plugin `zW kP
+   mQ` = 0) and the identified CoG is the physical one (`z_cog_physical`, +0.1376).
+   `standalone` (`Sim_launch.py`): Gazebo's buoyancy box is the hull, the plugin carries the
+   damping, and the CoG stays at the box construction `z_cog`; the physical CoG capsizes the
+   box (roll GM −0.025 m). The legacy plant ignores the argument.
 
 `upload_rov_launch.py odom_raw` (default True) bridges Gazebo's odometry to `<ns>/odom_gz`
 instead of `<ns>/odom`; `simulation_interface` republishes `/blueboat/odom` from it. False
