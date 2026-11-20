@@ -66,15 +66,22 @@ Duties the Replanner owns:
 The three design rules of `project_synthesis.md` §8.1 (resolution, budget, abandonment) are
 the Replanner's, not Control's.
 
-## R-3 BlueBoat-SSS-Sim — `full_mission_launch.py`
+## R-3 BlueBoat-SSS-Sim — `full_mission_launch.py` — **done 2026-11-18**
 
-That launch starts its own copies of Control's nodes, so built-world simulations cannot run
-replanner-owned runs yet.
+That launch starts its own copies of Control's nodes, so until 2026-11-18 built-world simulations
+could not run replanner-owned runs.
 
 **Request.** Add a `path_source` argument, default `mission`, and pass it as a parameter to
 its `master_control` node.
 
 Nothing else is needed. The simulator's acquisition and sea-state paths are unaffected.
+
+**Done 2026-11-18 (simulator session 13, owner order, before the freeze tag).**
+`full_mission_launch.py` declares `path_source` (default `mission`) and puts it in the launch's own
+`master_control` parameters, after a tuning file and before `control_params_file`, as `Sim_launch.py`
+does. `master_control` validates the value itself (`_init_path_update`). The launch file is outside the
+simulator's code digest (`cc29e08780aac4cd` unchanged). No Control file changed. From MCS:
+`path_source:=replanner` in Extra args.
 
 ## R-4 Superproject root `.claude/CLAUDE.md` — interface tables (for the user to apply)
 

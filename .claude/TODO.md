@@ -9,8 +9,8 @@ Open follow-ups of the **live path update** (`docs/PATH_UPDATE_*.md`), ordered b
   tolerances (0.20 m, 10°) and the lead rule rest on single-site field data and simulation.
 - [ ] **MCS "Replanner mode"** (`docs/REQUESTS.md` R-1). Until then a replanner session is
   started from the CLI, without the station's safety UI.
-- [ ] **BlueBoat-SSS-Sim `full_mission_launch.py`** should pass `path_source` (R-3).
-  Built-world simulations cannot run replanner-owned runs yet.
+- [x] **BlueBoat-SSS-Sim `full_mission_launch.py`** passes `path_source` (R-3, done
+  2026-11-18 in the simulator's launch file; no Control change).
 - [ ] **Optional plan visualisation topic** (R-5), only if MCS/GCS ask. Nothing draws an
   updated path's geometry today; `/set_path` and bag replay show the run-start path.
 - [ ] **Real-boat MPC with path updates.** Not before the real-boat MPC solve time has been

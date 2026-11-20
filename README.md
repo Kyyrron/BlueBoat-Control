@@ -1,6 +1,7 @@
 # BlueBoat-Control
 
-v1.0 - September 14th - 2026
+v1.1 - November 20th - 2026
+
 
 The **platform control stack** for a [BlueRobotics BlueBoat](https://bluerobotics.com/store/boat/blueboat/blueboat/)
 — a small twin-hull uncrewed surface vessel (USV). This repository is what makes the boat
