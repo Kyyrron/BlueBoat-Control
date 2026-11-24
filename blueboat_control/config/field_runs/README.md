@@ -1,6 +1,7 @@
 # Field-run configurations
 
-One ROS parameter file per field day and controller. Each file holds the controller gains
+One ROS parameter file per field day and controller (PID: proportional-integral-derivative,
+LoS: line of sight, MPC: model predictive control). Each file holds the controller gains
 flown that day (only those that differ from today's defaults) and that day's odometry timing
 (`odom_profile`). Use it to re-fly a field run in simulation with the controller as it was.
 
@@ -45,7 +46,7 @@ of the run's controller. The four routes are the designer files under
 | `LawnmowerPID`, `LawnmowerLoS`, `LawnmowerMPC` | `c_plage_lawnmower.yaml` (lawnmower; it was rewritten later, so `.deployed/plage_lawnmower.yaml` may be the version flown) |
 
 These runs saved no copy of their path. To re-fly one with a plain `Sim_launch.py`, shift the
-route so its first point is the origin, and pass its first heading as `spawn_yaw` (radians, ENU).
+route so its first point is the origin, and pass its first heading as `spawn_yaw` (radians, east-north-up convention: 0 = East).
 
 **2026-10-27 and 2026-10-28**: use the run's own `-path.yaml` (in its run folder) as the route.
 - MPC on 2026-10-27: `2026_10_27_MPC_pre_retune.yaml`. Run `10_44_08` needs `odom_profile:=field_13hz`.
