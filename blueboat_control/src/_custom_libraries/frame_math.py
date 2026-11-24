@@ -79,3 +79,31 @@ def inRobotFrame(robot_coords, target_coords):
     psi = wrap_angle(psi_t) - wrap_angle(psi_r)
 
     return x,y,psi
+
+
+# ---------------------------------------------------------------------------
+# Geodesy: lat/lon <-> local east/north metres about an anchor.
+#
+# The equirectangular model on a sphere of the WGS-84 equatorial radius that
+# every module of the superproject uses (blueboat_sss_sim core/geo.py, MCS,
+# GCS -- "byte-identical" by convention), ported here verbatim rather than
+# imported: no module imports a neighbour's package (CM-3). Used by
+# bag_replay.py to place a recorded run in a GPS-anchored built world.
+# ---------------------------------------------------------------------------
+
+EARTH_RADIUS_M = 6378137.0
+
+
+def latlon_to_local_en(lat, lon, lat0, lon0):
+    """(lat, lon) degrees -> (east, north) metres about the anchor (lat0, lon0)."""
+    east = np.radians(np.asarray(lon) - lon0) * EARTH_RADIUS_M * np.cos(np.radians(lat0))
+    north = np.radians(np.asarray(lat) - lat0) * EARTH_RADIUS_M
+    return east, north
+
+
+def local_en_to_latlon(east, north, lat0, lon0):
+    """(east, north) metres about the anchor -> (lat, lon) degrees. Exact
+    inverse of latlon_to_local_en."""
+    lat = lat0 + np.degrees(np.asarray(north) / EARTH_RADIUS_M)
+    lon = lon0 + np.degrees(np.asarray(east) / (EARTH_RADIUS_M * np.cos(np.radians(lat0))))
+    return lat, lon

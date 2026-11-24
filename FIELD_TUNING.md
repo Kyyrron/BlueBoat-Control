@@ -9,13 +9,36 @@ ros2 launch blueboat_control BlueBoat_launch.py controller_type:='PID' \
 ros2 param list /blueboat/master_control      # the whole set
 ```
 
-Defaults are given **real / sim**, selected by the `simulation` parameter (`Sim_launch.py`
-sets it True). A single value means both are the same. All of them are declared in one place,
-`Controller._declare_tuning_parameters`; the **Used in** column names the method that reads
-it, not a line number — lines move, methods do not.
+Defaults are given **real / sim**. A single value means both are the same. All of them are
+declared in one place, `Controller._declare_tuning_parameters`; the **Used in** column names
+the method that reads it, not a line number — lines move, methods do not.
 
-Branch priority in `timer_callback`: manual target → path following → pinger → zero thrust.
-A manual target overrides the path in **every** `controller_type`.
+**Which column runs (2026-11-13).** "real" is the real boat's column. "sim" is the column
+tuned on the old Gazebo plant (BlueROV2 hull coefficients). The parameter `gain_profile`
+chooses:
+
+| `gain_profile` | Column | Where |
+|---|---|---|
+| `''` (default) or `field` | **real** | the real boat, always; and simulation by default: the **field-equivalent** configuration |
+| `sim` | **sim** | simulation only (refused with `simulation:=false`): the **legacy** configuration |
+
+So a simulation now runs the real boat's gains, MPC model, horizon and weights unless asked
+otherwise. `simulation` itself still decides the log file name, `/pose_arrow` and nothing else
+in this file. Proof that the two spellings of the real column are one: `simulation:=false`
+and `simulation:=true gain_profile:=field` are bit-identical on the harness (9 runs, 3
+controllers). See "Simulation configurations" at the end.
+
+Branch priority in `timer_callback`: arrow keys → manual target → path following → pinger →
+zero thrust. A manual target overrides the path in **every** `controller_type`; the station's
+arrow keys override both.
+
+**Run sessions** (`session_mode:=true`, every real-robot launch from the Mission Control
+Station since 2026-10-09). The knobs below are still read once, at node construction, so a
+value passed at launch holds for **every run** of the session. What changes between runs is
+only what the station's Update Mission sends: `controller_type`, pinger-vs-path and the log
+note (`configure` on `/blueboat/run_command`). A switch to MPC builds its solver then, on a
+worker thread — about a second when cached, about a minute after any MPC knob below changed
+— and START RUN waits for it. To change a gain, relaunch the session.
 
 ---
 
@@ -28,6 +51,7 @@ A manual target overrides the path in **every** `controller_type`.
 | `min_thrust` | 2.0 N | `solve_LoS`, `manual_keep_location` | ESC breakaway floor on point-LoS and manual-hold surge; `0.0` = the unfloored law exactly. |
 | `path_request_timeout` | 1.0 s | `timer_callback` | Re-issue a `/path_request` whose answer never came. Without it one lost response wedges the node for the run. |
 | `path_stale_timeout` | 1.0 s | `timer_callback` | Older window → the governor **holds `tau`** instead of running open-loop. |
+| `arrow_timeout` | 0.5 s | `timer_callback` | Dead-man of the station's arrow-key stream (20 Hz): an older command is not applied — zero thrust, and arrow control stays engaged rather than handing back to autonomous control. |
 
 ### Governor (PID, LoS, MPC path following) — `advance_governor`
 
@@ -63,11 +87,11 @@ A manual target overrides the path in **every** `controller_type`.
 
 | Parameter | Default real / sim | Effect |
 |---|---|---|
-| `outer_gains_x` `[kp,ki,kd]` | `[3.0,0.01,0]` / `[6.0,0.01,0]` | Along-track error → surge speed correction on top of the path feedforward. `ki` winds up: keep it tiny. |
-| `outer_gains_psi` | `[3.0,0.01,0]` / `[4.0,0.01,0]` | Heading error → yaw-rate reference. ↑ = snappier turn onto the path, weaving if too high. |
-| `inner_gains_u` | `[1.0,0,0]` / `[2.0,0,0]` | Surge-speed error → force (N per m/s). |
+| `outer_gains_x` `[kp,ki,kd]` | `[3.5,0.01,0]` / `[8.0,0.01,0]` | Along-track error → surge speed correction on top of the path feedforward. `ki` winds up: keep it tiny. |
+| `outer_gains_psi` | `[3.3,0.01,0]` / `[4.0,0.01,0]` | Heading error → yaw-rate reference. ↑ = snappier turn onto the path, weaving if too high. |
+| `inner_gains_u` | `[1.0,0,0]` / `[2.5,0,0]` | Surge-speed error → force (N per m/s). |
 | `inner_gains_r` | `[1.5,0,0]` / `[2.5,0,0]` | Yaw-rate error → moment. Too high = thruster chatter. |
-| `pid_lookahead` (Δ) | 2.5 m | `psi_d = gamma_p + atan2(e_y, Δ)`. Small = aggressive cut back to the line, large = damped. |
+| `pid_lookahead` (Δ) | 2.5 m | `psi_d = gamma_p + atan2(−e_y, Δ)` (`e_y` = cross-track error, positive with the boat left of the path; same law as §2). Small = aggressive cut back to the line, large = damped. |
 | `hold_speed` | 0.05 m/s | Below this authored speed the tangent is rotated toward the bearing to the point, so the along-track term can see the range. |
 | `hold_radius` | 0.5 m | On-station radius; the rotation fades out inside it. |
 
@@ -91,8 +115,8 @@ Surge = authored speed feedforward (no along-track integrator); yaw = P-D on hea
 | Parameter | Default real / sim | Effect |
 |---|---|---|
 | `los_lookahead` (Δ) | 2.5 m | `psi_d = gamma_p + atan2(−e_y, Δ)`; small = harder cut onto the line. |
-| `los_ku` | 20.0 | Surge gain, **N per m/s** of speed error: 0.5 m/s short → 10 N. |
-| `los_kpsi` | 10.0 | Yaw moment per rad of heading error: 0.2 rad → 2 N·m. |
+| `los_ku` | 30.0 (was 20.0 until 2026-10-27) | Surge gain, **N per m/s** of speed error: 0.5 m/s short → 10 N. |
+| `los_kpsi` | 4.5 (was 10.0 until 2026-10-27) | Yaw moment per rad of heading error: 0.2 rad → 2 N·m. |
 | `los_kd` | 1.0 | Yaw-rate damping. **Raise this first** if `los_kpsi` makes the bow hunt. |
 | `los_speed_scale` | 1.0 / **2.0** | Scales the commanded speed, not the target's motion — use `path_speed_scale` to slow a mission. |
 | `hold_speed` | 0.05 m/s | Below it the law steers at the reference **point** and adds hold surge. |
@@ -107,7 +131,7 @@ Surge = authored speed feedforward (no along-track integrator); yaw = P-D on hea
 | Parameter | Default real / sim | Effect |
 |---|---|---|
 | `mpc_horizon` N | 15 / **30** | Prediction steps; sets step `dt = mpc_time/N` and QP size `nv = 2N`. |
-| `mpc_time` | 2.5 s / **6.0 s** | Prediction span. ⚠ The real boat stays at 2.5 s — solve time has never been measured on the companion computer. |
+| `mpc_time` | 2.5 s / **6.0 s** | Prediction span. ⚠ Real-robot runs stay at 2.5 s — the solve time has never been measured in one. |
 | `mpc_Q_diag` `[x,y,psi,u,v,r]` | `[50,50,30,1,1,1]` | Tracking weights: `x/y` for position, `psi` for heading. |
 | `mpc_R_diag` | `[0.015,0.015]` / `[0.10,0.10]` | Effort penalty in N². Sets where full throttle becomes cheaper than the error: **0.015 → 0.49 m, 0.10 → 1.26 m, 0.25 → 2.00 m**. Raise it if the MPC saturates. |
 | `mpc_qp_iter_max` | 0 = derive | qpOASES working-set budget, `0` → `max(50, 4·nu·N)` = 240 at N=30. ⚠ Never pin it below `nv = 2N`, or a saturating solve fails by construction. |
@@ -129,7 +153,7 @@ Active whenever `/blueboat/manual_target ≠ [0,0]`, in **any** `controller_type
 | Parameter | Default real / sim | Effect |
 |---|---|---|
 | `point_k_v` | 0.15 / 2.0 | Surge in `v = 5·ln(k_v·d + 1)`. |
-| `point_k_psi` | 100.0 / 60.0 | Yaw rate per rad of bearing; the differential is `±0.295·yaw_rate`. |
+| `point_k_psi` | 100.0 / 60.0 | Yaw rate per rad of bearing; the pursuit differential is `±0.295·yaw_rate` (only the keep-location hold uses `±0.295·yaw_rate/2`, halved 2026-10-27 — see the note under keep-location). |
 | `min_thrust` | 2.0 N | Breakaway floor, faded over `hold_radius`, killed by `cos(bearing)`. |
 
 **Keep-location (on station)**
@@ -145,10 +169,25 @@ Active whenever `/blueboat/manual_target ≠ [0,0]`, in **any** `controller_type
 | Parameter | Default real / sim | Effect |
 |---|---|---|
 | `manual_hold_radius` | 1.0 m | Arrive inside → hold; also the gap origin. **`<= 0` disables the hold** (pursuit-only, as before). |
-| `manual_reacquire_radius` | 2.0 m | Pushed beyond → resume pursuit. The gap to the above is the anti-toggle hysteresis. |
+| `manual_reacquire_radius` | 1.5 m (was 2.0 until 2026-10-27) | Pushed beyond → resume pursuit. The gap to the above is the anti-toggle hysteresis. |
 | `manual_hold_kx` | 8.0 / 15.0 | Hold surge in **Newtons per metre** of gap (≠ `los_hold_kx`, which is m/s). |
-| `manual_hold_umax` | derived `kx·(reacq − hold)` = 8 / 15 N | Cap. Leave it derived, so retuning a radius cannot break the handover. |
+| `manual_hold_umax` | derived `kx·(reacq − hold)` = 4 / 7.5 N (was 8 / 15 with the 2.0 m radius) | Cap. Leave it derived, so retuning a radius cannot break the handover. |
 | `manual_brake_time` | 1.0 s | Reverse pulse on each **fresh** arrival; a repeated target does not re-arm it. |
+
+> **Yaw differential halved (2026-10-27) — keep-location hold only.** `manual_keep_location`
+> (on station at a manual target, and the replanner run's awaiting-path hold) now returns
+> `[v_hold ± 0.295·yaw_rate/2]` instead of `[v_hold ± 0.295·yaw_rate]`, to stop the bow hunting.
+> The manual-target **pursuit** law and the **pinger** law in `solve_LoS` still return
+> `[v ± 0.295·yaw_rate]` (`master_control.py`, `solve_LoS`; corrected 2026-11-03 against the
+> code, which never halved them). Inside the hold `point_k_psi` therefore acts at half strength;
+> off station it acts at full strength. Path following
+> (PID / LoS / MPC) goes through the allocator and is unaffected. This is **real and simulation
+> alike** (no split).
+
+> **2026-10-27 retune:** real-boat PID `outer_gains_x` kp 3.0 → 3.5, `outer_gains_psi` kp
+> 3.0 → 3.3; LoS `los_ku` 20 → 30, `los_kpsi` 10 → 4.5 and `manual_reacquire_radius`
+> 2.0 → 1.5 m (these three are not split, so simulation too). Simulation PID since:
+> `outer_gains_x` kp 6.0 → 8.0, `inner_gains_u` kp 2.0 → 2.5. **No MPC parameter was touched.**
 
 **Pinger branch** (`use_pinger:=True`, `LoS`) uses the same pursuit law but no hold:
 
@@ -159,6 +198,47 @@ Active whenever `/blueboat/manual_target ≠ [0,0]`, in **any** `controller_type
 With `PID` + pinger, the §1 gains apply in a zeroed body frame.
 
 ---
+
+## Simulation configurations (2026-11-13)
+
+One switch on `Sim_launch.py`, two named configurations. `docs/PARAMETER_REGISTER.md` has the
+origin and interval of every number.
+
+| | `sim_config:=field_equivalent` (default) | `sim_config:=legacy` |
+|---|---|---|
+| Plant (`plant`) | `identified`: the BlueBoat hull and actuator identified on field logs | `bluerov2_legacy`: the BlueROV2 table |
+| Gains, MPC model, horizon, weights (`gain_profile`) | the real boat's column (N 15, T 2.5 s, R 0.015) | the sim-tuned column (N 30, T 6 s, R 0.10) |
+| Thrust applied (`thrust_rate_hz`) | 20 Hz, as `robot_interface` | 10 Hz |
+| `/blueboat/odom` (`odom_profile`) | field timing `field_13hz`: 25 Hz bursts and 4 Hz stretches, link delay | Gazebo's own 20 Hz, no delay |
+| Use | any simulated result meant to transfer to the boat | reproducing a simulation made before 2026-11-13 |
+
+```bash
+ros2 launch blueboat_control Sim_launch.py controller_type:=MPC trajectory:=from_yaml:<route>          # field-equivalent
+ros2 launch blueboat_control Sim_launch.py controller_type:=MPC trajectory:=<…> sim_config:=legacy    # as before
+# single pieces, on top of either: plant:=identified|bluerov2_legacy  odom_profile:=passthrough|field_3hz|field_4hz|field_13hz  odom_seed:=<n>
+# the gains of a field day (blueboat_control/config/field_runs/README.md):
+ros2 launch blueboat_control Sim_launch.py controller_type:=PID trajectory:=<…> \
+  tuning_file:=$(ros2 pkg prefix blueboat_control)/share/blueboat_control/config/field_runs/2026_09_07_PID.yaml
+```
+
+What to expect from the identified plant (measured in Gazebo against the pool run): 0.61 /
+0.99 / 1.40 m/s at 2 × 4 / 10 / 20 N; about 20 N for 1.0 m/s; a time constant in yaw of
+1.5 s at rest, and far less turn per Newton under way than the old plant gave (1.3 °/s for a
+12.7 N differential at 1.1 m/s, against 14 °/s). The sim-tuned column was tuned on a hull
+that needed three times the thrust: do not pair it with the identified plant and read
+anything into the result.
+
+The simulator's own launch (`full_mission_launch.py`) and MCS's world runs get the
+field-equivalent configuration from the defaults of each piece; they cannot select `legacy`
+until that launch forwards the argument (`docs/REQUESTS.md` R-6).
+
+**Heave / roll / pitch (2026-11-15, R-8): `vertical_model`.** `Sim_launch.py` defaults to
+`standalone`: it starts no sea node, so the hull is Gazebo's buoyancy box, the Hydrodynamics plugin
+carries the vertical damping, and the CoG stays at the box construction. World runs
+(`full_mission_launch.py`) get `sea_node`: the simulator's sea node owns hydrostatics and damping,
+and the CoG is the physical one. On the box, the physical CoG capsizes the boat (roll GM −0.025 m).
+So `Sim_launch.py vertical_model:=sea_node` only makes sense with a sea node started beside it.
+Register §4.
 
 ## Symptom → knob
 

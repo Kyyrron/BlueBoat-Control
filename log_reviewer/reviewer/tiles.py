@@ -38,6 +38,8 @@ directory, this reads the change out of its config.json; if it changes the
 projection maths, the copies below are wrong and must be re-copied.
 """
 
+import hashlib
+import io
 import json
 import math
 import os
@@ -127,6 +129,13 @@ class TileProvider(QObject if Signal is not None else object):
         self._memory = {}          # (z, x, y) -> decoded RGB(A) array
         self._order = []           # crude LRU
         self._missing = set()      # tried and failed, do not re-queue forever
+        # The provider's "no imagery here" picture arrives as a normal 200
+        # image (same rule as MCS's tile layer): learn its bytes from a tile
+        # that cannot exist and from any image served for three different
+        # tiles, treat it as missing, and fall back to a coarser zoom.
+        self._placeholders = set()
+        self._hash_keys = {}       # sha1 -> {(z, x, y)}
+        self._probe_started = False
         self._queued = set()
         self._lock = threading.Lock()
         self._worker = None
@@ -163,11 +172,27 @@ class TileProvider(QObject if Signal is not None else object):
         if span_m <= 0:
             return []
         zoom = self.choose_zoom(lat_c, canvas_px / span_m)
+        self._start_probe()
 
-        x0, y0 = latlon_to_tile_xy(lat_hi, lon_lo, zoom)      # north-west
-        x1, y1 = latlon_to_tile_xy(lat_lo, lon_hi, zoom)      # south-east
-        ix0, ix1 = int(math.floor(x0)), int(math.floor(x1))
-        iy0, iy1 = int(math.floor(y0)), int(math.floor(y1))
+        def span(z):
+            x0, y0 = latlon_to_tile_xy(lat_hi, lon_lo, z)      # north-west
+            x1, y1 = latlon_to_tile_xy(lat_lo, lon_hi, z)      # south-east
+            return (int(math.floor(x0)), int(math.floor(x1)),
+                    int(math.floor(y0)), int(math.floor(y1)))
+
+        ix0, ix1, iy0, iy1 = span(zoom)
+        # Every tile of the view known to be missing: use the next coarser
+        # zoom, whose tiles are simply magnified by imshow.
+        while zoom > MIN_ZOOM:
+            n = 2 ** zoom
+            keys = [(zoom, ix, iy) for ix in range(ix0, ix1 + 1)
+                    for iy in range(iy0, iy1 + 1)
+                    if 0 <= ix < n and 0 <= iy < n]
+            if (len(keys) > MAX_TILES or not keys
+                    or any(k not in self._missing for k in keys)):
+                break
+            zoom -= 1
+            ix0, ix1, iy0, iy1 = span(zoom)
         n = 2 ** zoom
         if (ix1 - ix0 + 1) * (iy1 - iy0 + 1) > MAX_TILES:
             return []
@@ -189,12 +214,19 @@ class TileProvider(QObject if Signal is not None else object):
         key = (z, x, y)
         if key in self._memory:
             return self._memory[key]
+        if key in self._missing:
+            return None
         path = self.cache_path(z, x, y)
         if os.path.isfile(path):
             try:
+                with open(path, "rb") as fh:
+                    raw = fh.read()
+                if self._note_hash(key, raw):
+                    self._discard(key)
+                    return None
                 # By content, not by extension - the cache holds JPEG bytes
                 # under a .png name (see the module docstring).
-                with Image.open(path) as handle:
+                with Image.open(io.BytesIO(raw)) as handle:
                     image = np.asarray(handle.convert("RGB"))
             except Exception:                              # noqa: BLE001
                 return None                                # corrupt/partial file
@@ -202,6 +234,60 @@ class TileProvider(QObject if Signal is not None else object):
             return image
         self._queue(key)
         return None
+
+    # -- placeholder detection ---------------------------------------------
+
+    def _note_hash(self, key, data):
+        """Record a tile's bytes; True when they are the placeholder."""
+        digest = hashlib.sha1(data).hexdigest()
+        with self._lock:
+            keys = self._hash_keys.setdefault(digest, set())
+            keys.add(key)
+            learn = len(keys) >= 3
+        if learn:
+            self._learn_placeholder(digest)
+        return digest in self._placeholders
+
+    def _learn_placeholder(self, digest):
+        with self._lock:
+            if digest in self._placeholders:
+                return
+            self._placeholders.add(digest)
+            keys = list(self._hash_keys.get(digest, ()))
+        for key in keys:
+            self._discard(key)
+
+    def _discard(self, key):
+        """A placeholder: never drawn, never re-queued, off the shared cache
+        (MCS removes it too)."""
+        with self._lock:
+            self._missing.add(key)
+        self._memory.pop(key, None)
+        try:
+            os.remove(self.cache_path(*key))
+        except OSError:
+            pass
+
+    def _start_probe(self):
+        if self._probe_started or not self.fetch_enabled:
+            return
+        self._probe_started = True
+        threading.Thread(target=self._probe, daemon=True).start()
+
+    def _probe(self):
+        # The deepest tile in an open-ocean corner: no imagery exists there,
+        # so whatever the server answers is its placeholder.
+        try:
+            url = self.tile_url.format(z=self.max_zoom, x=0, y=0)
+            reply = requests.get(url, timeout=FETCH_TIMEOUT_S,
+                                 headers={"User-Agent": USER_AGENT})
+            if reply.status_code == 200 and reply.content:
+                self._learn_placeholder(
+                    hashlib.sha1(reply.content).hexdigest())
+                if Signal is not None:
+                    self.tileReady.emit()      # redraw without the grey tiles
+        except Exception:                                  # noqa: BLE001
+            pass
 
     def _remember(self, key, image):
         self._memory[key] = image
@@ -248,6 +334,9 @@ class TileProvider(QObject if Signal is not None else object):
                 with self._lock:
                     self._missing.add(key)
                 return False
+            if self._note_hash(key, reply.content):
+                self._discard(key)
+                return True                # redraw: fall back to a coarser zoom
             # Atomic, so a Mission Control Station reading the same cache at
             # the same moment can never see a half-written tile.
             partial = target + ".part"

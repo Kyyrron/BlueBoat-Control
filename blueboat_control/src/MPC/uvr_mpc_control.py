@@ -1,29 +1,23 @@
 #!/usr/bin/env python3
 
 # rclpy
-from rclpy.node import Node, QoSProfile
-from rclpy.qos import QoSDurabilityPolicy
+from rclpy.node import Node
 import rclpy
 
 # Common python libraries
-import time
 import math
 import numpy as np
-from scipy.spatial.transform import Rotation as R
 from datetime import datetime
 
 # ROS2 msg libraries
-from std_msgs.msg import String, Float32, Float32MultiArray
+from std_msgs.msg import Float32MultiArray
 from nav_msgs.msg import Odometry, Path
-from geometry_msgs.msg import PoseStamped, Pose, Twist, Point, Quaternion, Vector3
 from visualization_msgs.msg import Marker
 
 # Custom libraries
-from urdf_parser_py import urdf
 import uvr_mpc
 from blueboat_control import ROV
 from blueboat_interfaces.srv import RequestPath
-import os
 import custom_functions as cf
 
 class Controller(Node):
@@ -52,7 +46,6 @@ class Controller(Node):
         self.mpc_time = 2.0
         self.mpc_path = Path()
         linear_bound = 40.0
-        angular_bound = 15.0
         self.input_bounds = {"lower": np.array([-linear_bound, -linear_bound, -linear_bound]),
                              "upper": np.array([linear_bound, linear_bound, linear_bound]),
                              "idx":   np.array([0, 1, 2])

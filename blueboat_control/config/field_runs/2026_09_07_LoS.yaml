@@ -1,0 +1,14 @@
+# Controller configuration as flown in the field - for re-flying that run in simulation:
+#   ros2 launch blueboat_control Sim_launch.py controller_type:=LoS tuning_file:=<this file> trajectory:=<route>
+# (sim_config:=field_equivalent, the default, supplies the identified plant, the real MPC model and 20 Hz thrust).
+# Day: 2026-09-07 (beach basin; odometry at 3.0 Hz, no sonar processor).  Status: certain [VERIFIED in git]
+# Source of the values: master_control.py real defaults at git 80d5f3d (2026-09-06) and c387079 (2026-09-09), identical; controller_comparison report Table 1
+# Only what differed from today's real-boat defaults is listed, plus the odometry timing of that day.
+/**:
+  ros__parameters:
+    los_ku: 20.0
+    los_kpsi: 10.0
+    los_kd: 1.0
+    los_lookahead: 2.5
+    los_speed_scale: 1.0
+    odom_profile: field_3hz

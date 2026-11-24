@@ -10,9 +10,13 @@ rewrites or deletes one - not even the file the operator has just renamed in
 the toolbar, which renames only the EXPORT. Everything written goes into
 
     ~/ros2_ws/data/Processed_Robot_data/<name>/
-        <name>.csv            the rows inside the timeline, every column, verbatim
+        <name>.csv            legend rows, then the rows inside the timeline,
+                              every column, verbatim (with the pinger ticked: in
+                              the with-pinger layout, see `write_cropped_csv`)
         <name>.png            the report as framed in the app
+        <name>.gif            the track replayed at x5-x20, as framed in the app
         <name>-origin.yaml    a COPY of the run's origin sidecar
+        <name>-bag/           a COPY of the run's whole ros2 bag, when it has one
         export.yaml           what was cropped, from what, with which text
 
 which is derived data: re-exporting the same window is expected, and
@@ -34,7 +38,9 @@ import yaml
 from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 from . import figures as F
+from . import pinger_bag as PB
 from . import poslog_bridge as pb
+from . import replay_video as V
 
 DEFAULT_ROOT = os.path.join(os.path.expanduser("~"), "ros2_ws", "data",
                             "Processed_Robot_data")
@@ -89,8 +95,8 @@ def safe_name(name, fallback="log"):
 
 
 def export(source_csv, name, crop, texts, root=None, tile_provider=None,
-           track_limits=None, overwrite=False):
-    """Write the four files. Returns the folder path.
+           track_limits=None, overwrite=False, video_speed=V.DEFAULT_SPEED):
+    """Write the five files, plus a copy of the run's bag. Returns the folder path.
 
     `root` resolves at CALL time, not at import time. A default argument of
     `DEFAULT_ROOT` binds the value once, so anything that redirects the root
@@ -109,7 +115,14 @@ def export(source_csv, name, crop, texts, root=None, tile_provider=None,
 
     csv_out = os.path.join(folder, name + ".csv")
     png_out = os.path.join(folder, name + ".png")
-    written_rows = write_cropped_csv(source_csv, csv_out, crop["row_index"])
+    pinger = crop["pinger"] if crop.get("pinger_show") and crop.get("pinger") else None
+    # A log that is already a with-pinger layout keeps its CSV verbatim (the raw
+    # pinger columns are field record); only the picture and video gain the
+    # filtered pinger.
+    add_columns = pinger is not None and crop["layout"] != "pinger"
+    written_rows, legend_from = write_cropped_csv(
+        source_csv, csv_out, crop["row_index"],
+        PB.export_columns(crop) if add_columns else None)
 
     figure = F.build_report_figure(crop, texts, tile_provider, track_limits)
     FigureCanvasAgg(figure)
@@ -123,36 +136,133 @@ def export(source_csv, name, crop, texts, root=None, tile_provider=None,
         sidecar_out = os.path.join(folder, name + "-origin.yaml")
         shutil.copy2(sidecar_in, sidecar_out)      # copied, never moved
 
+    # The video is a convenience on top of the record, so its failure is
+    # written into the manifest instead of costing the export its manifest.
+    gif_out = os.path.join(folder, name + ".gif")
+    try:
+        video = V.write_replay_gif(gif_out, crop, texts, tile_provider,
+                                   track_limits, video_speed)
+    except Exception as exc:                                    # noqa: BLE001
+        video = {"error": "%s: %s" % (type(exc).__name__, exc)}
+    if video is None:
+        video = {"skipped": "no drawable track in this selection"}
+    if "file" not in video and os.path.isfile(gif_out):
+        os.remove(gif_out)                  # a stale or partial video would lie
+
+    bag = copy_bag(source_csv, os.path.join(folder, name + "-bag"))
+
     write_manifest(os.path.join(folder, "export.yaml"), source_csv, sidecar_in,
-                   crop, texts, written_rows, track_limits, name)
+                   crop, texts, written_rows, track_limits, name, video,
+                   legend_from, PB.source_name(crop) if pinger else None, bag)
     return folder
 
 
-def write_cropped_csv(source_csv, out_csv, row_index):
-    """Copy the header and the selected data rows, field for field.
+def copy_bag(source_csv, bag_out):
+    """Copy the run's ros2 bag (found beside its poslog) to `bag_out`, whole.
 
-    `row_index` counts DATA rows, ignoring the header - the same numbering
-    `poslog_report.read_poslog` produces, which is what the crop carries.
+    The bag is field record (CM-7): it is COPIED, never moved, and never cut
+    to the timeline - trimming an MCAP means rewriting it, and the export's
+    rule is verbatim or nothing. `export.yaml` `crop` says which window of it
+    the rest of the export covers. Copied into `<bag_out>.part` and renamed
+    once complete, so an interrupted copy never sits under the final name.
+
+    Like the video, a failure is returned for the manifest, never raised, and a
+    bag left by an earlier export of the same name is removed first: an export
+    of a run with no bag must not carry another run's.
+    Returns the manifest's `bag` entry.
+    """
+    staging = bag_out + ".part"
+    for stale in (bag_out, staging):
+        if os.path.isdir(stale):
+            shutil.rmtree(stale)
+    bag_in = PB.find_bag(source_csv)
+    if bag_in is None:
+        return {"skipped": "no ros2 bag beside the source log"}
+    try:
+        shutil.copytree(bag_in, staging)       # hidden `.run-bag-*.mcap` included
+        os.replace(staging, bag_out)
+    except Exception as exc:                                    # noqa: BLE001
+        if os.path.isdir(staging):
+            shutil.rmtree(staging, ignore_errors=True)
+        return {"source": bag_in, "error": "%s: %s" % (type(exc).__name__, exc)}
+    files = sorted(os.listdir(bag_out))
+    size = sum(os.path.getsize(os.path.join(bag_out, f)) for f in files)
+    return {"source": bag_in, "folder": os.path.basename(bag_out),
+            "files": files, "bytes": size, "cropped": False}
+
+
+def write_cropped_csv(source_csv, out_csv, row_index, pinger_columns=None):
+    """Copy the legend, the header and the selected data rows, field for field.
+
+    An export ALWAYS opens with the two legend rows (description, unit) of
+    `robot_log_schema`, whatever the source's age: a log written since
+    2026-10-08 carries them and they are copied verbatim; an older one has
+    none, and they are built from the schema for its header (a column the
+    schema does not know gets empty cells). The data rows are copied verbatim
+    either way - only the export gains the legend, never the source.
+
+    `row_index` counts DATA rows, ignoring legend and header, and skipping
+    blank lines - the same numbering `poslog_report.read_poslog` produces,
+    which is what the crop carries.
+
+    `pinger_columns` (from `pinger_bag.export_columns`, one value per kept row
+    in order) turns the export into a WITH-PINGER log, so this same app reads it
+    back with no second code path: the header is `COLUMNS_PINGER`, the target
+    block is the pinger, the raw Water Linked packet fills `aco..filaco`, and
+    every source column the pinger layout does not have - the path target
+    (`target_x/y`, `target_latitude/longitude`) above all - follows at the end,
+    so nothing of the field record is dropped. The values of the columns both
+    layouts share are still copied verbatim; the legend is rebuilt from the
+    schema, because the source's no longer lines up with the new header.
+
+    Returns (rows written, "source" or "schema" - where the legend came from).
     """
     wanted = set(int(i) for i in row_index)
     written = 0
-    with open(source_csv, newline="") as source, \
-            open(out_csv, "w", newline="") as target:
-        reader = csv.reader(source)
+    with open(source_csv, newline="") as source:
+        table = list(csv.reader(source))
+    legend, header_index = pb.rls.split_header(table)
+    if header_index is None:
+        raise pb.PoslogError("%s: not a poslog (no 'relative_x' column)" % source_csv)
+    header = table[header_index]
+    legend_from = "source" if legend else "schema"
+    out_header = header
+    if pinger_columns is not None:
+        out_header = list(pb.rls.COLUMNS_PINGER) + [
+            name for name in header if name not in pb.rls.COLUMNS_PINGER]
+        legend, legend_from = None, "schema"
+    if legend is None:
+        legend = pb.rls.legend_rows(out_header)
+    order = sorted(int(i) for i in row_index)
+    place = {number: k for k, number in enumerate(order)}
+
+    with open(out_csv, "w", newline="") as target:
         writer = csv.writer(target, lineterminator="\n")
-        try:
-            writer.writerow(next(reader))
-        except StopIteration:
-            return 0
-        for number, row in enumerate(reader):
-            if number in wanted:
-                writer.writerow(row)
-                written += 1
-    return written
+        writer.writerows(legend)
+        writer.writerow(out_header)
+        data_rows = (row for row in table[header_index + 1:] if row)
+        for number, row in enumerate(data_rows):
+            if number not in wanted:
+                continue
+            if pinger_columns is not None:
+                row = _pinger_row(header, row, out_header, pinger_columns,
+                                  place[number])
+            writer.writerow(row)
+            written += 1
+    return written, legend_from
+
+
+def _pinger_row(header, row, out_header, pinger_columns, k):
+    """One data row in the with-pinger layout: pinger values from the bag, every
+    other column the source's own text."""
+    source = {name: (row[i] if i < len(row) else "") for i, name in enumerate(header)}
+    return [repr(float(pinger_columns[name][k])) if name in pinger_columns
+            else source.get(name, "") for name in out_header]
 
 
 def write_manifest(path, source_csv, sidecar_in, crop, texts, written_rows,
-                   track_limits, name):
+                   track_limits, name, video=None, legend_from=None, pinger=None,
+                   bag=None):
     """Everything needed to say what this export is and redo it."""
     t = crop["t"]
     rows = crop["row_index"]
@@ -168,6 +278,9 @@ def write_manifest(path, source_csv, sidecar_in, crop, texts, written_rows,
             "layout": crop["layout"],
             "target": crop["spec"]["target_name"],
             "rows": int(crop.get("n_rows_full", crop["n_rows"])),
+            # Where the export's legend rows came from: copied from the source,
+            # or built from robot_log_schema for a log older than 2026-10-08.
+            "legend": legend_from,
         },
         "crop": {
             "t_start_s": round(float(window[0]), 3),
@@ -186,8 +299,15 @@ def write_manifest(path, source_csv, sidecar_in, crop, texts, written_rows,
                         "lat_min": round(float(track_limits[2]), 8),
                         "lat_max": round(float(track_limits[3]), 8)}
                        if track_limits else {"framed": "fit to selection"}),
+        "video": video,
+        "bag": bag,
         "texts": dict(texts),
     }
+    if pinger:
+        # What the CSV's pinger columns came from, and the filter that decided
+        # which samples to trust - so the numbers can be reproduced or doubted.
+        manifest["pinger"] = dict(pinger, csv_layout="pinger",
+                                  columns_added=crop["layout"] != "pinger")
     with open(path, "w") as handle:
         yaml.safe_dump(plain(manifest), handle, sort_keys=False,
                        allow_unicode=True, default_flow_style=False)

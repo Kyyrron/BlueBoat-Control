@@ -50,6 +50,25 @@ install(PROGRAMS src/_custom_libraries/path_stamp.py
 
 install(PROGRAMS src/_custom_libraries/thrust_limits.py
         DESTINATION lib/${PROJECT_NAME})
+# v1.1: the per-run ros2bag recorder process (imported by robot_interface)
+# and the bag replay node (Replay_launch.py).
+install(PROGRAMS src/_custom_libraries/run_bag.py
+        DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS src/_custom_libraries/path_update.py
+        DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS src/_custom_libraries/path_update_log.py
+        DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS src/bag_replay.py
+        DESTINATION lib/${PROJECT_NAME})
+# 2026-10-27: the replay's attitude/heave maths (ROS-free, imported by bag_replay).
+install(PROGRAMS src/_custom_libraries/replay_attitude.py
+        DESTINATION lib/${PROJECT_NAME})
+
+# 2026-11-13: field odometry timing for simulation (ROS-free, imported by simulation_interface).
+install(PROGRAMS src/_custom_libraries/odom_emulation.py
+        DESTINATION lib/${PROJECT_NAME})
+# 2026-11-13: per-run controller configurations (gains flown on a given field day).
+install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 
 install(PROGRAMS src/robot_interaction/robot_interface.py
         DESTINATION lib/${PROJECT_NAME})

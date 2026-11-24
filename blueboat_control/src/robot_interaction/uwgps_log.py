@@ -3,10 +3,6 @@
 import argparse
 import datetime
 import requests
-import os
-import time
-import numpy as np
-import logging
 
 import rclpy
 from rclpy.node import Node

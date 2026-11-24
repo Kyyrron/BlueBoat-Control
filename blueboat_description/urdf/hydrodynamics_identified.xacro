@@ -1,0 +1,108 @@
+<?xml version="1.0"?>
+
+<xacro xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+<!--
+  IDENTIFIED BlueBoat plant (2026-11-13) - selected by blueboat.xacro plant:=identified (the default).
+  The BlueROV2 table stays in hydrodynamics.xacro (plant:=bluerov2_legacy).
+
+  Every number below is in docs/PARAMETER_REGISTER.md with its origin, 95 % interval and the script that
+  produced it (~/ros2_ws/sim_runs/sim_acceptance/04_control/ident/). In short:
+
+  * Identified on the pool run Newton_vs_Speed (2026-10-27 10:33, open-loop thrust steps), cross-checked on the
+    six runs of 2026-09-07 used for fitting (sine weave and expanding square, PID / LoS / MPC).
+  * SURGE, YAW and the ACTUATOR MODEL are identified. SWAY is not identifiable from those logs: it is derived
+    from the vendor CAD hull (draft 0.212 m) and bracketed. HEAVE, ROLL and PITCH (R-8, 2026-11-15): added
+    inertias from BlueBoat-SSS-Sim session 03's derivation, with two forced by this plugin's stability bound (heave
+    capped; roll / pitch carried as rigid inertia in blueboat.xacro); damping by xacro arg vertical_model (below).
+  * What the logs identify is the response to COMMANDED thrust. A commanded Newton is the vendor's bollard
+    figure for the M200 motor + weedless propeller at 16 V (custom_functions.generate_interpolator), not a
+    measured force. The plant is therefore written in two parts that only make sense together:
+      - this hull, in physical units, for the rigid mass of blueboat.xacro;
+      - an actuator model, applied by simulation_interface to every command before it reaches Gazebo:
+            applied = thrust_gain_side * ( T - prop_speed_loss * sqrt|T| * surge_speed )
+        thrust_gain carries the scale kappa between a commanded and an applied Newton (0.493);
+        prop_speed_loss is the loss of thrust with advance speed. The response to a command is what was
+        identified; kappa only splits it between "thrust" and "inertia" (bracket 0.45 - 0.85), which matters
+        for the response to wave and current forces.
+      - A right/left thrust asymmetry is NOT in this plant: its sign and size are not identifiable on the pool
+        run (three model forms give -0.24, -0.12 and +0.07). The field runs of 2026-09-07 all needed more
+        right than left thrust (+2.4 to +4.6 N), in wind. To study it, give the two gains different values
+        here or through simulation_interface's thrust_gain parameter (bracket a = -0.25 ... +0.10 around
+        kappa: right = kappa (1 + a), left = kappa (1 - a)).
+  * Yaw damping grows with surge speed: at rest the boat answers a differential thrust with a time constant of
+    about 1.5 s; under way it turns less for the same differential. Two things give that here, FITTED TOGETHER
+    on the plant as Gazebo integrates it: nRabsU, and the sway-yaw coupling of this plugin, whose added-mass
+    Coriolis terms have the opposite sign to Fossen's (gz-sim 8.15, HydrodynamicsUtils.hh) and so act as a
+    restoring moment. Changing yDotV, yVabsV, the plugin version or <disable_coriolis> therefore needs a refit
+    of nR / nRabsU (ident/yaw_fit5.py). Done 2026-11-15 for yVabsV -319.1 with Izz held at 9.48
+    (04b_control_r8/fit/yaw_fit5_r8_fixIzz.py); across the Yvv bracket 213 - 426 nRabsU moves from 4.73 to 5.53.
+-->
+
+<!-- R-8 (2026-11-15, session 04b; ~/ros2_ws/sim_runs/sim_acceptance/03_sea_state/R8_request_for_control.md).
+     Heave added mass A33: R-8 derives 16.15 kg (1.0 x displacement, MSS otter_legacy.m rule, bracket 0.5 - 1.5 m).
+     FORCED to 14.5 kg = 0.9 x the moving mass 16.15 kg (16.01 + 2 x 0.07). gz-sim 8.15's plugin applies added mass
+     from the previous step's acceleration (Hydrodynamics.cc stateDot = (state - prevState) / dt), which is unstable
+     for A >= m: at -16.15 the boat diverged within 15 s in Gazebo (session 04b, gz/r8_zDotW_16p15_external).
+     Heave natural frequency with it: 1.35 Hz on the CAD hull (K33 2199 N/m, R-8 2.1), 1.02 Hz on Gazebo's box (1264 N/m).
+     The bound that matters is the spectral radius of M_rb^-1 M_A at the link origin (< 1); it couples sway and roll
+     through the CoG offset, which is why A44 / A55 are rigid inertia in blueboat.xacro (kDotP / mDotQ 0 here). -->
+<xacro:property name="zDotW_identified" value="-14.5"/>
+<!-- Vertical (heave / roll / pitch) damping, xacro arg vertical_model (blueboat.xacro):
+       sea_node (default)  0 here: the simulator's sea-state node (BlueBoat-SSS-Sim sea/motion.py damping_from_ratios)
+                           carries all of it - every world run (full_mission_launch.py).
+       standalone          carried here (Control's own Sim_launch.py, which starts no sea node). Same rule as R-8 2.4,
+                           b = 2 zeta sqrt(K (I + A)), zeta 0.30 / 0.20 / 0.20, with K of the hull that run has (Gazebo's
+                           buoyancy box: 1264 N/m, 38.4 and 46.0 N.m/rad) and I + A as carried (30.65 kg, 4.214, 6.570).
+                           A sea node started beside it sizes its share as the complement: damped once either way. -->
+<xacro:if value="${vertical_model == 'standalone'}">
+  <xacro:property name="zW_identified" value="-118.09"/>
+  <xacro:property name="kP_identified" value="-5.086"/>
+  <xacro:property name="mQ_identified" value="-6.952"/>
+</xacro:if>
+<xacro:unless value="${vertical_model == 'standalone'}">
+  <xacro:property name="zW_identified" value="0.0"/>
+  <xacro:property name="kP_identified" value="0.0"/>
+  <xacro:property name="mQ_identified" value="0.0"/>
+</xacro:unless>
+
+<gazebo>
+    <plugin filename="ignition-gazebo-hydrodynamics-system" name="ignition::gazebo::systems::Hydrodynamics">
+
+    <!-- Notation: Fossen, Handbook of Marine Craft Hydrodynamics and Motion Control (2011) -->
+    <link_name>${ns}/base_link</link_name>
+
+    <!-- Negative diagonal of the added-mass matrix -->
+    <xDotU>-1.60</xDotU>          <!-- DERIVED: 10 % of the rigid mass (slender hull); total 17.61 kg = kappa * 35.7 kg identified -->
+    <yDotV>-14.0</yDotV>          <!-- FORCED (2026-11-15): strip theory rho pi T(x)^2 / 2 per demihull gives 132.6 kg at the CAD draft 0.212 m (13.6 at the 0.06 m of before); the plugin's explicit added mass is unstable for A >= m at the link origin, so 14.0 is kept. Bracket 8 - 133 kg (Gazebo: <= 14) -->
+    <zDotW>${zDotW_identified}</zDotW>    <!-- R-8: see the property above the plugin -->
+    <kDotP>0.0</kDotP>            <!-- R-8 A44 1.79 [0.90, 2.69] is carried as rigid roll inertia (blueboat.xacro): FORCED -->
+    <mDotQ>0.0</mDotQ>            <!-- R-8 A55 0.93 [0.47, 1.40] is carried as rigid pitch inertia (blueboat.xacro): FORCED -->
+    <nDotR>-1.98</nDotR>          <!-- IDENTIFIED total yaw inertia 9.48 kg.m2 [8.11, 10.95] = 7.50 rigid (blueboat.xacro) + 1.98 here -->
+
+    <!-- Negative linear damping -->
+    <xU>0.0</xU>                  <!-- IDENTIFIED: no linear term needed (fits to zero) -->
+    <yV>0.0</yV>                  <!-- not identifiable; cross-flow drag only -->
+    <zW>${zW_identified}</zW>      <!-- R-8: vertical damping, see vertical_model above -->
+    <kP>${kP_identified}</kP>
+    <mQ>${mQ_identified}</mQ>
+    <nR>-6.35</nR>                <!-- IDENTIFIED, N.m.s/rad, 95 % [3.30, 7.08]; refit 2026-11-15 for yVabsV -319.1 (was -6.31) -->
+
+    <!-- Negative quadratic damping -->
+    <xUabsU>-4.23</xUabsU>        <!-- IDENTIFIED: kappa * 8.58 N.s2/m2 -->
+    <yVabsV>-319.1</yVabsV>       <!-- DERIVED (2026-11-15): cross-flow drag 1/2 rho Cd A, Cd 1.5 on the CAD lateral area 2 x 0.2127 m2 at 0.212 m draft (was 108.0 on 0.144 m2 at 0.06 m); bracket Cd 1.0 - 2.0: 213 - 426 -->
+    <zWabsW>0.0</zWabsW>          <!-- R-8: no quadratic vertical damping (folded into the linear equivalent) -->
+    <kPabsP>0.0</kPabsP>
+    <mQabsQ>0.0</mQabsQ>
+    <nRabsR>0.0</nRabsR>          <!-- IDENTIFIED: no r|r| term needed (fits to zero) -->
+    <nRabsU>-5.12</nRabsU>        <!-- IDENTIFIED: yaw damping per m/s of surge, N.m.s/rad per m/s, 95 % [1.33, 15.5]; refit 2026-11-15 (was -4.76) -->
+
+    <!-- Actuator model, read by blueboat_control simulation_interface (Gazebo ignores these tags) -->
+    <plant_name>identified_2026_11_15_r8</plant_name>
+    <thrust_gain_right>0.493</thrust_gain_right>    <!-- kappa = (16.01 + 1.60) kg / 35.7 kg identified, bracket 0.45 - 0.85 -->
+    <thrust_gain_left>0.493</thrust_gain_left>      <!-- same: no asymmetry identified (see the header) -->
+    <prop_speed_loss>1.83</prop_speed_loss>         <!-- sqrt(N).s/m per thruster, 95 % [0, 2.98] -->
+
+    </plugin>
+</gazebo>
+</xacro>

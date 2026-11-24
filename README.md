@@ -1,237 +1,174 @@
 # BlueBoat-Control
 
-v1.0 - September 14th - 2026
+The control stack of a [BlueRobotics BlueBoat](https://bluerobotics.com/store/boat/blueboat/blueboat/),
+a small twin-hull uncrewed surface vessel (USV). This module makes the boat move. It follows a
+path with one of three controllers, drives the two thrusters through the autopilot, and logs
+every run. The same ROS 2 interface runs in the Gazebo simulator and on the real boat.
 
-The **platform control stack** for a [BlueRobotics BlueBoat](https://bluerobotics.com/store/boat/blueboat/blueboat/)
-— a small twin-hull uncrewed surface vessel (USV). This repository is what makes the boat
-move: the MAVROS/ArduPilot bridge, the thruster driver, trajectory generation, and three
-interchangeable controllers (**MPC**, **PID**, **LoS**). It also carries the Gazebo model of
-the boat, so the identical ROS interface runs in simulation and on the water, and a desktop
-app for reading back a recorded mission.
+![Real field runs: the planned path (black) and the path each controller flew](controller_comparison/figures/fig1_trajectories.png)
 
-Three ROS 2 packages plus one standalone app:
+*Four routes flown on the water at a beach basin, once with each controller. The black line is
+the planned path. The coloured line is where the boat really went. The closer they are, the
+better the controller follows the path.*
 
-| | What it is |
-|---|---|
-| `blueboat_control` | Every node, controller, trajectory and launch file |
-| `blueboat_description` | URDF/xacro model, meshes, Gazebo world and the spawn/bridge launch chain |
-| `blueboat_interfaces` | `RequestPath.srv`, `OmniscanProfile.msg`, `ProcessedSSSPing.msg` |
-| `log_reviewer/` | PySide6 desktop app for reading a recorded mission (not a ROS package) |
+## What you can do with it
 
-`blueboat_interfaces` is defined **here** and consumed by the side-scan-sonar modules, so this
-repository has to be built before them:
-[BlueBoat-SSS](https://github.com/Kyyrron/BlueBoat-SSS) ·
-[BlueBoat-SSS-Sim](https://github.com/Kyyrron/BlueBoat-SSS-Sim) ·
-[BlueBoat-MCS](https://github.com/Kyyrron/BlueBoat-MCS).
+- **Drive the boat along a path** with one of three controllers you choose at launch: model
+  predictive control (MPC), proportional-integral-derivative (PID) or line of sight (LoS).
+- **Fly built-in test shapes** (circle, square, sine, lawnmower...) or any survey path drawn in
+  the Mission Control Station.
+- **Simulate the boat in Gazebo** with a model identified from real field logs, so simulated and
+  real runs can be compared.
+- **Change the path while the boat moves** (the live path update). The Replanner uses this.
+- **Log every run**: a position log, a report picture and, on the real boat, a ros2 bag.
+- **Replay a recorded real run in Gazebo**, with the boat moving exactly as it did on the water.
+- **Review a run on your desk** with the log reviewer app (below), without ROS.
 
-> This package started from [BlueROV2](https://github.com/CentraleNantesROV/bluerov2) and the
-> hull's hydrodynamic properties are still the BlueROV2 ones.
+![The log reviewer on a real pool run](docs/img/log_reviewer.png)
 
----
+*The log reviewer on a real run in a pool. On the left, the boat's track (blue) and the target it
+was sent to (orange). On the right, how far the boat was from its target, its speed and the
+thrust of each motor. The bar at the top trims the run.*
+
+## How it connects to the other modules
+
+```
+sonar (BlueBoat-SSS) → Perception → Belief → Replanner → [ Control ] → boat
+```
+
+| Module | Link | Relation to Control |
+|---|---|---|
+| BlueBoat-MCS | [github.com/Kyyrron/BlueBoat-MCS](https://github.com/Kyyrron/BlueBoat-MCS) | The Mission Control Station (MCS) starts, watches and stops this stack |
+| BlueBoat-Replanner | [github.com/Kyyrron/BlueBoat-Replanner](https://github.com/Kyyrron/BlueBoat-Replanner) | Sends new paths through the live path update `/blueboat/update_path` |
+| BlueBoat-SSS | [github.com/Kyyrron/BlueBoat-SSS](https://github.com/Kyyrron/BlueBoat-SSS) | The sonar module; uses this module's message types and the boat's position |
+| BlueBoat-SSS-Sim | [github.com/Kyyrron/BlueBoat-SSS-Sim](https://github.com/Kyyrron/BlueBoat-SSS-Sim) | Starts this stack inside generated Gazebo worlds with a simulated sonar and sea |
+| BlueBoat-Belief | [github.com/Kyyrron/BlueBoat-Belief](https://github.com/Kyyrron/BlueBoat-Belief) | Reads the boat's position (`/blueboat/odom`) |
+| Whole project | [github.com/Kyyrron/BlueBoat-SideScanSonar](https://github.com/Kyyrron/BlueBoat-SideScanSonar) | The superproject that holds every module |
+
+This module also owns the package `blueboat_interfaces` (the shared message and service types),
+so **build it first**.
+
+**Where the software runs.** Every node runs on the operator laptop, in `~/ros2_ws`. The laptop
+reaches the boat over the BlueBoat Base Station WiFi. The boat carries only its own hardware and
+firmware: the BlueOS / ArduPilot autopilot (`192.168.2.2`), the sonars, GPS, compass and the
+Water Linked underwater positioning system.
 
 ## Dependencies
 
-**System**
-
-| | Version | Install |
+| Dependency | Link | Quick install |
 |---|---|---|
-| ROS 2 | Jazzy | [docs.ros.org](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html) |
-| Gazebo | Harmonic (LTS) | [gazebosim.org](https://gazebosim.org/docs/latest/ros_installation/) |
+| Ubuntu 24.04 | [ubuntu.com](https://ubuntu.com/download/desktop) | |
+| ROS 2 Jazzy | [docs.ros.org](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html) | `sudo apt install ros-jazzy-desktop` |
+| Gazebo Harmonic and its ROS bridge | [gazebosim.org](https://gazebosim.org/docs/harmonic/ros_installation/) | `sudo apt install ros-jazzy-ros-gz` |
+| ROS packages | apt | `sudo apt install ros-jazzy-xacro ros-jazzy-simple-launch ros-jazzy-slider-publisher ros-jazzy-mavros ros-jazzy-urdfdom-py` |
+| `pose_to_tf` | [github.com/oKermorgant/pose_to_tf](https://github.com/oKermorgant/pose_to_tf) | clone into `~/ros2_ws/src` |
+| Python packages | `requirements.txt` | `pip install -r requirements.txt` in the workspace venv |
+| acados (the MPC solver) | [docs.acados.org](https://docs.acados.org/installation/index.html) | build from source, step 4 below |
+| QGroundControl (optional) | [download](https://s3.amazonaws.com/downloads.bluerobotics.com/QGC/latest/QGroundControl.AppImage) | to watch the real boat's autopilot |
 
-**ROS packages** — all `apt install ros-${ROS_DISTRO}-<name>`:
-[`xacro`](https://github.com/ros/xacro/tree/ros2) ·
-[`simple-launch`](https://github.com/oKermorgant/simple_launch) ·
-[`slider-publisher`](https://github.com/oKermorgant/slider_publisher) ·
-[`mavros`](https://github.com/mavlink/mavros) ·
-[`urdfdom-py`](https://github.com/ros/urdf_parser_py)
+**acados is needed for every controller**, not only MPC: the control node loads it at start-up.
 
-From source, into the same workspace `src/`:
-[`pose_to_tf`](https://github.com/oKermorgant/pose_to_tf) (Gazebo ground truth) ·
-[`auv_control`](https://github.com/CentraleNantesROV/auv_control) (basic control laws)
-
-**Python** — `requirements.txt`. **[acados](https://docs.acados.org/index.html)** needs two
-extra pieces `pip` does not install; see step 5 below. It is only required for
-`controller_type:='MPC'`, but `master_control` imports it unconditionally, so it must be
-present for any controller.
-
-**Real robot** — the boat runs [BlueOS](https://bluerobotics.com/learn/blueboat-software-setup/)
-with the [blueos-ros2 app](https://github.com/itskalvik/blueos-ros2) (installable from the
-BlueOS app tab). High-level supervision is
-[QGroundControl](https://s3.amazonaws.com/downloads.bluerobotics.com/QGC/latest/QGroundControl.AppImage) (runnable through `./QGroundControl.AppImage`).
-
----
-
-## Installation
-
-From a fresh Ubuntu 24.04.
+## Installation, step by step
 
 ```bash
-# 1. ROS 2 Jazzy and Gazebo Harmonic -- follow the two links above, then:
-sudo apt install ros-jazzy-xacro ros-jazzy-simple-launch \
-                 ros-jazzy-slider-publisher ros-jazzy-mavros ros-jazzy-urdfdom-py
+# 1. ROS 2 Jazzy, Gazebo Harmonic and the ROS packages (table above), then:
+sudo apt install ros-jazzy-xacro ros-jazzy-simple-launch ros-jazzy-slider-publisher \
+                 ros-jazzy-mavros ros-jazzy-urdfdom-py ros-jazzy-ros-gz
 
-# 2. Workspace and sources
+# 2. Get the code. With the whole project (recommended):
 mkdir -p ~/ros2_ws/src && cd ~/ros2_ws/src
-git clone https://github.com/Kyyrron/BlueBoat-Control.git
+git clone --recurse-submodules https://github.com/Kyyrron/BlueBoat-SideScanSonar.git
+#    or this module alone:
+#    git clone https://github.com/Kyyrron/BlueBoat-Control.git
 git clone https://github.com/oKermorgant/pose_to_tf.git
-git clone https://github.com/CentraleNantesROV/auv_control.git
 
-# 3. Python dependencies (a venv is recommended -- acados, casadi and PySide6 are heavy)
-python3 -m venv ~/ros2_ws/.venv && source ~/ros2_ws/.venv/bin/activate
-pip install -r ~/ros2_ws/src/BlueBoat-Control/requirements.txt
+# 3. Python environment (the venv every module shares)
+cd ~/ros2_ws
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r src/BlueBoat-SideScanSonar/requirements.txt   # or BlueBoat-Control/requirements.txt alone
 ```
 
-**4. acados C library.** `pip` installs only the Python interface. Build acados itself: `cd .venv/src/acados-template/` and do [these commands](https://docs.acados.org/installation/index.html#installation-via-cmake)
-
-
-
-**5. Build and source.**
+**4. Build the acados C library.** `pip` installed only its Python part, in
+`~/ros2_ws/.venv/src/acados-template/`. Build the library there with
+[the acados CMake instructions](https://docs.acados.org/installation/index.html#installation-via-cmake),
+then add these two lines to `~/.bashrc`:
 
 ```bash
-cd ~/ros2_ws && colcon build
-source /opt/ros/jazzy/setup.bash
+export ACADOS_SOURCE_DIR=$HOME/ros2_ws/.venv/src/acados-template
+export LD_LIBRARY_PATH=$ACADOS_SOURCE_DIR/lib:$LD_LIBRARY_PATH
+```
+
+acados also needs its template renderer in `$ACADOS_SOURCE_DIR/bin/t_renderer`. If it is missing,
+the control node stops and prints the exact command that downloads it.
+
+**5. Create `~/ros2_ws/env.sh`** (once), the file you source in every new terminal:
+
+```bash
+source .venv/bin/activate
 source install/setup.bash
 ```
 
-**6. Check it works.**
+**6. Build**, always from the workspace root, in a terminal where only ROS is sourced:
 
 ```bash
-ros2 launch blueboat_control Sim_launch.py controller_type:='PID' trajectory:='circle' # Tests PID controller
-ros2 launch blueboat_control Sim_launch.py controller_type:='MPC' trajectory:='circle' # Tests MPC controller and acados installation
+cd ~/ros2_ws && source /opt/ros/jazzy/setup.bash
+colcon build --packages-select blueboat_interfaces    # first: other modules use its types
+colcon build
 ```
 
-Gazebo should open with the boat driving a 4 m circle. The first MPC launch additionally
-compiles the solver (about a minute) and caches it in `~/.ros/blueboat_control/mpc`; delete
-that directory to force a rebuild.
-
----
-
-## Features
-
-* **Three interchangeable controllers** — MPC (acados), PID and lookahead LoS — behind one
-  ROS interface and one `controller_type:=` argument.
-* **Eight built-in trajectories** plus designer-authored YAML missions, all served by one
-  parameter-agnostic `/path_request` service.
-* **Progress-driven reference.** The virtual target walks the path only as fast as the boat
-  keeps up, so it can never run away; a speed profile that varies along the path is followed
-  with no extra machinery.
-* **GPS-anchored deferred missions.** A `from_yaml` trajectory file is watched, so the boat
-  station-keeps until the [Mission Control Station](https://github.com/Kyyrron/BlueBoat-MCS) deploys the anchored mission.
-* **Gazebo simulation on the identical ROS interface** — same topics, types, node names and
-  parameters, so anything downstream runs unmodified in both.
-* **Safety** — a motor gate that holds neutral rather than going silent, a latching E-STOP, a
-  thruster-command watchdog at both ends, and a servo-mapping restore on shutdown.
-* **Write-once run logging** — a position CSV and a controller `.npy` per run, plus an
-  automatic post-mission report PNG.
-* **Log reviewer** — trim, zoom, replay and export a recorded mission over satellite imagery.
-
----
-
-## Usage
-
-Two launch files, sharing most arguments.
+## Check the installation
 
 ```bash
-# Simulation
-ros2 launch blueboat_control Sim_launch.py
-ros2 launch blueboat_control Sim_launch.py controller_type:='MPC' trajectory:='kin_square'
-
-# Real robot
-ros2 launch blueboat_control BlueBoat_launch.py
-ros2 launch blueboat_control BlueBoat_launch.py enable_motors:=True controller_type:='PID' note:='testing_gains'
-
-# Publishing inputs to the real robot (see ### Terminal commands)
-ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: default" 
-ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: override" 
-ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: move 3 3 2"
+cd ~/ros2_ws && source env.sh
+ros2 launch blueboat_control Sim_launch.py controller_type:='PID' trajectory:='circle'
+ros2 launch blueboat_control Sim_launch.py controller_type:='MPC' trajectory:='circle'
 ```
 
-### Launch arguments
+Gazebo opens and the boat drives a circle of 4 m radius. The first MPC launch compiles its
+solver, which takes about a minute. Close Gazebo with `Ctrl+C` in the terminal.
 
-| Argument | Where | Meaning |
-|---|---|---|
-| `controller_type` | both | `'MPC'`, `'PID'` or `'LoS'`. Empty on the real boat starts no controller. |
-| `trajectory` | both | The reference to follow. Full list in `blueboat_control/src/_custom_libraries/path_generation.py`; a designer mission is `from_yaml:/abs/path.yaml`. |
-| `data_dir` | both | Root for the run artifacts. Empty resolves automatically — see below. |
-| `note` | both | Tag added to the position-log file name. |
-| `spawn_yaw` | sim | Boat spawn heading, radians ENU (0 = East). |
-| `robot_file` | sim | `thrusters_ur` (2 thrusters, default) or `thrusters_uvr` (3, not functional). |
-| `enable_motors` | real | **Defaults False.** No thrust-bearing signal reaches the motors unless this is True. |
-| `use_pinger` | real | With a Water Linked underwater GPS, `PID` and `LoS` follow an acoustic pinger instead of a trajectory. |
-| `fcu_url` | real | MAVROS ↔ autopilot endpoint. Defaults to `udp://:14550@192.168.2.2:14550`. |
-
-Every controller gain is also a declared ROS parameter, so tuning costs a launch argument
-rather than a rebuild — `ros2 param list /blueboat/master_control`, and see `FIELD_TUNING.md`.
-
-### Terminal commands
+The log reviewer needs no ROS:
 
 ```bash
-ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: <value>"
+cd ~/ros2_ws/src/BlueBoat-SideScanSonar/BlueBoat-Control
+python3 log_reviewer/run.py            # then "Open log..."
 ```
 
-| `<value>` | Effect |
+## Tips: when to use it, what to know
+
+- **Normally you do not start this module by hand.** The Mission Control Station launches it for
+  real runs and simulations. Start it by hand to tune a controller or test one shape.
+- **Nothing moves on the real boat unless you pass `enable_motors:=True`.** This is on purpose.
+- **Send `default` before you stop a real-boat launch.** Otherwise the boat may stay in
+  "override" and ignore the hand controller. The Mission Control Station does it for you:
+  ```bash
+  ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: default"
+  ```
+- **QGroundControl and the autopilot link both use UDP port 14550.** Close QGroundControl, or the
+  launch cannot connect.
+- **Run one mission launch at a time.** A second one refuses to start.
+- **A simulation is not the real boat.** In simulation MPC turns a little less and LoS a little
+  more than the real boat. Use simulated runs to compare strategies, not as field numbers (the
+  superproject's `SIM_VALIDITY_CONDITIONS.md`).
+- **The live path update is tested in Gazebo only**, not yet on water.
+- **Recorded runs are field data.** Never edit or overwrite anything in `~/ros2_ws/data/Robot_data/`.
+- **After pulling new code, rebuild** (`colcon build`). An old build runs old code without warning.
+
+## More documentation
+
+| Document | What you find there |
 |---|---|
-| `enable` | Opens the motor gate. Nothing reaches the thrusters until this is called, and it is the only thing that clears a `stop`. |
-| `stop` | Zeroes thrust, closes the gate, disarms — and **latches** until `enable`. |
-| `override` | Disables the default thruster mapping so input can be sent straight to the motors. Makes Xbox-controller control impossible. |
-| `default` | Restores the default mapping. **Do this before closing the terminal.** MCS App does it automatically when stopping a mission, but this is the first thing to check if QGroundControl cannot connect to the robot. |
-| `move <left> <right> <seconds>` | Applies the two thrusts for that duration. |
-| `arm` / `disarm` | Arms / disarms the thrusters (used with the Xbox controller). |
-
-### Where run data is written
-
-Under `<root>/data/Robot_data/{date}-{note}-poslog.csv` for the position/target/pinger log (primary log file) and
-`<root>/data/{controller}_data/{date}-…npy` for the controller log (secondary, not usefull for basic usage of the USV). 
-
-When a run ends, the CSV, its `-origin.yaml` sidecar and a report PNG
-are filed into `Robot_data/<csv stem>/`.
-
-### Log reviewer
-
-```bash
-python3 log_reviewer/run.py # then "Open log…"
-```
-
-A standalone desktop window — no ROS, no sourced workspace. Open a poslog CSV and:
-
-* **Timeline** — two handles over mission time; every panel and every number recomputes live
-  as you drag.
-* **Track** — zoom, pan, and satellite imagery from the Mission Control Station's tile cache.
-* **Replay** — plays the selection back at ×1 to ×8.
-* **Editable text** — every title and description is what the exported picture carries.
-* **Export log** — writes the trimmed run to `~/ros2_ws/data/Processed_Robot_data/<name>/`.
-
-Full detail in `log_reviewer/README.md`.
-
-### Further reading
-
-| | |
-|---|---|
-| `controller_comparison/Controller_Report_BlueBoat.pdf` | Field-measured comparison of the three controllers |
-| `FIELD_TUNING.md` | Field-experiment references to quickly access the controllers' parameters. |
-| `blueboat_control/src/TRAJECTORY_SYSTEM.md` | The trajectory library, τ and the governor, one tick end to end - usefull for AI agents |
-
-
----
-
-## Warnings and tips
-
-* **`enable_motors` defaults to False**
-* **Publish `default` before killing a launch.** Leaving the boat in `override` disables the
-  Xbox controller (QGroundControl cannot access the robot).
-* **Recorded runs are primary field data.** Never overwrite or regenerate a poslog CSV, its
-  sidecar or a controller `.npy`.
-* **Only one `/path_request` server may run.** A second mission launch left up will corrupt
-  the reference of the first; since 2026-09-03 the second `path_generation` refuses to start.
-* **Simulation is not the real boat.** The hull uses the BlueROV2 drag table, which caps the
-  simulated speed at about 0.78 m/s — author simulated missions at ≤ 0.45 m/s. The MPC's own
-  plant model is a different fit again, so a simulated MPC result is not a
-  solver-against-its-own-model result.
-* **`fsin` runs at 0.5 m/s**, five times the speed it was originally authored at. Runs
-  recorded either side of that change are not comparable; every other shape is untouched.
-* **Manual-target and pinger thrust columns are not calibrated Newtons** — that branch writes
-  a kinematic command onto the thrust topic. They are comparable within a run, not across
-  laws. Path following is unaffected.
+| [docs/USER_GUIDE.md](docs/USER_GUIDE.md) | Every launch, launch argument, operator command, log file and the replay, in detail |
+| [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md) | How to work on this module: Claude Code, setup, tests, rules, next steps |
+| [log_reviewer/README.md](log_reviewer/README.md) | The log reviewer app |
+| [FIELD_TUNING.md](FIELD_TUNING.md) | Every controller setting, real and simulated defaults, which knob fixes which symptom |
+| [blueboat_control/config/field_runs/README.md](blueboat_control/config/field_runs/README.md) | Re-flying a field day's controller settings in simulation |
+| [controller_comparison/Controller_Report_BlueBoat.pdf](controller_comparison/Controller_Report_BlueBoat.pdf) | The field comparison of the three controllers |
+| [blueboat_control/src/TRAJECTORY_SYSTEM.md](blueboat_control/src/TRAJECTORY_SYSTEM.md) | How the moving target along the path is built |
+| [docs/PATH_UPDATE_INTERFACE.md](docs/PATH_UPDATE_INTERFACE.md) | The live path update, for programs that send paths |
+| [docs/PATH_UPDATE_DESIGN.md](docs/PATH_UPDATE_DESIGN.md) | Why the live path update works the way it does |
+| [docs/PATH_UPDATE_REAL_WATER_TEST.md](docs/PATH_UPDATE_REAL_WATER_TEST.md) | The protocol for its first test on water |
+| [docs/PARAMETER_REGISTER.md](docs/PARAMETER_REGISTER.md) | Every number of the simulated boat and where it comes from |
 
 ---
 

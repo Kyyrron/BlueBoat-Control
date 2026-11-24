@@ -1,66 +1,57 @@
 #!/usr/bin/env python3
 
 # ============================================================================
-# Gazebo thrust bridge, sim-side readiness handshake, and the position CSV.
+# robot_interface's simulation counterpart: Gazebo thrust bridge, readiness
+# handshake (latched AND re-published every second), the same watchdog and
+# thrust saturation, and the SAME position CSV, so a simulated and a field run
+# share one reader (N2 / CM-2). Not duplicated: the pinger (no-pinger layout
+# only), MAVROS / the enable_motors gate / the parameter mode (a command always
+# reaches Gazebo), and the IMU (attitude and rates come from /blueboat/odom).
 #
-# This node is robot_interface's simulation counterpart: same topics, same
-# watchdog, same thrust saturation, and -- since this revision -- the SAME
-# POSITION LOG. A simulated run and a field run now produce byte-compatible
-# artifacts, so poslog_report.py, the offline notebooks and any sim-to-real
-# comparison read one format rather than two (N2 / CM-2).
+# Since 2026-11-13 it also carries the two things the real boat has between
+# master_control and the water that Gazebo did not: the ACTUATOR MODEL of the
+# identified plant (what a commanded Newton becomes at the propeller; read from
+# the robot description, absent in the legacy plant) and the FIELD ODOMETRY
+# TIMING (Gazebo's 20 Hz odometry republished on /blueboat/odom at the field
+# rate and delay, as robot_interface republishes MAVROS odometry).
 #
-# What is deliberately NOT duplicated from robot_interface:
-#   * the pinger. There is no Water Linked UGPS in simulation, so this node
-#     fixes use_UWgps = False and writes COLUMNS_NO_PINGER (27 columns) only.
-#   * MAVROS, the enable_motors gate and the parameter mode. Gazebo has no
-#     autopilot to be in override of, so a command reaching this node always
-#     reaches the water -- see actuation_state() for what that means for the
-#     column of the same name.
-#   * the IMU. Gazebo publishes no /mavros/imu/data under Sim_launch, so the
-#     attitude and rate columns come from /blueboat/odom instead; see
-#     odom_callback for the one column (lin_acc_*) where that is not a
-#     like-for-like substitution.
-#
-# Column layout, its revision history and the actuation_state encoding live in
-# _custom_libraries/robot_log_schema.py. Rows are filled BY COLUMN NAME so the
-# two can never desynchronise.
+# FILE MAP (class Controller):
+#   1. WIRING            __init__
+#   2. MAIN LOOP         thr_input_callback, thruster_input_stale, move,
+#                        description_callback, applied_thrust
+#   3. STATE/TELEMETRY   raw_odom_callback, release_odom, odom_callback,
+#                        gps_callback, monitoring_data_callback
+#   4. CSV LOGGING       actuation_state, write_origin_sidecar, build_log_row,
+#                        to_gps, log_timer_callback, path_event_callback
+#   5. SHUTDOWN          shutdown
 # ============================================================================
 
-# ----------------------------------------------------------------------------
-# FILE MAP (class Controller)
-#
-#   1. WIRING                 __init__
-#   2. MAIN LOOP              thr_input_callback, thruster_input_stale, move
-#   3. STATE / TELEMETRY      odom_callback, gps_callback,
-#                             monitoring_data_callback
-#   4. CSV LOGGING            actuation_state, write_origin_sidecar,
-#                             build_log_row, to_gps, log_timer_callback
-#   5. SHUTDOWN               shutdown
-# ----------------------------------------------------------------------------
-
-# rclpy
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
 import rclpy
 
-# Common python libraries
+import json
+import math
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
+from collections import deque
 from datetime import datetime
 import numpy as np
 
-# ROS2 msg libraries
-from std_msgs.msg import Bool, Float32MultiArray
+from std_msgs.msg import Bool, Float32MultiArray, String
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import NavSatFix
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy, ReliabilityPolicy
 
-# Custom libraries
 from blueboat_control import ROV
 import custom_functions as cf
-import robot_log_schema as rls   # CSV column layout (ROS-free, _custom_libraries/)
+import robot_log_schema as rls   # CSV column layout (ROS-free)
 import thrust_limits as tl       # uniform thrust saturation (ROS-free)
+import path_update_log as pul    # the run's -pathlog.csv (ROS-free)
+import odom_emulation as oe      # field odometry timing (ROS-free)
+
 
 class Controller(Node):
 
@@ -72,27 +63,27 @@ class Controller(Node):
 
         super().__init__('pid_sim', namespace='blueboat')
 
-        self.declare_parameter('controller_type', 'MPC') 
+        self.declare_parameter('controller_type', 'MPC')
         self.controller_type = self.get_parameter('controller_type').get_parameter_value().string_value
 
-        # Loss-of-reference watchdog, same name, semantics and default as
-        # robot_interface: simulation and real water must not differ on a safety
-        # property. master_control publishes /thruster_input at 20 Hz, so 0.5 s is
-        # ten missed producer ticks (five ticks of this node's own 10 Hz loop).
+        # Same names, semantics and defaults as robot_interface (CM-2).
         self.declare_parameter('thruster_input_timeout', 0.5)
         self.thruster_input_timeout = self.get_parameter('thruster_input_timeout').get_parameter_value().double_value
 
-        # Same name, semantics and default as robot_interface and master_control.
-        # Simulation used to apply NO thrust limit at all -- ROV.move puts
-        # whatever arrives straight onto the Gazebo thrusters -- so a command the
-        # real boat would have saturated ran unbounded here and the two diverged
-        # exactly where N2/CM-2 says they must not.
         self.declare_parameter('thrust_limit', 20.0)
         self.thrust_limit = self.get_parameter('thrust_limit').get_parameter_value().double_value
 
-        # Same two names robot_interface uses, so a simulated run is filed the
-        # same way a field run is. Empty data_dir means "resolve it" -- see
-        # custom_functions.data_root for the order.
+        # Additive (2026-11-07): the clock of the thrust watchdog and the
+        # ready republish. 'wall' (default): time.time(), as before. 'ros':
+        # the node clock (/clock), so a simulation slowed below real time
+        # (Gazebo real-time factor < 1) does not trip the 0.5 s watchdog
+        # between master_control's sim-time 20 Hz commands. Every simulation
+        # launch passes 'ros'.
+        self.declare_parameter('time_source', 'wall')
+        self.time_source = self.get_parameter('time_source').get_parameter_value().string_value
+        if self.time_source not in ('wall', 'ros'):
+            raise ValueError(f"unknown time_source '{self.time_source}' (wall | ros)")
+
         self.declare_parameter('note', 'sim')
         self.note = self.get_parameter('note').get_parameter_value().string_value
 
@@ -100,50 +91,106 @@ class Controller(Node):
         self.data_root = cf.data_root(
             self.get_parameter('data_dir').get_parameter_value().string_value)
 
-        # There is no Water Linked UGPS in simulation, so the pinger layout can
-        # never be filled here. Fixed rather than declared: a parameter that
-        # selects a layout this node cannot populate would only produce a CSV of
-        # zeros under pinger column names.
+        # ---- field-equivalent loop timing and actuator model (2026-11-13) ----
+        # All additive. The values that reproduce the simulation before that
+        # date are thrust_rate_hz 10, odom_profile passthrough (with the Gazebo bridge
+        # on /blueboat/odom) and the legacy plant, whose description carries no
+        # actuator model: Sim_launch.py sim_config:=legacy sets them together.
+        #
+        # Rate at which the latest /thruster_input is applied to the
+        # thrusters. robot_interface streams RC override at 20 Hz.
+        self.declare_parameter('thrust_rate_hz', 20.0)
+        self.thrust_rate_hz = self.get_parameter('thrust_rate_hz').get_parameter_value().double_value
+        if not self.thrust_rate_hz > 0.0:
+            raise ValueError(f"thrust_rate_hz must be positive, got {self.thrust_rate_hz}")
+        # Odometry timing applied when Gazebo's odometry arrives on the raw
+        # topic /blueboat/odom_gz (upload_rov_launch.py odom_raw:=true):
+        # passthrough (forwarded as is) | field_3hz | field_4hz | field_13hz
+        # (odom_emulation.py: where each comes from).
+        self.declare_parameter('odom_profile', 'field_13hz')
+        self.odom_profile = self.get_parameter('odom_profile').get_parameter_value().string_value
+        if self.odom_profile not in oe.profile_names():
+            raise ValueError(f"unknown odom_profile '{self.odom_profile}' "
+                             f"({' | '.join(oe.profile_names())})")
+        self.declare_parameter('odom_seed', 0)
+        self.declare_parameter('odom_base_delay', 0.0)
+        self.odom_emulator = None
+        if self.odom_profile != oe.OFF:
+            self.odom_emulator = oe.OdomEmulator(
+                self.odom_profile,
+                self.get_parameter('odom_seed').get_parameter_value().integer_value,
+                self.get_parameter('odom_base_delay').get_parameter_value().double_value)
+        # Actuator model: applied = gain_side * (T - prop_speed_loss * sqrt|T| * surge).
+        # Negative values (the defaults) mean "what the robot description
+        # says" - the identified plant states its own, the legacy plant none
+        # (gain 1, no loss: a commanded Newton is an applied Newton).
+        self.declare_parameter('thrust_gain', [-1.0, -1.0])        # [right, left]
+        self.declare_parameter('prop_speed_loss', -1.0)            # sqrt(N).s/m per thruster
+        self.declare_parameter('esc_deadband', 0.0)                # N, |command| below it gives no thrust
+        self.declare_parameter('thrust_lag_tau', 0.0)              # s, first-order spin-up lag
+        self.thrust_gain_param = list(self.get_parameter('thrust_gain').get_parameter_value().double_array_value)
+        if len(self.thrust_gain_param) != 2:
+            raise ValueError("thrust_gain expects [right, left]")
+        self.prop_speed_loss_param = self.get_parameter('prop_speed_loss').get_parameter_value().double_value
+        self.esc_deadband = self.get_parameter('esc_deadband').get_parameter_value().double_value
+        self.thrust_lag_tau = self.get_parameter('thrust_lag_tau').get_parameter_value().double_value
+        self.actuator = None              # (gain_right, gain_left, speed_loss), set by the description
+        self.actuator_identity = True     # nothing to apply: the legacy path, untouched
+        self.lag_state = [0.0, 0.0]
+        self.true_surge = 0.0             # body surge speed the propellers see [m/s]
+
+        # No Water Linked UGPS in simulation: fixed, not a parameter.
         self.use_UWgps = False
 
         self.rov = ROV(self, thrust_visual = True)
+        self.description_sub = self.create_subscription(
+            String, 'robot_description', self.description_callback,
+            QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL))
 
         self.odom_sim_subscriber = self.create_subscription(Odometry, '/blueboat/odom', self.odom_callback, 10)
+        # Raw Gazebo odometry, when the bridge is retargeted to it. The
+        # /blueboat/odom publisher is created at the first raw message, so a
+        # launch that keeps the bridge on /blueboat/odom is untouched.
+        self.raw_odom_seen = False
+        self.odom_relay_refused = False
+        self.odom_publisher = None
+        self.odom_queue = deque()         # (release time on the node clock, message)
+        self.raw_odom_sub = self.create_subscription(Odometry, '/blueboat/odom_gz', self.raw_odom_callback, 50)
+        self.odom_release_timer = self.create_timer(0.005, self.release_odom)
         self.thruster_input_sub = self.create_subscription(Float32MultiArray, "/thruster_input", self.thr_input_callback,10)
 
-        # Logging inputs. /monitoring_data carries the controller's world-frame
-        # target in EVERY branch (CM-8 / N9), which is where target_x/y comes
-        # from. The NavSatFix is BEST_EFFORT to match every other consumer of it
-        # in the project (CM-4); nothing publishes it under Sim_launch, but the
-        # Mission Control Station's bridge and the simulator's mavros_shim_node
-        # both do in a GPS-anchored run, and the GPS columns fill in when they do.
+        # Logging inputs. The NavSatFix (BEST_EFFORT like every consumer)
+        # comes from the station's bridge or the simulator's mavros shim in a
+        # GPS-anchored run; nothing publishes it under a plain Sim_launch.
         self.monitoring_sub = self.create_subscription(
             Float32MultiArray, "/monitoring_data", self.monitoring_data_callback, 10)
         gps_qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT)
         self.gps_sub = self.create_subscription(
             NavSatFix, '/mavros/global_position/global', self.gps_callback, gps_qos)
+        # The same -pathlog.csv robot_interface writes on the real boat.
+        self.path_event_sub = self.create_subscription(
+            String, '/blueboat/path_update_event', self.path_event_callback,
+            QoSProfile(depth=50))
 
         latched = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.ready_publisher = self.create_publisher(Bool, '/blueboat/controller_ready', latched)
         self.data_publisher = self.create_publisher(Float32MultiArray, "/monitoring_data", 10)
 
-        self.timer = self.create_timer(0.1, self.move)
-        # Same rate as robot_interface's log timer -- three rows a second.
+        self.timer = self.create_timer(1.0 / self.thrust_rate_hz, self.move)
         self.log_timer = self.create_timer(0.33, self.log_timer_callback)
 
         self.thr_input = [0,0]
 
-        # None until the first /thruster_input arrives, which is itself a
-        # "no reference" condition.
         self.last_thr_rx = None
         self.thr_watchdog_tripped = False
 
         self.sent_ready = False
+        # Re-published, not only latched: master_control subscribes VOLATILE
+        # (CM-4), so a late match missed the one latched sample.
+        self.last_ready_tx = 0.0
+        self.ready_republish_period = 1.0
 
-        ################## Logged state ##################
-        # Filled by the callbacks in section 3; every one of them has a value
-        # that is safe to log before the first message arrives, so the log timer
-        # never has to guess whether the graph has come up yet.
+        # ---- logged state (section 3), all safe to log before any message ----
         self.relative_coordinates = [0.0, 0.0, 0.0]   # x, y, yaw (local ENU)
         self.roll = 0.0
         self.pitch = 0.0
@@ -152,50 +199,39 @@ class Controller(Node):
         self.monitoring_data = []
         self.gps_data = [0.0, 0.0]
 
-        # Frame origin. In simulation /blueboat/odom is already local ENU about
-        # the Gazebo world origin, so there is nothing to re-zero -- yaw0 is
-        # latched for the sidecar's provenance field only. geo_anchor is
-        # (lat, lon, x, y): the first VALID fix and the world position the boat
-        # held when it arrived, which is what lets the world frame be converted
-        # to WGS84 even though the fix may show up long after odom does.
+        # /blueboat/odom is already local ENU (Gazebo world origin): nothing to
+        # re-zero; yaw0 is sidecar provenance. geo_anchor = (lat, lon, x, y):
+        # the first VALID fix and the world position held when it arrived.
         self.yaw0 = None
         self.geo_anchor = None
-        # No row is written before the first /blueboat/odom. Every logged value
-        # has a safe default, so without this the log would open with a run of
-        # all-zero rows recorded while Gazebo was still coming up -- which reads
-        # downstream as a boat sitting at the origin, not as no data.
+        # No row before the first odom: zero rows would read as a boat at the
+        # origin, not as no data.
         self.odom_seen = False
 
-        # Previous body-frame velocity sample, for the differentiated
-        # acceleration in odom_callback.
+        # Previous body-frame velocity, for the differentiated acceleration.
         self.prev_twist = None
         self.prev_twist_t = None
 
-        ################## Initialize data collection ##################
-        # Column layout lives in robot_log_schema.py (ROS-free, in
-        # _custom_libraries/). It is a WRITE-ONCE field-data contract: read the
-        # module docstring before touching a name or an order. Rows are filled
-        # by column NAME below, never by index.
+        # ---- position CSV (write-once field record, robot_log_schema.py) ----
         self.data_columns = rls.columns_for(self.use_UWgps)
         self.target_cols, self.target_gps_cols = rls.target_columns_for(self.use_UWgps)
 
-        # The FILE NAME is stamped with the wall clock so simulated and field
-        # runs sort together in one directory; the ROWS are stamped with the ROS
-        # clock, which is sim time here -- see build_log_row.
+        # File name on the wall clock (sorts with field runs); rows on sim time.
         self.date = datetime.today().strftime('%Y_%m_%d-%H_%M_%S')
         log_dir = cf.ensure_data_dir(self, self.data_root, 'data', 'Robot_data')
         stem = f'{self.date}-{self.note}-poslog' if self.note else f'{self.date}-poslog'
         self.path = cf.reserve_run_file(log_dir, stem, '.csv') + '.csv'
-        # Sidecar name derived by pattern, not by a fixed-length slice -- the
-        # same rule the reader in poslog_report uses.
         self.origin_path = re.sub(r'-poslog(-\d+)?\.csv$', r'-origin\1.yaml', self.path)
 
-        # Header once, then one appended-and-flushed row per tick.
         self.log_file = open(self.path, 'w', buffering=1)
+        for line in rls.legend_rows(self.data_columns):
+            self.log_file.write(','.join(line) + '\n')
         self.log_file.write(','.join(self.data_columns) + '\n')
         self.log_file.flush()
         self.origin_written = False
         self.get_logger().info(f"Position log: {self.path}")
+        # Path-update log beside the CSV, created at the first request.
+        self.pathlog = pul.PathLog(pul.pathlog_path(self.path))
 
     # ======================================================================
     #  2. MAIN LOOP
@@ -203,21 +239,78 @@ class Controller(Node):
 
     def thr_input_callback(self, msg: Float32MultiArray):
         self.thr_input = msg.data
-        self.last_thr_rx = time.time()
+        self.last_thr_rx = self._world_clock()
+
+    def _world_clock(self):
+        """Seconds on the watchdog clock (parameter ``time_source``)."""
+        if self.time_source == 'ros':
+            return self.get_clock().now().nanoseconds * 1e-9
+        return time.time()
 
     def thruster_input_stale(self, now):
-        """
-        Loss-of-reference watchdog predicate - the mirror of
-        robot_interface.thruster_input_stale. True when /thruster_input has gone
-        quiet for longer than thruster_input_timeout, so the last received thrust
-        is not re-applied to the Gazebo thrusters indefinitely.
-        """
+        """Loss-of-reference watchdog (robot_interface.thruster_input_stale)."""
         if self.last_thr_rx is None:
             return True
         return (now - self.last_thr_rx) > self.thruster_input_timeout
 
+    def description_callback(self, msg: String):
+        """The actuator model the robot description states for its plant.
+
+        hydrodynamics_identified.xacro carries <thrust_gain_right>,
+        <thrust_gain_left> and <prop_speed_loss> inside its Hydrodynamics
+        plugin element (Gazebo ignores them); the legacy description has none.
+        A non-negative parameter overrides the description.
+        """
+        if self.actuator is not None:
+            return
+        found = {}
+        try:
+            for plugin in ET.fromstring(msg.data).iter('plugin'):
+                if 'Hydrodynamics' in (plugin.get('name') or ''):
+                    for tag in ('thrust_gain_right', 'thrust_gain_left', 'prop_speed_loss', 'plant_name'):
+                        node = plugin.find(tag)
+                        if node is not None and node.text:
+                            found[tag] = node.text.strip()
+        except ET.ParseError as exc:
+            self.get_logger().error(f"robot_description unreadable ({exc}): no actuator model applied.")
+        gain = [float(found.get('thrust_gain_right', 1.0)), float(found.get('thrust_gain_left', 1.0))]
+        loss = float(found.get('prop_speed_loss', 0.0))
+        for i in range(2):
+            if self.thrust_gain_param[i] >= 0.0:
+                gain[i] = self.thrust_gain_param[i]
+        if self.prop_speed_loss_param >= 0.0:
+            loss = self.prop_speed_loss_param
+        self.actuator = (gain[0], gain[1], loss)
+        self.actuator_identity = (gain == [1.0, 1.0] and loss == 0.0
+                                  and self.esc_deadband <= 0.0 and self.thrust_lag_tau <= 0.0)
+        self.get_logger().info(
+            f"Plant '{found.get('plant_name', 'bluerov2_legacy (no actuator model)')}': thrust gain "
+            f"[right {gain[0]:.3f}, left {gain[1]:.3f}], propeller speed loss {loss:.2f} sqrt(N).s/m, "
+            f"deadband {self.esc_deadband:.1f} N, lag {self.thrust_lag_tau:.2f} s; "
+            f"thrust applied at {self.thrust_rate_hz:.0f} Hz.")
+
+    def applied_thrust(self, r, l):
+        """What the commanded [right, left] Newtons become at the propellers.
+
+        Per thruster, in this order: ESC deadband, first-order spin-up lag,
+        loss of thrust with the boat's surge speed (a propeller at a given
+        speed of rotation pulls less the faster the water arrives), side gain.
+        The CSV and /monitoring_data keep the COMMAND, as on the real boat.
+        """
+        gain_r, gain_l, loss = self.actuator
+        out = []
+        for i, (cmd, gain) in enumerate(((r, gain_r), (l, gain_l))):
+            if self.esc_deadband > 0.0 and abs(cmd) < self.esc_deadband:
+                cmd = 0.0
+            if self.thrust_lag_tau > 0.0:
+                a = min(1.0, (1.0 / self.thrust_rate_hz) / self.thrust_lag_tau)
+                self.lag_state[i] += a * (cmd - self.lag_state[i])
+                cmd = self.lag_state[i]
+            out.append(gain * (cmd - loss * math.sqrt(abs(cmd)) * self.true_surge))
+        return out[0], out[1]
+
     def move(self):
-        if not self.rov.ready():
+        if not self.rov.ready() or self.actuator is None:
             return
 
         if not self.sent_ready:
@@ -226,8 +319,12 @@ class Controller(Node):
             self.ready_publisher.publish(msg)
             self.get_logger().info(f'Ready publishing: {msg.data}')
             self.sent_ready = True
+            self.last_ready_tx = self._world_clock()
+        elif self._world_clock() - self.last_ready_tx > self.ready_republish_period:
+            self.last_ready_tx = self._world_clock()
+            self.ready_publisher.publish(Bool(data=True))
 
-        if self.thruster_input_stale(time.time()):
+        if self.thruster_input_stale(self._world_clock()):
             if not self.thr_watchdog_tripped:
                 self.thr_watchdog_tripped = True
                 self.get_logger().warn(
@@ -238,12 +335,8 @@ class Controller(Node):
             self.thr_watchdog_tripped = False
             self.get_logger().info("/thruster_input resumed - releasing watchdog.")
 
-        # Saturate the same way the real boat does: one scale factor for both
-        # thrusters, so the right:left ratio and the direction of the commanded
-        # wrench survive the clamp (thrust_limits.py explains why per-side
-        # clipping does not). master_control already limits at its publisher, so
-        # this normally does nothing -- it is here so that a command reaching
-        # Gazebo from anywhere else is bounded like the hardware is.
+        # Uniform saturation as on the real boat (normally a no-op:
+        # master_control already limits at its publisher).
         limited, scale = tl.scale_to_limit(self.thr_input, self.thrust_limit)
         if scale < 1.0:
             self.get_logger().warn(
@@ -252,26 +345,68 @@ class Controller(Node):
                 throttle_duration_sec=2.0)
 
         r, l = float(limited[0]), float(limited[1])
-        # Apply force to thrusters
+        if not self.actuator_identity:
+            r, l = self.applied_thrust(r, l)
         self.rov.move([r,l])
 
     # ======================================================================
-    #  3. STATE / TELEMETRY
-    #  None of these command anything.
+    #  3. STATE / TELEMETRY -- nothing here commands anything
     # ======================================================================
+
+    def raw_odom_callback(self, msg: Odometry):
+        """Gazebo's own odometry (/blueboat/odom_gz) -> /blueboat/odom.
+
+        Forwarded as is with odom_profile 'passthrough', else thinned and delayed to
+        the field pattern (odom_emulation.py). The header stamp is kept: it is
+        the time the pose was true, as on the real boat.
+        """
+        self.true_surge = float(msg.twist.twist.linear.x)
+        if self.odom_relay_refused:
+            return
+        if not self.raw_odom_seen:
+            self.raw_odom_seen = True
+            others = self.count_publishers('/blueboat/odom')
+            if others > 0:
+                self.odom_relay_refused = True
+                self.get_logger().error(
+                    f"/blueboat/odom already has {others} publisher(s) while raw odometry arrives on "
+                    "/blueboat/odom_gz: the odometry is NOT relayed (two sources would alternate). "
+                    "Launch with either odom_raw:=true or the bridge on /blueboat/odom, not both.")
+                return
+            self.odom_publisher = self.create_publisher(Odometry, '/blueboat/odom', 10)
+            self.get_logger().info(
+                "Relaying /blueboat/odom_gz -> /blueboat/odom, "
+                + ("unchanged (odom_profile passthrough)." if self.odom_emulator is None
+                   else f"at the field timing '{self.odom_profile}'."))
+        if self.odom_emulator is None:
+            self.odom_publisher.publish(msg)
+            return
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        now = self.get_clock().now().nanoseconds * 1e-9
+        release = self.odom_emulator.offer(stamp)
+        if release is None:
+            return
+        # the delay is counted from the arrival of the raw sample
+        self.odom_queue.append((now + (release - stamp), msg))
+
+    def release_odom(self):
+        """Publish the queued odometry samples whose delay has elapsed."""
+        if not self.odom_queue:
+            return
+        now = self.get_clock().now().nanoseconds * 1e-9
+        while self.odom_queue and self.odom_queue[0][0] <= now:
+            self.odom_publisher.publish(self.odom_queue.popleft()[1])
 
     def odom_callback(self, msg: Odometry):
         pose, twist = cf.odometry(msg)
 
         self.rov.current_pose = pose
         self.rov.current_twist = twist
+        if not self.raw_odom_seen:
+            # bridge on /blueboat/odom: this IS Gazebo's odometry
+            self.true_surge = float(msg.twist.twist.linear.x)
 
-        # --- everything below is for the log only ---------------------------
-        # /blueboat/odom is ALREADY local ENU here: the Gazebo bridge publishes
-        # in the world frame with no re-zeroing, so unlike robot_interface there
-        # is no origin to subtract. The boat spawns at (0, 0), so the two frames
-        # agree in kind and in origin; only the yaw at spawn (Sim_launch's
-        # spawn_yaw) varies, and that is recorded in the sidecar.
+        # --- the rest is for the log only (odom is already local ENU) -------
         roll, pitch, yaw = cf.quaternion_to_rpy(msg.pose.pose.orientation)
         self.relative_coordinates = [msg.pose.pose.position.x,
                                      msg.pose.pose.position.y,
@@ -282,12 +417,8 @@ class Controller(Node):
         av = msg.twist.twist.angular
         self.angular_velocity = np.array([av.x, av.y, av.z])
 
-        # lin_acc_* is the ONE column that is not a like-for-like substitution
-        # for the real boat's. There is no simulated IMU under Sim_launch, so
-        # this is the body-frame linear velocity differentiated over the ROS
-        # clock (sim time). Two consequences for an analyst: it carries NO
-        # gravity component, where a real /mavros/imu/data acceleration does,
-        # and it is as noisy as the numerical difference of a 20 Hz odometry.
+        # lin_acc_*: the body-frame velocity differentiated over sim time (no
+        # simulated IMU) -- NO gravity component, and 20 Hz difference noise.
         lv = msg.twist.twist.linear
         v = np.array([lv.x, lv.y, lv.z])
         t = self.get_clock().now().nanoseconds * 1e-9
@@ -300,12 +431,8 @@ class Controller(Node):
             self.yaw0 = yaw
         self.odom_seen = True
 
-        # Latch the geodetic anchor on the first VALID fix, together with the
-        # world position held at that moment. Deferring it this way is what
-        # makes the GPS columns usable in a Mission Control Station run, where
-        # the synthesised fixes can start after odom does; with no fix at all
-        # (a plain Sim_launch) the anchor stays None and the GPS columns stay
-        # zero, which is exactly what "no fix" means everywhere else here.
+        # Geodetic anchor on the first VALID fix (fixes may start after odom);
+        # none all run (plain Sim_launch) leaves the GPS columns zero.
         if self.geo_anchor is None and not (self.gps_data[0] == 0.0
                                             and self.gps_data[1] == 0.0):
             self.geo_anchor = (self.gps_data[0], self.gps_data[1],
@@ -313,37 +440,21 @@ class Controller(Node):
                                msg.pose.pose.position.y)
 
     def gps_callback(self, msg: NavSatFix):
-        # (0, 0) means no fix, the same rule every other consumer in the project
-        # applies; it is stored as-is and discarded by the anchor test above and
-        # by poslog_report's own _valid_gps.
+        # (0, 0) = no fix, stored as-is (the anchor test ignores it).
         self.gps_data = [msg.latitude, msg.longitude]
 
     def monitoring_data_callback(self, msg: Float32MultiArray):
-        """
-        Cache /monitoring_data = [t, x, y, psi, x_d, y_d, psi_d, u1, u2].
-        Only the target pair [4:6] is logged, and it is world-frame in every
-        controller branch (CM-8 / N9) - no frame correction is applied here.
-        """
+        """Cache /monitoring_data; its [4:6] target is world-frame (N9)."""
         self.monitoring_data = msg.data
 
     # ======================================================================
-    #  4. CSV LOGGING
-    #  Same writer, same columns and same rate as robot_interface's, so a
-    #  simulated run and a field run are read by one reader.
+    #  4. CSV LOGGING -- same writer, columns and rate as robot_interface's
     # ======================================================================
 
     def actuation_state(self):
         """
-        One integer saying whether the logged thrust command could reach the water.
-
-        Output : int, see robot_log_schema for the encoding.
-
-        Simulation has only two of the four states. There is no enable_motors
-        gate and no autopilot mode here: ROV.move puts whatever this node
-        commands straight onto the Gazebo thrusters, so a command always reaches
-        the water (ACT_LIVE) unless the loss-of-reference watchdog has forced it
-        to zero (ACT_WATCHDOG). States 0 and 2 are hardware conditions and
-        cannot occur - a simulated log never shows them.
+        Only ACT_LIVE or ACT_WATCHDOG in simulation: no motor gate and no
+        autopilot mode exist here (robot_log_schema encoding).
         """
         if self.thr_watchdog_tripped:
             return rls.ACT_WATCHDOG
@@ -351,23 +462,16 @@ class Controller(Node):
 
     def write_origin_sidecar(self):
         """
-        Record the world frame's own origin, once, beside the CSV.
-
-        Written on the first row that has a geodetic anchor to record. Without
-        a GPS publisher (a plain Sim_launch) there is none, so the sidecar is
-        written once at the end of the run instead, carrying yaw0 and no fix -
-        see shutdown. yaw0_rad is the boat's ENU heading at the first odom
-        callback, i.e. Sim_launch's spawn_yaw; it is provenance only and is NOT
-        part of the frame, which is absolute ENU.
+        Record the world frame's origin, once, beside the CSV: written with the
+        first logged row (lat/lon 0 if no GPS anchor exists yet), or at shutdown
+        if no row was logged. yaw0_rad is the spawn heading, provenance only.
         """
         if self.origin_written or self.yaw0 is None:
             return
         if self.geo_anchor is None:
             lat0 = lon0 = 0.0
         else:
-            # The anchor fix was taken at (xa, ya), which is not necessarily the
-            # frame origin; project back to (0, 0) so the sidecar means the same
-            # thing it does on the real boat.
+            # Project the anchor fix, taken at (xa, ya), back to the origin.
             lat_a, lon_a, xa, ya = self.geo_anchor
             lat0, lon0 = cf.enu_to_gps(lat_a, lon_a, -xa, -ya)
         try:
@@ -389,22 +493,9 @@ class Controller(Node):
             self.get_logger().warn(f"Could not write the frame origin sidecar: {exc}")
 
     def build_log_row(self):
-        """
-        Assemble one CSV row of the no-pinger layout (27 columns).
-
-        Output : dict {column name: value} covering every column of
-                 self.data_columns. Filled BY COLUMN NAME, never by index.
-        """
-        # The ROS clock, which is SIM TIME under Sim_launch (use_sim_time=True),
-        # not the wall clock robot_interface stamps with. That is deliberate:
-        # every derived quantity a reader computes from these columns - speed,
-        # mission duration - must be measured against the clock the physics ran
-        # on, or a real-time factor other than 1 silently rescales all of them.
-        # Sim time starts at 0, so the date columns read 1970-01-01; readers
-        # take differences from the first row and never the absolute date.
-        # Rendered in LOCAL time, like robot_interface's, so that when this node
-        # runs on the wall clock instead (no /clock publisher) the two nodes'
-        # stamps are directly comparable rather than a timezone apart.
+        """One no-pinger CSV row, {column name: value} (27 columns)."""
+        # ROS clock = SIM TIME (dates read 1970-01-01): speeds and durations
+        # must use the clock the physics ran on. Local time, like robot_interface.
         now = datetime.fromtimestamp(self.get_clock().now().nanoseconds * 1e-9)
 
         row = {
@@ -412,8 +503,7 @@ class Controller(Node):
             'Hour': now.hour, 'Minute': now.minute, 'Second': now.second,
             'MicroSecond': now.microsecond,
 
-            # Robot pose, local-ENU world frame. relative_psi is ABSOLUTE ENU
-            # yaw (0 = East, CCW+), as it is on the real boat since 2026-08-31.
+            # Local-ENU world frame; relative_psi is absolute ENU yaw.
             'relative_x': self.relative_coordinates[0],
             'relative_y': self.relative_coordinates[1],
             'relative_psi': self.relative_coordinates[2],
@@ -421,14 +511,11 @@ class Controller(Node):
             'gps_latitude': self.gps_data[0],
             'gps_longitude': self.gps_data[1],
 
-            # thr_input is [right, left] (master_control's convention), logged
-            # as COMMANDED on /thruster_input - the watchdog writes [0, 0] into
-            # it, which is what actuation_state above disambiguates.
+            # [right, left] as commanded (the watchdog writes [0, 0] here).
             'right_thr_in': self.thr_input[0],
             'left_thr_in': self.thr_input[1],
             'actuation_state': self.actuation_state(),
 
-            # Attitude. Yaw is not repeated -- it is relative_psi above.
             'roll': self.roll,
             'pitch': self.pitch,
 
@@ -436,16 +523,13 @@ class Controller(Node):
             'ang_vel_y': self.angular_velocity[1],
             'ang_vel_z': self.angular_velocity[2],
 
-            # Differentiated from the odometry twist, NOT a simulated IMU:
-            # no gravity component. See odom_callback.
+            # Differentiated odometry, no gravity (odom_callback).
             'lin_acc_x': self.linear_acceleration[0],
             'lin_acc_y': self.linear_acceleration[1],
             'lin_acc_z': self.linear_acceleration[2],
         }
 
-        # /monitoring_data = [t, x, y, psi, x_d, y_d, psi_d, u1, u2]. x_d/y_d are
-        # world-frame in EVERY controller branch (CM-8 / N9). An empty buffer
-        # (no controller running yet) logs zeros rather than raising.
+        # x_d, y_d (world frame, N9); zeros before the first message.
         if len(self.monitoring_data) >= 6:
             target_xy = [self.monitoring_data[4], self.monitoring_data[5]]
         else:
@@ -460,13 +544,7 @@ class Controller(Node):
         return row
 
     def to_gps(self, xy):
-        """
-        Convert a local-ENU world-frame point into WGS84 degrees.
-
-        Input  : xy -- [x, y] in the same frame as relative_x/y.
-        Output : [latitude, longitude], or [0.0, 0.0] before a valid fix has
-                 anchored the frame -- (0, 0) is this project's "no fix".
-        """
+        """[lat, lon] of a world-frame [x, y], or [0, 0] before a valid fix."""
         if self.geo_anchor is None:
             return [0.0, 0.0]
         lat0, lon0, xa, ya = self.geo_anchor
@@ -474,9 +552,7 @@ class Controller(Node):
         return [lat, lon]
 
     def log_timer_callback(self):
-        """
-        Append one row to the position CSV. The single writer.
-        """
+        """Append one row to the position CSV (the single writer)."""
         if not self.odom_seen:
             self.get_logger().warn(" -- Not ready to log yet: no /blueboat/odom",
                                    throttle_duration_sec=5.0)
@@ -499,19 +575,29 @@ class Controller(Node):
 
         self.write_origin_sidecar()
 
+    def path_event_callback(self, msg: String):
+        """One /blueboat/path_update_event -> one row of the -pathlog.csv."""
+        try:
+            event = json.loads(msg.data)
+            if not isinstance(event, dict):
+                raise ValueError("not a JSON object")
+        except ValueError as exc:
+            self.get_logger().error(f"/blueboat/path_update_event: unreadable ({exc}) - ignored.",
+                                    throttle_duration_sec=10.0)
+            return
+        try:
+            self.pathlog.write_event(event)
+        except OSError as exc:
+            self.get_logger().error(f"Path-update log not written: {exc}",
+                                    throttle_duration_sec=10.0)
+
     # ======================================================================
-    #  5. SHUTDOWN
-    #  Ordered teardown, mirroring robot_interface's: stop the thrusters, close
-    #  the CSV, then file the run. Every step is independently guarded so a
-    #  failure in one cannot skip the ones after it.
+    #  5. SHUTDOWN -- mirrors robot_interface's; every step guarded
     # ======================================================================
 
     def shutdown(self):
-        # 1. Thrusters first, always. rov.parsed() is False until the URDF has
-        #    arrived on robot_description, and ROV.move indexes its (empty)
-        #    publisher list unconditionally -- so without the test a teardown
-        #    before Gazebo ever came up reports an IndexError as a failure to
-        #    stop thrusters that do not exist yet.
+        # 1. Thrusters (only once the URDF is parsed: ROV.move needs its
+        #    publishers).
         try:
             if self.rov.parsed():
                 self.rov.move([0.0, 0.0])
@@ -532,10 +618,16 @@ class Controller(Node):
                 self.get_logger().info(f"Position log closed: {self.path}")
         except Exception as exc:                       # noqa: BLE001 - teardown
             self.get_logger().error(f"Shutdown: closing the log failed: {exc}")
+        try:
+            if getattr(self, 'pathlog', None) is not None:
+                self.pathlog.close()
+                if self.pathlog.rows:
+                    self.get_logger().info(
+                        f"Path-update log closed ({self.pathlog.rows} rows): {self.pathlog.path}")
+        except Exception as exc:                       # noqa: BLE001 - teardown
+            self.get_logger().error(f"Shutdown: closing the path-update log failed: {exc}")
 
-        # 4. Mission report. Imported HERE, not at module scope: matplotlib is
-        #    not declared in package.xml and must never be able to stop this
-        #    node from starting.
+        # 4. Mission report (matplotlib imported lazily, never at module scope).
         try:
             import poslog_report
             folder = poslog_report.finalise_run(self.path)
@@ -553,9 +645,7 @@ def main():
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, ExternalShutdownException):
-        # A launch teardown SIGINTs the whole process group; rclpy turns that
-        # into ExternalShutdownException rather than KeyboardInterrupt. Both
-        # mean "the run is over", and the shutdown below must still run.
+        # A launch teardown arrives as ExternalShutdownException.
         pass
     finally:
         node.shutdown()
