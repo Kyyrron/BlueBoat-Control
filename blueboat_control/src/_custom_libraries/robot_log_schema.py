@@ -274,14 +274,6 @@ LAYOUT_OF_MODE = {'off': 'no_pinger', 'follow': 'pinger', 'log': 'pinger_log'}
 COLUMNS_OF_LAYOUT = {'no_pinger': COLUMNS_NO_PINGER, 'pinger': COLUMNS_PINGER,
                      'pinger_log': COLUMNS_PINGER_LOG}
 
-# The two names that differ between the layouts, for code that fills the
-# shared leading block once instead of branching twice. Index 0 is the
-# world-frame target pair, index 1 the target's WGS84 pair.
-TARGET_COLUMNS_NO_PINGER = (('target_x', 'target_y'),
-                            ('target_latitude', 'target_longitude'))
-TARGET_COLUMNS_PINGER = (('corrected_pinger_x', 'corrected_pinger_y'),
-                         ('pinger_latitude', 'pinger_longitude'))
-
 
 # Rows above the column names in a CSV written since 2026-10-08.
 LEGEND_ROWS = 2
@@ -399,31 +391,6 @@ def split_header(rows) -> tuple:
     return None, None
 
 
-def columns_for(use_UWgps: bool) -> list:
-    """
-    Return the column list for the layout `use_UWgps` selects.
-
-    Input  : use_UWgps -- bool, the launch parameter of the same name.
-    Output : a NEW list[str] (27 or 39 entries). A fresh list every call, so
-             the caller may hand it to pandas and the module constants above
-             can never be mutated through it.
-    """
-    return list(COLUMNS_PINGER if use_UWgps else COLUMNS_NO_PINGER)
-
-
-def target_columns_for(use_UWgps: bool) -> tuple:
-    """
-    Return the two target column-name pairs the layout uses.
-
-    Input  : use_UWgps -- bool, the launch parameter of the same name.
-    Output : ((world_x, world_y), (latitude, longitude)) -- the names under
-             which the controller's target is stored in this layout. Lets one
-             row-assembly path fill the target block without knowing which
-             layout it is writing.
-    """
-    return TARGET_COLUMNS_PINGER if use_UWgps else TARGET_COLUMNS_NO_PINGER
-
-
 def pinger_mode_of(pinger_mode='', use_pinger=False) -> str:
     """The effective pinger mode: `pinger_mode` when given, else the
     `use_pinger` alias (True = follow, False = off)."""
@@ -436,14 +403,11 @@ def pinger_mode_of(pinger_mode='', use_pinger=False) -> str:
 
 
 def columns_for_mode(pinger_mode: str) -> list:
-    """A NEW list of the column names the run's pinger mode writes."""
+    """A NEW list of the column names the run's pinger mode writes. A writer
+    fills every column any layout has and writes these: in the pinger layout
+    the legacy pinger (corrected_pinger_*) IS the target slot, in the others
+    the path target (target_*) is."""
     return list(COLUMNS_OF_LAYOUT[LAYOUT_OF_MODE[pinger_mode]])
-
-
-def target_columns_for_mode(pinger_mode: str) -> tuple:
-    """The target pairs of the mode's layout: the pinger is the target only when
-    the boat follows it; in log mode the path target stays the target."""
-    return TARGET_COLUMNS_PINGER if pinger_mode == 'follow' else TARGET_COLUMNS_NO_PINGER
 
 
 def layout_of_header(header) -> str:

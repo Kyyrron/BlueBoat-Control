@@ -8,7 +8,7 @@ Publishes
                 default 4 Hz): every field of every endpoint polled in that
                 cycle, each with its request/response time on the ROS clock,
                 HTTP status and error. Full cycles (full_rate_hz, default 2 Hz)
-                also poll filtered, global, master (and antenna with --antenna).
+                also poll filtered and global (and antenna with --antenna).
                 The pinger_estimator's input.
   /uw_gps_data  std_msgs/Float32MultiArray, 19 values -- the LEGACY packet,
                 unchanged in layout and meaning and published on the same 2 Hz
@@ -16,43 +16,30 @@ Publishes
                 raw xyz, antenna xyz, lat, lon, depth = raw z, filtered xyz; a
                 failed request leaves zeros). Kept byte-compatible for the legacy
                 pinger, the CSV's aco/filaco columns and old tools.
-  /uw_gps/info  std_msgs/String, JSON `blueboat_uwgps_info/1`, TRANSIENT_LOCAL
-                depth 1: what the unit says about itself (about / antenna /
-                receiver configuration, best effort), at start and every
-                info_period_s, so a run records which hardware and setup it used.
 
 Every request has a (connect, read) timeout and uses one keep-alive session:
 before 2026-11-24 a request had no timeout, and one hang stalled all pinger data
-for 103 s (docs/PINGER_FILTER_FINDINGS.md section 3).
+for 103 s.
 """
 
 import argparse
 import datetime
 import json
 import sys
-import threading
 
 import requests
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from rclpy.qos import QoSProfile, ReliabilityPolicy
 from rclpy.utilities import remove_ros_args
 from std_msgs.msg import Float32MultiArray, String
 
 SCHEMA_FIX = "blueboat_uwgps_fix/1"
-SCHEMA_INFO = "blueboat_uwgps_info/1"
 ENDPOINTS = {
     "raw": "/api/v1/position/acoustic/raw",
     "filtered": "/api/v1/position/acoustic/filtered",
     "antenna": "/api/v1/config/antenna",
     "global": "/api/v1/position/global",
-    "master": "/api/v1/position/master",
-}
-INFO_ENDPOINTS = {
-    "about": "/api/v1/about",
-    "antenna": "/api/v1/config/antenna",
-    "receivers": "/api/v1/config/receivers",
-    "generic": "/api/v1/config/generic",
 }
 
 
@@ -67,7 +54,6 @@ class uw_gps_logger(Node):
         self.full_rate_hz = float(self.declare_parameter('full_rate_hz', 2.0).value)
         self.connect_timeout_s = float(self.declare_parameter('connect_timeout_s', 0.25).value)
         self.read_timeout_s = float(self.declare_parameter('read_timeout_s', 0.4).value)
-        self.info_period_s = float(self.declare_parameter('info_period_s', 60.0).value)
         if self.raw_rate_hz <= 0.0 or self.full_rate_hz <= 0.0:
             raise ValueError("raw_rate_hz and full_rate_hz must be > 0")
         # A full cycle every `ratio` raw polls (2 at 4 / 2 Hz).
@@ -80,12 +66,6 @@ class uw_gps_logger(Node):
             help = "Base URL to use",
             type = str,
             default = "http://192.168.2.94")
-        self.parser.add_argument(
-            '-t',
-            '--temp',
-            help='Temperature to send',
-            type=float,
-            default=10)
         self.parser.add_argument(
             "-a",
             "--antenna",
@@ -100,17 +80,11 @@ class uw_gps_logger(Node):
 
         self.session = requests.Session()
         fix_qos = QoSProfile(depth=50, reliability=ReliabilityPolicy.RELIABLE)
-        info_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
-                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.uw_data_pub = self.create_publisher(Float32MultiArray, '/uw_gps_data', 10)
         self.fix_pub = self.create_publisher(String, '/uw_gps/fix', fix_qos)
-        self.info_pub = self.create_publisher(String, '/uw_gps/info', info_qos)
         self.seq = 0
         self.tick = 0
         self.timer = self.create_timer(1.0 / self.raw_rate_hz, self.timer_callback)
-        self._info_stop = threading.Event()
-        self._info_thread = threading.Thread(target=self._info_loop, name='uwgps_info', daemon=True)
-        self._info_thread.start()
 
         self.get_logger().info(f'Using base_url: {self.base_url}')
         self.get_logger().info(
@@ -121,13 +95,13 @@ class uw_gps_logger(Node):
     def _now(self):
         return self.get_clock().now().nanoseconds * 1e-9
 
-    def _request(self, session, name, path):
+    def _request(self, name, path):
         """One GET -> {t_req, t_resp, ok, status, error, data}. Never raises."""
         url = f"{self.base_url}{path}"
         rec = {"t_req": self._now(), "t_resp": None, "ok": False, "status": None,
                "error": None, "data": None}
         try:
-            r = session.get(url, timeout=(self.connect_timeout_s, self.read_timeout_s))
+            r = self.session.get(url, timeout=(self.connect_timeout_s, self.read_timeout_s))
             rec["status"] = r.status_code
             if r.status_code == requests.codes.ok:
                 rec["data"] = r.json()
@@ -152,8 +126,8 @@ class uw_gps_logger(Node):
 
         names = ["raw"]
         if full:
-            names += ["filtered"] + (["antenna"] if self.args.antenna else []) + ["global", "master"]
-        recs = {n: self._request(self.session, n, ENDPOINTS[n]) for n in names}
+            names += ["filtered"] + (["antenna"] if self.args.antenna else []) + ["global"]
+        recs = {n: self._request(n, ENDPOINTS[n]) for n in names}
 
         self.seq += 1
         msg = String()
@@ -220,24 +194,6 @@ class uw_gps_logger(Node):
         msg = Float32MultiArray()
         msg.data = [float(v) for v in df_tmp]
         self.uw_data_pub.publish(msg)
-
-    # ------------------------------------------------------------------- info
-    def _info_loop(self):
-        session = requests.Session()
-        while not self._info_stop.is_set():
-            info = {"schema": SCHEMA_INFO, "t": self._now(), "base_url": self.base_url,
-                    "endpoints": {n: self._request(session, n, p) for n, p in INFO_ENDPOINTS.items()}}
-            msg = String()
-            msg.data = json.dumps(info)
-            try:
-                self.info_pub.publish(msg)
-            except Exception:                   # noqa: BLE001 - shutting down
-                return
-            self._info_stop.wait(self.info_period_s)
-
-    def destroy_node(self):
-        self._info_stop.set()
-        super().destroy_node()
 
 
 def main():

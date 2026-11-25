@@ -66,8 +66,22 @@ PINGER_CHASE_STATUSES = ('tracking', 'coasting')
 NPY_HEADER = ['t', 'x', 'y', 'psi', 'x_d', 'y_d', 'psi_d', 'u1', 'u2']
 
 
-def _wrap(a):
-    return (a + np.pi) % (2 * np.pi) - np.pi
+def _run_config_problem(ctype, mode, has_path, path_source):
+    """Why a run configuration cannot run, or None. One table for a launch (a
+    FATAL) and a station `configure` (its refusal)."""
+    if ctype not in ('PID', 'LoS', 'MPC'):
+        return f"unknown controller_type '{ctype}'"
+    if ctype == 'MPC' and mode == 'follow':
+        return "MPC does not support pinger following - choose PID or LoS"
+    if path_source not in pu.PATH_SOURCES:
+        return f"unknown path_source '{path_source}' (one of {', '.join(pu.PATH_SOURCES)})"
+    if path_source == 'replanner' and mode == 'follow':
+        return ("a replanner run follows paths, not the pinger - "
+                "set use_pinger false or path_source 'mission'")
+    if path_source == 'replanner' and not has_path:
+        return ("a replanner run always has a path (the replanner's) - "
+                "has_path false needs path_source 'mission'")
+    return None
 
 
 def _allocation_matrix():
@@ -216,6 +230,7 @@ class Controller(Node):
 
         self.monitoring = [list(NPY_HEADER)]
         self.monitoring_saved_rows = 0
+        self.monitoring_chunks = []     # rows already converted for the .npy (save_monitoring)
 
         # Arrow control (arrow_thrust_callback): highest priority while active;
         # a stale stream commands zero, never autonomous control.
@@ -344,15 +359,12 @@ class Controller(Node):
             self.path_time = self.mpc_time
             self.path_steps = self.mpc_horizon + 1
 
-        if controller_type == 'PID':
+        if controller_type in ('PID', 'LoS'):
             self.path_time = self.dt
             self.path_steps = 2
 
-        if controller_type ==  'LoS':
-            self.path_time = self.dt
-            self.path_steps = 2
-            self.los_allocator = PID.ThrustAllocator(_allocation_matrix(),
-                                                     limits=self.thruster_limits)
+        if controller_type == 'LoS':
+            self.los_allocator = PID.ThrustAllocator(_allocation_matrix(), self.thrust_limit)
 
     def _make_controller(self, controller_type):
         """Construct and RETURN the controller object for controller_type.
@@ -398,8 +410,7 @@ class Controller(Node):
                               outer_gains = self.outer_gains,
                               inner_gains = self.inner_gains,
                               lookahead = self.pid_lookahead,
-                              thruster_limits = self.thruster_limits
-                              )
+                              thrust_limit = self.thrust_limit)
 
         return None
 
@@ -479,13 +490,12 @@ class Controller(Node):
                                 'psi': tuple(arr('outer_gains_psi', [3.3, 0.01, 0.0]))}
             self.inner_gains = {'u': tuple(arr('inner_gains_u', [1.0, 0.0, 0.0])),
                                 'r': tuple(arr('inner_gains_r', [1.5, 0.0, 0.0]))}
-            self.pid_lookahead = dbl('pid_lookahead', 2.5)
         else:
             self.outer_gains = {'x':   tuple(arr('outer_gains_x',   [8.0, 0.01, 0.0])),
                                 'psi': tuple(arr('outer_gains_psi', [4.0, 0.01, 0.0]))}
             self.inner_gains = {'u': tuple(arr('inner_gains_u', [2.5, 0.0, 0.0])),
                                 'r': tuple(arr('inner_gains_r', [2.5, 0.0, 0.0]))}
-            self.pid_lookahead = dbl('pid_lookahead', 2.5)
+        self.pid_lookahead = dbl('pid_lookahead', 2.5)
 
         # -- kinematic Fossen-LoS -------------------------------------------
         self.los_lookahead   = dbl('los_lookahead', 2.5)
@@ -573,8 +583,6 @@ class Controller(Node):
         # -- thrust limit: one symmetric scalar for every exit ---------------
         self.thrust_limit = dbl('thrust_limit', 20.0)
         limit = self.thrust_limit
-        self.thruster_limits = {"min": np.array([-limit, -limit]),
-                                "max": np.array([ limit,  limit])}
         self.input_bounds = {"lower": np.array([-limit, -limit]),
                              "upper": np.array([ limit,  limit]),
                              "idx":   np.array([0, 1])}
@@ -685,11 +693,8 @@ class Controller(Node):
             target_str = ", ".join(f"{float(x):.2f}" for x in list(self.manual_target))
             self.get_logger().info(f'\nManual target coordinates: \n{target_str}')
 
-        if (self.controller_path.poses or (self.use_pinger and self.pinger_target is not None)
-                or manual_active or arrow_active or self._awaiting_hold_active()
-                or self.pinger_hold is not None):
-            self._record_monitoring(current_time, current_state, u,
-                                    world_target if world_target is not None else target)
+        self._record_monitoring(current_time, current_state, u,
+                                world_target if world_target is not None else target)
 
     def _mission_reference_step(self, current_time, current_state, overridden):
         """Fixed-mission reference: collect the /path_request answer, advance
@@ -726,7 +731,7 @@ class Controller(Node):
         window_fresh = window_age is not None and window_age <= self.path_stale_timeout
         if self.controller_path.poses and not overridden:
             if window_fresh:
-                e_along, e_y, _, _ = self.path_progress_errors(self.controller_path, current_state)
+                e_along, e_y = self.path_progress_errors(self.controller_path, current_state)
                 self.advance_governor(e_along, e_y)
             else:
                 self.get_logger().warning(
@@ -774,21 +779,14 @@ class Controller(Node):
             return u, list(world_target), world_target
 
         if manual_active:
-            target = [*self.manual_target[:2], 0, 0, 0, 0]   # yaw unused for LoS
-            world_target = list(target[:3])  # --- world-frame monitoring target ---
-            target = fm.inRobotFrame(current_state, target)
-            return self.solve_LoS(target, current_time), target, world_target
+            return self._hold_at(current_state, current_time, *self.manual_target[:2], 0)
 
         if self.run_active and self.controller_path.poses:
             return self._path_following_command(current_state)
 
         if self.run_active and self._awaiting_hold_active():
-            # Replanner run before its first path (section 7): hold the start
-            # pose with the manual-target keep-location law.
-            hx, hy, hyaw = self.path_updater.hold
-            world_target = [hx, hy, hyaw]  # --- world-frame monitoring target ---
-            target = fm.inRobotFrame(current_state, [hx, hy, 0, 0, 0, 0])
-            return self.solve_LoS(target, current_time, keep_location=True), target, world_target
+            # Replanner run before its first path (section 7): hold the start pose.
+            return self._hold_at(current_state, current_time, *self.path_updater.hold)
 
         if self.run_active and self.use_pinger:
             ok, why = self._pinger_chase_ok()
@@ -843,16 +841,20 @@ class Controller(Node):
         if self.pinger_hold is None:
             self.pinger_hold = (float(current_state[0]), float(current_state[1]),
                                 float(current_state[2]))
-            if list(self.manual_target) == [0.0, 0.0]:
-                self._clear_manual_hold()
+            self._clear_manual_hold()   # no manual target here (it has priority)
             self.get_logger().warning(
                 f"Pinger following paused ({why}): holding position at "
                 f"({self.pinger_hold[0]:.2f}, {self.pinger_hold[1]:.2f}).")
         else:
             self.get_logger().warning(f"Pinger following paused: {why}.", throttle_duration_sec=5.0)
-        hx, hy, hyaw = self.pinger_hold
-        world_target = [hx, hy, hyaw]  # --- world-frame monitoring target ---
-        target = fm.inRobotFrame(current_state, [hx, hy, 0, 0, 0, 0])
+        return self._hold_at(current_state, current_time, *self.pinger_hold)
+
+    def _hold_at(self, current_state, current_time, x, y, logged_yaw):
+        """Hold the world point (x, y) with the manual-target keep-location law
+        (a manual target, the replanner's awaiting-hold, the pinger hold).
+        `logged_yaw` is the yaw the monitoring row records for it."""
+        world_target = [x, y, logged_yaw]  # --- world-frame monitoring target ---
+        target = fm.inRobotFrame(current_state, [x, y, 0, 0, 0, 0])
         return self.solve_LoS(target, current_time, keep_location=True), target, world_target
 
     def _path_following_command(self, current_state):
@@ -907,9 +909,9 @@ class Controller(Node):
                 if g > 0.0:
                     bearing = math.atan2(target[1] - current_state[1],
                                          target[0] - current_state[0])
-                    psi_path = target[2] + w * g * _wrap(bearing - target[2])
+                    psi_path = target[2] + w * g * PID.wrap_angle(bearing - target[2])
                     slow = True
-            u,_ = self.controller.compute(current_state, target[:3],
+            u = self.controller.compute(current_state, target[:3],
                                           u_ff=target[3], psi_path=psi_path,
                                           slow_on_turn=slow)
 
@@ -930,11 +932,11 @@ class Controller(Node):
             # Body-frame solve: the boat at the origin, heading zero.
             target = [*self.pinger_target[:2], 0]
             current_state[[0,1,2]] = 0
-            u,_ = self.controller.compute(current_state, target)
+            u = self.controller.compute(current_state, target)
 
         if self.controller_type == 'LoS':
             target = self.pinger_target
-            u = self.solve_LoS(target, current_time)
+            u = self.solve_LoS(target, current_time, keep_location=False)
 
         # /controller_target: body frame, pinger branch only (N9).
         msg = Float32MultiArray()
@@ -1080,27 +1082,18 @@ class Controller(Node):
 
     def path_progress_errors(self, path, state):
         """
-        From the current path window (poses[0] = virtual target at tau,
-        poses[1] = a step further along), return:
-          e_along : signed along-track gap boat->target  (target ahead > 0)
-          e_y     : signed cross-track error of the boat
-          gamma_p : path-tangent heading at the target
-          U_d     : authored path speed at the target (m/s)
+        From the current path window (poses[0] = virtual target at tau), the
+        signed along-track gap boat->target (target ahead > 0) and the signed
+        cross-track error of the boat, along the path tangent at the target.
         """
         p0 = path.poses[0].pose
-        p1 = path.poses[1].pose if len(path.poses) > 1 else path.poses[0].pose
-
         x0, y0 = p0.position.x, p0.position.y
         gamma_p = cf.quaternion_to_yaw(p0.orientation)
-
-        dtau = self.path_time / max(1, (self.path_steps - 1))
-        U_d = math.hypot(p1.position.x - x0, p1.position.y - y0) / dtau if dtau > 0 else 0.0
-
         xb, yb = state[0], state[1]
         c, s = math.cos(gamma_p), math.sin(gamma_p)
         e_along =  (x0 - xb) * c + (y0 - yb) * s
         e_y     = -(xb - x0) * s + (yb - y0) * c
-        return e_along, e_y, gamma_p, U_d
+        return e_along, e_y
 
     def advance_governor(self, e_along, e_y):
         """
@@ -1109,7 +1102,7 @@ class Controller(Node):
         error) grows. Both factors are clipped to [0, 1] and multiplied, so tau
         is monotonic and never faster than the path's own parameterisation --
         which is what makes a varying authored speed profile followed for free.
-        Nothing may scale tau_dot above unity. Returns the combined factor.
+        Nothing may scale tau_dot above unity.
         """
         span_along = max(1e-6, (self.gov_Lmax - self.gov_Lmin))
         fac_along = np.clip((self.gov_Lmax - e_along) / span_along, 0.0, 1.0)
@@ -1120,10 +1113,8 @@ class Controller(Node):
         else:
             fac_cross = 1.0
 
-        factor = fac_along * fac_cross
-        tau_dot = self.path_speed_scale * factor
+        tau_dot = self.path_speed_scale * (fac_along * fac_cross)
         self.tau += tau_dot * self.dt
-        return factor
 
     def los_guidance(self, target6, state):
         """
@@ -1158,10 +1149,10 @@ class Controller(Node):
                 # Steer at the point; never reverse (a lookahead law steers the
                 # wrong way backwards), the yaw channel turns the boat round.
                 bearing = math.atan2(y_ref - y, x_ref - x)
-                psi_d = psi_d + w * _wrap(bearing - psi_d)
+                psi_d = psi_d + w * PID.wrap_angle(bearing - psi_d)
                 u_hold = min(self.los_hold_umax, w * self.los_hold_kx * gap)
 
-        psi_err = _wrap(psi_d - psi)
+        psi_err = PID.wrap_angle(psi_d - psi)
 
         u_cmd = (self.los_speed_scale * U_d + u_hold) * max(0.0, math.cos(psi_err))
 
@@ -1171,13 +1162,10 @@ class Controller(Node):
         thrusts = self.los_allocator.allocate(np.array([X, 0.0, N]))
         return thrusts
 
-    def solve_LoS(self, target, current_time, keep_location=None):
-        """Point line-of-sight to a body-frame target (pinger / manual target).
-
-        keep_location None derives the manual-target variant from
-        self.manual_target; True selects it explicitly (a replanner run's
-        awaiting-path hold, section 7).
-        """
+    def solve_LoS(self, target, current_time, keep_location):
+        """Point line-of-sight to a body-frame target. keep_location: the
+        manual-target variant (a point held: manual target, awaiting-hold,
+        pinger hold); False: the pinger pursuit law."""
         x,y,z = target
 
         bearing = np.arctan2(y, x)
@@ -1186,10 +1174,7 @@ class Controller(Node):
         v = self.k_v * d
         v = 5*np.log(v+1)
 
-        if keep_location is None:
-            manual = list(self.manual_target) != [0.0,0.0]
-        else:
-            manual = bool(keep_location)
+        manual = keep_location
         if manual:
             v = 10*np.log(v+1) if not self.tuning_sim else 7*np.log(v+1)  # If manual target, go faster. Don't need to be that precise here. (real / sim-tuned column, gain_profile)
 
@@ -1407,8 +1392,9 @@ class Controller(Node):
     def save_monitoring(self):
         """
         Write the controller log, on its own timer and only when rows were
-        added. np.save rewrites the whole file (string header -> <U32 array),
-        so doing it from the control tick decayed the 20 Hz loop on long runs.
+        added. Only the new rows are converted to the file's <U32 strings
+        (converting the whole list took ~0.5 s per write after an hour of run,
+        on the control executor); the bytes are what np.save of the list gives.
         """
         if self.title is None:
             return                      # a session before its first run: no file
@@ -1416,7 +1402,11 @@ class Controller(Node):
         if rows == self.monitoring_saved_rows:
             return                      # nothing new since the last write
         try:
-            np.save(self.title, self.monitoring)
+            chunk = np.array(self.monitoring[self.monitoring_saved_rows:], dtype='<U32')
+            # The header alone is saved as np.save always did (<U5).
+            np.save(self.title, np.concatenate(self.monitoring_chunks + [chunk])
+                    if rows > 1 else self.monitoring)
+            self.monitoring_chunks.append(chunk)
             self.monitoring_saved_rows = rows
         except Exception as exc:
             self.get_logger().error(f"Could not write {self.title}.npy: {exc}",
@@ -1491,27 +1481,12 @@ class Controller(Node):
         except ValueError as exc:
             self._answer(cmd, False, str(exc))
             return
-        use_pinger = mode == 'follow'
         has_path = bool(cmd.get('has_path', True))
-        if ctype not in ('PID', 'LoS', 'MPC'):
-            self._answer(cmd, False, f"unknown controller_type '{ctype}'")
-            return
-        if ctype == 'MPC' and use_pinger:
-            self._answer(cmd, False, "MPC does not support pinger following - choose PID or LoS")
-            return
         # Section 7, additive: absent = unchanged.
         path_source = str(cmd.get('path_source', self.path_source))
-        if path_source not in pu.PATH_SOURCES:
-            self._answer(cmd, False, f"unknown path_source '{path_source}' "
-                                     f"(one of {', '.join(pu.PATH_SOURCES)})")
-            return
-        if path_source == 'replanner' and use_pinger:
-            self._answer(cmd, False, "a replanner run follows paths, not the pinger - "
-                                     "set use_pinger false or path_source 'mission'")
-            return
-        if path_source == 'replanner' and not has_path:
-            self._answer(cmd, False, "a replanner run always has a path (the replanner's) - "
-                                     "has_path false needs path_source 'mission'")
+        problem = _run_config_problem(ctype, mode, has_path, path_source)
+        if problem:
+            self._answer(cmd, False, problem)
             return
         self.path_source = path_source
         self.pinger_source = str(cmd.get('pinger_source', self.pinger_source))
@@ -1594,23 +1569,15 @@ class Controller(Node):
         self.title = title
         self.monitoring = [list(NPY_HEADER)]
         self.monitoring_saved_rows = 0
+        self.monitoring_chunks = []
 
-        self.manual_target = [0.0, 0.0]
-        self._clear_manual_hold()
-        self.manual_hold_target = None
+        self._clear_run_reference()
         self.arrow_active = False
         self.arrow_cmd = [0.0, 0.0]
-        self.stopping_sequence = False
         self.stopping_time = None
-
         self.tau = 0.0
-        self.controller_path = Path()
-        self.future = None
-        self.request_sent = None
         self.tau_requested = None
-        self.path_rx_time = None
         self.last_world_target = None
-        self.pinger_hold = None
         self.path_complete_logged = False
 
         # Controller memory from the previous run must not leak into this one.
@@ -1640,17 +1607,9 @@ class Controller(Node):
             f"Controller log: {self.title}.npy")
         self._answer(cmd, True, f"run {self.run_number} started")
 
-    def _stop_run(self, cmd):
-        """End the run: stop following, write the log, zero thrust, stay in override."""
-        if not self.run_active:
-            self._answer(cmd, True, "no run active")
-            return
-        self.run_active = False
-        self.run_status = 'idle'
-        self.save_monitoring()
-
-        # No manual target survives the run (arrow control, a station toggle,
-        # is left alone).
+    def _clear_run_reference(self):
+        """What no run outlives: the manual target and its hold, the path
+        window and its pending request, the pinger hold."""
         self.manual_target = [0.0, 0.0]
         self._clear_manual_hold()
         self.manual_hold_target = None
@@ -1660,6 +1619,18 @@ class Controller(Node):
         self.request_sent = None
         self.path_rx_time = None
         self.pinger_hold = None
+
+    def _stop_run(self, cmd):
+        """End the run: stop following, write the log, zero thrust, stay in override."""
+        if not self.run_active:
+            self._answer(cmd, True, "no run active")
+            return
+        self.run_active = False
+        self.run_status = 'idle'
+        self.save_monitoring()
+
+        # Arrow control, a station toggle, is left alone.
+        self._clear_run_reference()
         self._path_update_reset('run_stopped')
 
         self.get_logger().info(
@@ -1711,21 +1682,11 @@ class Controller(Node):
         """Declare the feature's parameters and interfaces (all additive)."""
         self.declare_parameter('path_source', 'mission')
         self.path_source = self.get_parameter('path_source').get_parameter_value().string_value
-        if self.path_source not in pu.PATH_SOURCES:
-            msg = (f"unknown path_source '{self.path_source}' "
-                   f"(one of {', '.join(pu.PATH_SOURCES)})")
-            self.get_logger().fatal(msg)
-            raise ValueError(msg)
-        if self.path_source == 'replanner' and self.use_pinger:
-            msg = ("path_source:=replanner follows paths, not the pinger: launch "
-                   "with use_pinger:=false or path_source:=mission")
-            self.get_logger().fatal(msg)
-            raise ValueError(msg)
-        if self.path_source == 'replanner' and not self.has_path:
-            msg = ("path_source:=replanner always has a path (the replanner's): "
-                   "has_path:=false needs path_source:=mission")
-            self.get_logger().fatal(msg)
-            raise ValueError(msg)
+        problem = _run_config_problem(self.controller_type, self.pinger_mode, self.has_path,
+                                      self.path_source)
+        if problem:
+            self.get_logger().fatal(problem)
+            raise ValueError(problem)
 
         dbl, integer = self._dbl, self._int
         # Thresholds and their derivations: docs/PATH_UPDATE_DESIGN.md D-4.
@@ -1881,7 +1842,7 @@ class Controller(Node):
         self.path_rx_time = current_time        # composed now: always fresh
 
         if not (manual_active or arrow_active):
-            e_along, e_y, _, _ = self.path_progress_errors(self.controller_path, current_state)
+            e_along, e_y = self.path_progress_errors(self.controller_path, current_state)
             self.advance_governor(e_along, e_y)
 
         events = updater.tick(self._path_update_context())

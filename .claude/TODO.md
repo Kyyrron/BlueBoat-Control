@@ -41,8 +41,6 @@ Done and what it rests on: `docs/PARAMETER_REGISTER.md`; requests to other modul
   behind its target, register §8); it was only ever flown at 0.5 m/s.
 - [ ] **A stale MPC iterate after a manual excursion** is only moved by whole turns
   (`_align_iterate`); a full re-seed when the boat is far from it was not attempted.
-- [ ] **`uvr_mpc.py`** (standalone, launched by nothing) still unwraps its heading stage by
-  stage against the wrapped previous yaw.
 
 ## Notes
 

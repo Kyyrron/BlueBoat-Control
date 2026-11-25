@@ -1,23 +1,20 @@
 #!/usr/bin/env python3
 r"""
-Pinger filter parameters: the schema file, presets, validation and the hash.
+Pinger filter parameters: `config/pinger_filter.yaml` (every parameter, its
+range and, in plain words, what it does), its presets, and a tuning file.
 
-ROS-FREE BY CONSTRUCTION (stdlib + PyYAML). Read by the pinger_estimator node, the
-pinger_filter_replay CLI, poslog_report and the log reviewer; the Mission Control
-Station reads the SAME data file (`config/pinger_filter.yaml`) without importing
-this module.
+ROS-FREE (stdlib + PyYAML). The station (BlueBoat-MCS) reads the same YAML as
+data for its filter dialog.
 
-    params = load_params(preset='slow_rov', overrides={'latency_s': 1.2})
-    params.values['latency_s']    -> 1.2
-    params.hash                   -> 16 hex digits of the applied set
+    params = load_params(preset='slow_rov', yaml_path='my_tuning.yaml')
+    params.values['latency_s'], params.hash      # 16 hex digits of the set
 
-The schema file is found, in order: an explicit path; $BLUEBOAT_PINGER_SCHEMA;
-the source tree (`<pkg>/config/` two levels above this file); the installed share
-directory (`<install>/share/blueboat_control/config/`, relative to the installed
-`lib/blueboat_control/`); ament_index if importable.
+A tuning file is `params: {name: value, ...}` (or a flat mapping), optionally
+with `preset:`; only the values it names change. Order: defaults <- preset <-
+tuning file <- overrides. Every set is validated whole: a wrong name, type or
+range is refused with the reason.
 """
 
-import copy
 import hashlib
 import json
 import os
@@ -34,59 +31,35 @@ class ParamError(ValueError):
     """An invalid parameter set; the message names every problem."""
 
 
-def schema_path(explicit=None):
-    """Absolute path of the schema file, or FileNotFoundError naming every place tried."""
+def schema_path():
+    """The schema file: the source tree's (beside this file's package) or the
+    installed share's (beside the installed lib/blueboat_control/)."""
     here = os.path.dirname(os.path.abspath(__file__))
-    tried = []
-    candidates = []
-    if explicit:
-        candidates.append(explicit)
-    if os.environ.get("BLUEBOAT_PINGER_SCHEMA"):
-        candidates.append(os.environ["BLUEBOAT_PINGER_SCHEMA"])
-    candidates.append(os.path.join(here, "..", "..", "config", SCHEMA_NAME))           # source tree
-    candidates.append(os.path.join(here, "..", "..", "share", "blueboat_control", "config", SCHEMA_NAME))
-    for c in candidates:
-        tried.append(os.path.abspath(c))
+    for c in (os.path.join(here, "..", "..", "config", SCHEMA_NAME),
+              os.path.join(here, "..", "..", "share", "blueboat_control", "config", SCHEMA_NAME)):
         if os.path.isfile(c):
             return os.path.abspath(c)
-    try:
-        from ament_index_python.packages import get_package_share_directory
-        c = os.path.join(get_package_share_directory("blueboat_control"), "config", SCHEMA_NAME)
-        tried.append(c)
-        if os.path.isfile(c):
-            return c
-    except Exception:                                   # noqa: BLE001 - optional lookup
-        pass
-    raise FileNotFoundError("pinger filter schema not found; tried: " + ", ".join(tried))
+    raise FileNotFoundError(f"pinger filter parameters ({SCHEMA_NAME}) not found from {here}")
 
 
-_SCHEMA_CACHE = {}
+_SCHEMA = None
 
 
-def load_schema(path=None):
-    """The parsed schema dict ({schema, groups, parameters, presets})."""
-    p = schema_path(path)
-    if p not in _SCHEMA_CACHE:
-        with open(p, "r") as handle:
+def load_schema():
+    """The parsed schema {schema, groups, parameters, presets, ...} (read once; do not modify)."""
+    global _SCHEMA
+    if _SCHEMA is None:
+        path = schema_path()
+        with open(path, "r") as handle:
             data = yaml.safe_load(handle)
         if not isinstance(data, dict) or data.get("schema") != SCHEMA_ID:
-            raise ParamError(f"{p}: not a {SCHEMA_ID} file")
-        _SCHEMA_CACHE[p] = data
-    return copy.deepcopy(_SCHEMA_CACHE[p])
+            raise ParamError(f"{path}: not a {SCHEMA_ID} file")
+        _SCHEMA = data
+    return _SCHEMA
 
 
-def defaults(schema=None):
-    schema = schema or load_schema()
-    return {name: spec["default"] for name, spec in schema["parameters"].items()}
-
-
-def preset_names(schema=None):
-    schema = schema or load_schema()
-    return list(schema["presets"].keys())
-
-
-def coerce(name, value, spec):
-    """`value` converted to the parameter's type, or ParamError with the reason."""
+def _coerce(name, value, spec):
+    """`value` converted to the parameter's type, or ParamError."""
     kind = spec["type"]
     try:
         if kind == "bool":
@@ -98,166 +71,135 @@ def coerce(name, value, spec):
                     return False
                 raise ValueError(value)
             return bool(value)
+        if kind == "enum":
+            return str(value)
+        if isinstance(value, bool):
+            raise ValueError(value)
         if kind == "int":
-            if isinstance(value, bool):
-                raise ValueError(value)
             f = float(value)
             if f != int(f):
                 raise ValueError(value)
             return int(f)
         if kind == "float":
-            if isinstance(value, bool):
-                raise ValueError(value)
             return float(value)
-        if kind == "enum":
-            return str(value)
     except (TypeError, ValueError, OverflowError):
         raise ParamError(f"{name}: {value!r} is not a {kind}") from None
     raise ParamError(f"{name}: unknown type {kind!r} in the schema")
 
 
-def check_value(name, value, spec):
-    """None if `value` (already coerced) is allowed, else the reason (one line)."""
-    kind = spec["type"]
-    if kind == "enum":
+def _problem(name, value, spec):
+    """None if `value` (already coerced) is allowed, else the reason."""
+    if spec["type"] == "enum":
         if value not in spec["choices"]:
             return f"{name}: {value!r} is not one of {', '.join(spec['choices'])}"
         return None
-    if kind in ("int", "float"):
+    if spec["type"] in ("int", "float"):
         if value != value or value in (float("inf"), float("-inf")):
             return f"{name}: {value} is not a finite number"
-        lo, hi = spec.get("min"), spec.get("max")
+        lo, hi, unit = spec.get("min"), spec.get("max"), spec.get("unit", "")
         if lo is not None and value < lo:
-            return f"{name}: {value} is below the minimum {lo} {spec.get('unit', '')}".rstrip()
+            return f"{name}: {value} is below the minimum {lo} {unit}".rstrip()
         if hi is not None and value > hi:
-            return f"{name}: {value} is above the maximum {hi} {spec.get('unit', '')}".rstrip()
+            return f"{name}: {value} is above the maximum {hi} {unit}".rstrip()
     if name in ("y_sign", "z_sign") and value == 0:
         return f"{name}: must be +1 or -1"
     return None
 
 
-def cross_checks(values):
-    """Reasons that involve several parameters."""
-    out = []
-    if values["gate_hard"] < values["gate_soft"]:
-        out.append("gate_hard must be >= gate_soft")
-    if values["stale_timeout_s"] < values["coast_after_s"]:
-        out.append("stale_timeout_s must be >= coast_after_s")
-    return out
-
-
-class Params:
-    """An applied, validated parameter set."""
-
-    def __init__(self, values, preset, schema):
-        self.values = dict(values)
-        self.preset = preset
-        self.schema_id = schema["schema"]
-        # Once: read with every fix and estimate, and `values` is never
-        # changed after validation.
-        self.hash = params_hash(self.values)
-
-    def __getitem__(self, key):
-        return self.values[key]
-
-    def as_dict(self):
-        return {"schema": self.schema_id, "preset": self.preset, "params": dict(self.values),
-                "hash": self.hash}
-
-
-def params_hash(values):
-    canon = json.dumps({k: values[k] for k in sorted(values)}, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(canon.encode("utf-8")).hexdigest()[:16]
-
-
-def validate(values, schema=None):
-    """(coerced values, []) or raise ParamError listing every problem. Unknown
-    names are errors (a typo must not be silently ignored)."""
-    schema = schema or load_schema()
-    specs = schema["parameters"]
-    problems, out = [], {}
-    for name in values:
-        if name not in specs:
-            problems.append(f"{name}: unknown parameter")
+def validate(values):
+    """The coerced values, or ParamError naming every problem. An unknown name
+    is an error (a typo must never be silently ignored)."""
+    specs = load_schema()["parameters"]
+    problems = [f"{name}: unknown parameter" for name in values if name not in specs]
+    out = {}
     for name, spec in specs.items():
         if name not in values:
             problems.append(f"{name}: missing")
             continue
         try:
-            v = coerce(name, values[name], spec)
+            out[name] = _coerce(name, values[name], spec)
         except ParamError as exc:
             problems.append(str(exc))
             continue
-        why = check_value(name, v, spec)
+        why = _problem(name, out[name], spec)
         if why:
             problems.append(why)
-        out[name] = v
     if not problems:
-        problems.extend(cross_checks(out))
+        if out["gate_hard"] < out["gate_soft"]:
+            problems.append("gate_hard must be >= gate_soft")
+        if out["stale_timeout_s"] < out["coast_after_s"]:
+            problems.append("stale_timeout_s must be >= coast_after_s")
     if problems:
         raise ParamError("; ".join(problems))
     return out
 
 
-def load_params(preset=DEFAULT_PRESET, overrides=None, yaml_path=None, schema=None):
-    """Defaults <- preset <- YAML file (`params:` mapping or a flat mapping) <- overrides.
+class Params:
+    """A validated parameter set: `values`, the `preset` it builds on, its `hash`."""
 
-    preset `custom` means "the YAML file / overrides on top of the defaults".
-    """
-    schema = schema or load_schema()
-    values = defaults(schema)
-    file_values = read_param_yaml(yaml_path) if yaml_path else None
-    file_preset = read_file_preset(yaml_path) if yaml_path else None
-    if file_preset and file_preset in schema["presets"]:
-        # A saved set builds on the preset it was saved from (as the station
-        # reads it), whatever preset the launch names.
+    def __init__(self, values, preset):
+        self.values = values
+        self.preset = preset
+        canon = json.dumps({k: values[k] for k in sorted(values)}, sort_keys=True, separators=(",", ":"))
+        self.hash = hashlib.sha256(canon.encode("utf-8")).hexdigest()[:16]
+
+    def __getitem__(self, key):
+        return self.values[key]
+
+
+def read_tuning_file(path):
+    """(preset or None, {name: value}) of a tuning file."""
+    with open(os.path.expanduser(path), "r") as handle:
+        data = yaml.safe_load(handle) or {}
+    if not isinstance(data, dict):
+        raise ParamError(f"{path}: not a mapping")
+    preset = str(data["preset"]) if data.get("preset") else None
+    if "params" in data:
+        values = data["params"] or {}             # every line commented out: nothing changed
+        if not isinstance(values, dict):
+            raise ParamError(f"{path}: `params:` is not a mapping")
+        return preset, dict(values)
+    return preset, {k: v for k, v in data.items() if k not in ("schema", "preset", "hash", "description")}
+
+
+def write_tuning_template(path, params):
+    """Create a tuning file listing every parameter, commented out, with its
+    current value, range and what it changes. Never overwrites a file."""
+    schema = load_schema()
+    lines = ["# Pinger filter tuning. Uncomment a line, change the value, save: the running",
+             "# pinger_estimator applies it within a second, keeping its estimate. A bad value is",
+             "# refused (the reason is in the log) and the previous set stays. Presets: "
+             + ", ".join(schema["presets"]) + ".",
+             f"preset: {params.preset}",
+             "params:"]
+    for group in schema["groups"]:
+        lines.append(f"  # ---- {group}")
+        for name, spec in schema["parameters"].items():
+            if spec["group"] != group:
+                continue
+            value = params.values[name]
+            shown = str(value).lower() if isinstance(value, bool) else value
+            span = (f"[{spec['min']}, {spec['max']}] {spec.get('unit', '')}".rstrip()
+                    if "min" in spec else " | ".join(spec.get("choices", [])) or "true | false")
+            lines.append(f"  # {name}: {shown}    # {span}. {spec['description']}")
+    path = os.path.expanduser(path)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "x") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+def load_params(preset=DEFAULT_PRESET, overrides=None, yaml_path=None):
+    """Defaults <- preset <- tuning file <- overrides, validated. A tuning file
+    that names a preset builds on it, whatever `preset` says."""
+    schema = load_schema()
+    values = {name: spec["default"] for name, spec in schema["parameters"].items()}
+    file_preset, file_values = read_tuning_file(yaml_path) if yaml_path else (None, {})
+    if file_preset in schema["presets"]:
         preset = file_preset
     if preset not in (CUSTOM, None, ""):
         if preset not in schema["presets"]:
             raise ParamError(f"unknown preset {preset!r} (one of {', '.join(schema['presets'])}, custom)")
         values.update(schema["presets"][preset].get("values") or {})
-    if file_values:
-        values.update(file_values)
-    if overrides:
-        values.update(overrides)
-    return Params(validate(values, schema), preset or CUSTOM, schema)
-
-
-def read_param_yaml(path):
-    """The parameter mapping of a saved file ({params: {...}} or flat)."""
-    with open(os.path.expanduser(path), "r") as handle:
-        data = yaml.safe_load(handle) or {}
-    if not isinstance(data, dict):
-        raise ParamError(f"{path}: not a mapping")
-    if "params" in data and isinstance(data["params"], dict):
-        return dict(data["params"])
-    return {k: v for k, v in data.items() if k not in ("schema", "preset", "hash", "description")}
-
-
-def read_file_preset(path):
-    """The `preset:` a saved set names, or None."""
-    with open(os.path.expanduser(path), "r") as handle:
-        data = yaml.safe_load(handle) or {}
-    p = data.get("preset") if isinstance(data, dict) else None
-    return str(p) if p else None
-
-
-def write_param_yaml(path, params):
-    """Write an applied set (the format MCS saves too)."""
-    with open(os.path.expanduser(path), "w") as handle:
-        yaml.safe_dump(params.as_dict(), handle, sort_keys=False)
-
-
-def parse_overrides(pairs, schema=None):
-    """['latency_s=1.2', 'robust=chi2'] -> {name: coerced value}."""
-    schema = schema or load_schema()
-    out = {}
-    for pair in pairs or []:
-        name, sep, raw = pair.partition("=")
-        name = name.strip()
-        if not sep:
-            raise ParamError(f"{pair!r}: expected name=value")
-        if name not in schema["parameters"]:
-            raise ParamError(f"{name}: unknown parameter")
-        out[name] = coerce(name, raw.strip(), schema["parameters"][name])
-    return out
+    values.update(file_values)
+    values.update(overrides or {})
+    return Params(validate(values), preset or CUSTOM)

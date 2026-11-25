@@ -33,7 +33,6 @@ import rclpy
 import json
 import math
 import os
-import re
 import time
 import xml.etree.ElementTree as ET
 from collections import deque
@@ -50,6 +49,7 @@ import custom_functions as cf
 import robot_log_schema as rls   # CSV column layout (ROS-free)
 import thrust_limits as tl       # uniform thrust saturation (ROS-free)
 import path_update_log as pul    # the run's -pathlog.csv (ROS-free)
+import poslog_report             # files a finished run; owns the run-file names (ROS-free)
 import odom_emulation as oe      # field odometry timing (ROS-free)
 
 
@@ -139,9 +139,6 @@ class Controller(Node):
         self.lag_state = [0.0, 0.0]
         self.true_surge = 0.0             # body surge speed the propellers see [m/s]
 
-        # No Water Linked UGPS in simulation: fixed, not a parameter.
-        self.use_UWgps = False
-
         self.rov = ROV(self, thrust_visual = True)
         self.description_sub = self.create_subscription(
             String, 'robot_description', self.description_callback,
@@ -213,15 +210,14 @@ class Controller(Node):
         self.prev_twist_t = None
 
         # ---- position CSV (write-once field record, robot_log_schema.py) ----
-        self.data_columns = rls.columns_for(self.use_UWgps)
-        self.target_cols, self.target_gps_cols = rls.target_columns_for(self.use_UWgps)
+        self.data_columns = rls.columns_for_mode('off')        # simulation logs no pinger
 
         # File name on the wall clock (sorts with field runs); rows on sim time.
         self.date = datetime.today().strftime('%Y_%m_%d-%H_%M_%S')
         log_dir = cf.ensure_data_dir(self, self.data_root, 'data', 'Robot_data')
         stem = f'{self.date}-{self.note}-poslog' if self.note else f'{self.date}-poslog'
         self.path = cf.reserve_run_file(log_dir, stem, '.csv') + '.csv'
-        self.origin_path = re.sub(r'-poslog(-\d+)?\.csv$', r'-origin\1.yaml', self.path)
+        self.origin_path = poslog_report.sidecar_path(self.path)
 
         self.log_file = open(self.path, 'w', buffering=1)
         for line in rls.legend_rows(self.data_columns):
@@ -535,11 +531,9 @@ class Controller(Node):
         else:
             target_xy = [0.0, 0.0]
 
-        row[self.target_cols[0]] = target_xy[0]
-        row[self.target_cols[1]] = target_xy[1]
         target_gps = self.to_gps(target_xy)
-        row[self.target_gps_cols[0]] = target_gps[0]
-        row[self.target_gps_cols[1]] = target_gps[1]
+        row.update(target_x=target_xy[0], target_y=target_xy[1],
+                   target_latitude=target_gps[0], target_longitude=target_gps[1])
 
         return row
 
@@ -629,7 +623,6 @@ class Controller(Node):
 
         # 4. Mission report (matplotlib imported lazily, never at module scope).
         try:
-            import poslog_report
             folder = poslog_report.finalise_run(self.path)
             self.get_logger().info(f"Mission report: {folder}")
         except Exception as exc:                       # noqa: BLE001 - teardown

@@ -20,14 +20,10 @@
 #   /set_path           the run's `-path.yaml` snapshot, world frame, every 5 s.
 #   original names      every /mavros/* topic but rc/override (recorded GPS
 #                       fixes, compass, IMU, state, ...), /thruster_input,
-#                       /controller_target, /uw_gps_data, /uw_gps/fix,
-#                       /uw_gps/info -- unchanged but for header.stamp.
-#   pinger outputs      /blueboat/pinger_coordinates and /blueboat/pinger/*
-#                       (2026-11-24): under their own names (the bag's pinger,
-#                       as recorded) -- or, with `pinger_estimator:=true`, under
-#                       /replay/<name>, because a pinger_estimator then runs on
-#                       the replayed inputs and owns the live names (one
-#                       publisher per topic).
+#                       /controller_target, /uw_gps_data, /uw_gps/fix and
+#                       the pinger (/blueboat/pinger_coordinates,
+#                       /blueboat/pinger/*, as recorded) -- unchanged but for
+#                       header.stamp.
 #   /replay/<name>      everything else (operator commands, session plumbing,
 #                       param handshake, rc/override, the raw /blueboat/odom):
 #                       nothing lost, nothing that triggers a live consumer.
@@ -108,22 +104,18 @@ T_MONITORING = '/monitoring_data'
 T_MAVLINK = '/uas1/mavlink_source'
 
 # Republished unchanged under their own names (beside every /mavros/* topic).
-LIVE_TOPICS = {'/thruster_input', '/controller_target', '/uw_gps_data',
-               '/uw_gps/fix', '/uw_gps/info'}
-# What pinger_estimator publishes: live names unless a replay estimator runs.
-PINGER_OUTPUTS = {'/blueboat/pinger_coordinates', '/blueboat/pinger/legacy_body',
-                  '/blueboat/pinger/estimate', '/blueboat/pinger/fix',
-                  '/blueboat/pinger/filter_config'}
+LIVE_TOPICS = {'/thruster_input', '/controller_target', '/uw_gps_data', '/uw_gps/fix',
+               '/blueboat/pinger_coordinates', '/blueboat/pinger/legacy_body',
+               '/blueboat/pinger/estimate', '/blueboat/pinger/fix',
+               '/blueboat/pinger/filter_config'}
 # Latched at both ends live (CM-4): republished latched.
-LATCHED_TOPICS = {'/blueboat/pinger/filter_config', '/uw_gps/info'}
+LATCHED_TOPICS = {'/blueboat/pinger/filter_config'}
 # Never republished: graph plumbing of the recording session.
 DROPPED_TOPICS = {'/rosout', '/parameter_events', '/tf', '/tf_static', '/clock'}
 # /mavros/* topics that are commands TO the boat, not telemetry from it.
 MAVROS_COMMANDS = {'/mavros/rc/override'}
 REPLAY_PREFIX = '/replay'
 
-HEAVE_WINDOW_S = 10.0
-HEAVE_CLIP_M = 0.5
 
 
 # ============================================================================
@@ -257,19 +249,6 @@ def slerp(q0, q1, a):
     return q / np.linalg.norm(q)
 
 
-def detrended(t_s, z, window_s=HEAVE_WINDOW_S, clip=HEAVE_CLIP_M):
-    """z minus its centred moving mean over window_s, clipped: the EKF's
-    altitude drifts by metres (GPS / baro), its short-term motion is heave."""
-    z = np.asarray(z, float)
-    if len(z) == 0:
-        return z
-    c = np.concatenate([[0.0], np.cumsum(z)])
-    lo = np.searchsorted(t_s, t_s - window_s / 2.0, side='left')
-    hi = np.searchsorted(t_s, t_s + window_s / 2.0, side='right')
-    mean = (c[hi] - c[lo]) / np.maximum(hi - lo, 1)
-    return np.clip(z - mean, -clip, clip)
-
-
 def mavlink_attitude(s):
     """(bag times ns, quaternions ENU/FLU, body rates FLU) of the recorded
     ATTITUDE messages of the main autopilot, timed by time_boot_ms; None when
@@ -356,7 +335,9 @@ class Track:
                 self.z = z if z is not None else np.zeros(len(self.t))
             elif heave:
                 self.heave_mode = 'replayed'
-                self.z = detrended(self.t * 1e-9, p[:, 2])
+                # The EKF's altitude drifts by metres; its short-term motion is heave.
+                self.z = np.clip(ra.detrended(self.t * 1e-9, p[:, 2]),
+                                 -ra.HEAVE_CLIP_M, ra.HEAVE_CLIP_M)
             else:
                 self.z = np.zeros(len(self.t))
         elif s['bb_t']:
@@ -496,9 +477,6 @@ class BagReplay(Node):
         # rest height sss_sim_node takes as the still waterline -- cited, not
         # imported (CM-3), so the transducers sit at its sensor_depth_m.
         self.declare_parameter('boat_pose_waterline_z', -0.111)
-        # True when Replay_launch runs a pinger_estimator on the replayed
-        # inputs: the recorded pinger outputs then go to /replay/<name>.
-        self.declare_parameter('pinger_estimator', False)
 
         gp = self.get_parameter
         self.bag_dir = resolve_bag(gp('bag').get_parameter_value().string_value)
@@ -607,10 +585,6 @@ class BagReplay(Node):
         if topic.startswith('/mavros/') and topic not in MAVROS_COMMANDS:
             return topic, 'live'
         if topic in LIVE_TOPICS:
-            return topic, 'live'
-        if topic in PINGER_OUTPUTS:
-            if self.get_parameter('pinger_estimator').get_parameter_value().bool_value:
-                return REPLAY_PREFIX + topic, 'raw'
             return topic, 'live'
         return REPLAY_PREFIX + topic, 'raw'
 

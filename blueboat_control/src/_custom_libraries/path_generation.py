@@ -310,22 +310,11 @@ class PathGeneration(Node):
         # a station-keeping pose at the origin until the file is loaded.
         if path_shape.startswith('from_yaml'):
             if self.yaml_traj is None:
-                x, y, z, roll, pitch, yaw = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+                x, y, z, yaw = 0.0, 0.0, 0.0, 0.0
             else:
-                x, y, z, roll, pitch, yaw = yt.read_yaml(self.yaml_traj, t)
-            quat = R.from_euler('zyx', [yaw, 0.0, 0.0]).as_quat()
-            pose = PoseStamped()
-            pose.header.frame_id = "world"
-            pose.pose.position.x = float(x)
-            pose.pose.position.y = float(y)
-            pose.pose.position.z = float(z)
-            pose.pose.orientation.x = quat[0]
-            pose.pose.orientation.y = quat[1]
-            pose.pose.orientation.z = quat[2]
-            pose.pose.orientation.w = quat[3]
-            return pose
+                x, y, z, _, _, yaw = self.yaml_traj.pose(t)
 
-        if path_shape == 'station_keeping':
+        elif path_shape == 'station_keeping':
             x = 0.0
             y = 0.0
             z = 0.0

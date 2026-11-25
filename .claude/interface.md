@@ -7,8 +7,8 @@
 Names are written **absolutely** in the source; `master_control` has `namespace='blueboat'`,
 which ROS 2 does not apply to absolute names — rewriting them relative would rename half the
 interface (N1). Relative names: `path_publisher` (`set_path`, `path_request`, root namespace)
-and the `ROV` helper in `blueboat_control/__init__.py` (`odom`, `joint_states`,
-`robot_description`, `cmd_<thruster>`, `cmd_<joint>`, display-only `blueboat_<thruster>_wrench`
+and the `ROV` helper in `blueboat_control/__init__.py` (`robot_description`, `cmd_<thruster>`,
+display-only `blueboat_<thruster>_wrench`
 and `blueboat_base`, all under `blueboat`). Cross-module behaviour of these topics (QoS of
 `controller_ready`, `/thruster_input` never silent, the 3-value body-frame pinger vector) is
 in the superproject `CLAUDE.md` §4.1.
@@ -24,21 +24,17 @@ sources import each other as bare modules (`import custom_functions`, `import PI
 | `simulation_interface.py` | `src/` | `pid_sim` (ns `blueboat`) | Gazebo thrust bridge via `ROV`; sim readiness; position CSV (no-pinger layout) |
 | `robot_interface.py` | `src/robot_interaction/` | `blueboat_controller` | MAVROS bridge, thrust→PWM, odom republish, CSV, run bags |
 | `param_set.py` | `src/robot_interaction/` | `blueboat_parameter_control` | SERVO function + GCS sysid remapping; watchdogged |
-| `uwgps_log.py` | `src/robot_interaction/` | `underwater_gps_logger` | Water Linked UGPS HTTP poller: `/uw_gps/fix` JSON at `raw_rate_hz` (4), the legacy `/uw_gps_data` packet on the 2 Hz full cycle, `/uw_gps/info`; every request has a (connect, read) timeout (2026-11-24) |
-| `pinger_estimator.py` | `src/robot_interaction/` | `pinger_estimator` | The USBL pinger pipeline (2026-11-24): filter + legacy value; the ONE publisher of `/blueboat/pinger_coordinates` and `/blueboat/pinger/*`. Logic in the ROS-free `pinger_estimator_core.py` (shared with the offline CLI) |
-| `pinger_filter_replay.py` | `src/_custom_libraries/` | (CLI, no node) | Offline pinger filter on bags / CSVs / per-fix logs: `run`, `grid`, `evaluate` (ROS-free) |
+| `uwgps_log.py` | `src/robot_interaction/` | `underwater_gps_logger` | Water Linked UGPS HTTP poller: `/uw_gps/fix` JSON at `raw_rate_hz` (4), the legacy `/uw_gps_data` packet on the 2 Hz full cycle; every request has a (connect, read) timeout (2026-11-24) |
+| `pinger_estimator.py` | `src/robot_interaction/` | `pinger_estimator` | The USBL pinger (2026-11-24): filter + legacy value, live tuning file; the ONE publisher of `/blueboat/pinger_coordinates` and `/blueboat/pinger/*`. Filter: ROS-free `pinger_filter.py`; parameters: `pinger_params.py` |
 | `path_generation.py` | `src/_custom_libraries/` | `path_generation` | `/path_request` server; trajectory library |
 | `path_publisher.py` | `src/_custom_libraries/` | `path_publisher` | Whole-path preview for RViz |
 | `bag_replay.py` | `src/` | `bag_replay` | Kinematic Gazebo replay of one run's bag (§2.3) |
-| `MPC/ur_mpc_control.py`, `MPC/uvr_mpc_control.py` | `src/MPC/` | `mpc_control` (ns `blueboat`) | Standalone MPC nodes (2 / 3 thrusters) — installed, launched by nothing |
 
 **ROS-free by construction** (numpy or stdlib only; keep them so — anything needing `rclpy`
 goes in `custom_functions.py`): `frame_math.py`, `robot_log_schema.py`, `thrust_limits.py`,
 `path_stamp.py`, `poslog_report.py`, `run_bag.py`, `path_update.py`, `path_update_log.py`,
-`replay_attitude.py`, `yaml_trajectory.py`, `odom_emulation.py`, and the pinger pipeline's
-`pinger_filter.py`, `pinger_estimator_core.py`, `pinger_params.py`, `pinger_input.py`, `pinger_log.py`,
-`legacy_pinger.py`, `mcap_lite.py`, `pinger_filter_replay.py` (all `src/_custom_libraries/`),
-plus `MPC/ur_mpc.py` (acados, no ROS).
+`replay_attitude.py`, `yaml_trajectory.py`, `odom_emulation.py`, `pinger_filter.py`,
+`pinger_params.py` (all `src/_custom_libraries/`), plus `MPC/ur_mpc.py` (acados, no ROS).
 
 `poslog_report.py` (also a CLI) files a finished run: creates `Robot_data/<csv stem>/` and
 **moves** the CSV, its `-origin.yaml`, a PNG report and, from a session, the `-path.yaml`
@@ -62,12 +58,11 @@ change; what file a thing lives in may not (N1). The `fsin` table must stay at
 | `/blueboat/odom` | `nav_msgs/Odometry` | `robot_interface` (real) · `simulation_interface` (sim, field-equivalent: relayed from `/blueboat/odom_gz` at the field rate and delay) · Gazebo bridge (sim, `odom_raw:=false`: legacy, §8) · `bag_replay` | `master_control`, `simulation_interface`, `pinger_estimator` (pose buffer, legacy dead reckoning) — **local ENU** on both: origin = launch point (real) / Gazebo origin (sim), yaw **absolute ENU** |
 | `/blueboat/odom_gz` | `nav_msgs/Odometry` | Gazebo bridge — **simulation only**, `odom_raw:=true` (default): Gazebo's own 20 Hz odometry | `simulation_interface` (the relay; also the surge speed its actuator model uses) |
 | `/blueboat/pinger_coordinates` | `Float32MultiArray` `[x, y, z]` body frame | `pinger_estimator` (was `robot_interface` until 2026-11-24: same name, type, frame and QoS) — at odom rate, the FILTERED vector `b = R(ψ)ᵀ(p̂ − p_boat)` (zeros until the filter initialises) with `pinger_source:=filter` (default), exactly the v1.1 legacy vector with `legacy` | `master_control` (follow target), GCS `pinger_listener`, MCS |
-| `/blueboat/pinger/legacy_body` | `Float32MultiArray` `[x, y, z]` body frame | `pinger_estimator`, always — the v1.1 algorithm ("dragged by the boat between fixes", `legacy_pinger.py`) | `robot_interface` (`corrected_pinger_*` columns, same formula as before), MCS legacy layer |
-| `/blueboat/pinger/estimate` | `String` (JSON `blueboat_pinger_estimate/1`) | `pinger_estimator`, at each processed fix + `heartbeat_hz` (1, ≥ 0.5) and right after any filter restart. `status` = the filter's; `source_status` = the status of the source `/blueboat/pinger_coordinates` carries (the filter's, or with `pinger_source:=legacy` the legacy input's freshness) | `master_control` (`source_status` gates following), `robot_interface` (`pf_*` columns), MCS |
-| `/blueboat/pinger/fix` | `String` (JSON `blueboat_pinger_fix/1`), reliable depth 50 | `pinger_estimator`, one per processed fix (duplicates and invalid ones included, with the reason), and `decision: state` filter snapshots (run start, parameter change, every `snapshot_period_s` = 10 s) | `robot_interface` (the run's `-pingerlog.csv`, started at a snapshot), MCS raw-fix layer |
-| `/blueboat/pinger/filter_config` | `String` (JSON `blueboat_pinger_filter_config/1`), reliable depth 1 TRANSIENT_LOCAL | `pinger_estimator`: the applied parameter set, its hash, preset, source, mapping, and the `configure` seq it answers (`ok`, `detail`) | `robot_interface` (sidecar, per-fix log `config` rows), MCS ("applied") |
+| `/blueboat/pinger/legacy_body` | `Float32MultiArray` `[x, y, z]` body frame | `pinger_estimator`, always — the v1.1 algorithm ("dragged by the boat between fixes", `pinger_filter.LegacyPinger`) | `robot_interface` (`corrected_pinger_*` columns, same formula as before), MCS legacy layer |
+| `/blueboat/pinger/estimate` | `String` (JSON `blueboat_pinger_estimate/1`) | `pinger_estimator`, at each processed fix, every second and right after a parameter change. `status` = the filter's; `source_status` = the status of the source `/blueboat/pinger_coordinates` carries (the filter's, or with `pinger_source:=legacy` the legacy input's freshness) | `master_control` (`source_status` gates following), `robot_interface` (`pf_*` columns), MCS |
+| `/blueboat/pinger/fix` | `String` (JSON `blueboat_pinger_fix/1`), reliable depth 50 | `pinger_estimator`, one per processed fix (duplicates and invalid ones included, with the reason) | MCS raw-fix layer, the run bag |
+| `/blueboat/pinger/filter_config` | `String` (JSON `blueboat_pinger_filter_config/1`), reliable depth 1 TRANSIENT_LOCAL | `pinger_estimator`: the parameter set in force, its hash, preset, source, and the `configure` seq it answers (`ok`, `detail`; `seq` null after a tuning-file reload) | `robot_interface` (sidecar), MCS ("applied") |
 | `/uw_gps/fix` | `String` (JSON `blueboat_uwgps_fix/1`), reliable depth 50 | `uwgps_log`, one per raw poll: every field of every polled endpoint, with request/response ROS times, HTTP status, error | `pinger_estimator` (the filter's input), the bag |
-| `/uw_gps/info` | `String` (JSON `blueboat_uwgps_info/1`), reliable depth 1 TRANSIENT_LOCAL | `uwgps_log`, at start and every 60 s: the unit's about / antenna / receiver configuration (best effort) | the bag, operators |
 | `/blueboat/path_info` | `String` (JSON `blueboat_path_info/1`), reliable depth 1 TRANSIENT_LOCAL | `path_generation`: the served trajectory, `duration_s` (null when it never ends), `loop`, `loaded` | `master_control` (`path_complete`) |
 | `/blueboat/controller_ready` | `Bool` | `robot_interface` · `simulation_interface` | `master_control` |
 | `/thruster_input` | `Float32MultiArray` `[right, left]` N | `master_control` | `robot_interface`, `simulation_interface` |
@@ -106,7 +101,7 @@ run_command  {"cmd":"configure","controller_type":"PID|LoS|MPC","use_pinger":b,"
               "path_source":"mission|replanner",                     # path_source optional, additive
               "pinger_mode":"off|follow|log","has_path":b,           # additive 2026-11-24 (pinger_mode wins over use_pinger)
               "pinger_source":"filter|legacy",                       # additive: echoed; applied by pinger_estimator
-              "pinger_filter":{"preset":s,"params":{...}}}           # additive: applied by pinger_estimator between runs
+              "pinger_filter":{"preset":s,"params":{...}}}           # additive: applied by pinger_estimator, any time
              {"cmd":"start","seq":n}   {"cmd":"stop","seq":n}
 run_state    {"seq":n,"ok":b,"detail":s,"state":"idle|loading|running|error","controller_type":s,
               "pinger_mode":s,"pinger_source":s,"has_path":b,"tau":x,"path_complete":b,   # additive 2026-11-24
@@ -130,8 +125,7 @@ simulation (CM-2).
 | `/replay/command` | `String` (JSON), in | `{"cmd":"pause"\|"resume"}`, `{"cmd":"rate","rate":x}` |
 | `/blueboat/odom` | `Odometry`, out | rebuilt from the recorded `/mavros/local_position/odom`: **full** attitude, body twist, world frame |
 | `/monitoring_data`, `/set_path` | as live, out | targets shifted into the world frame; the path from the run's `-path.yaml` |
-| live names | as recorded, out | every other `/mavros/*` but `rc/override`, `/thruster_input`, `/controller_target`, `/uw_gps_data`, `/uw_gps/fix`, `/uw_gps/info` |
-| pinger outputs | as recorded, out — or `/replay/<name>` with `pinger_estimator:=true` | `/blueboat/pinger_coordinates`, `/blueboat/pinger/{legacy_body,estimate,fix,filter_config}`: under their names (what the bag holds), unless `Replay_launch.py pinger_estimator:=true` starts a `pinger_estimator` on the replayed inputs (sim time), which then owns the names (one publisher per topic). Latched topics are republished latched |
+| live names | as recorded, out | every other `/mavros/*` but `rc/override`, `/thruster_input`, `/controller_target`, `/uw_gps_data`, `/uw_gps/fix`, `/blueboat/pinger_coordinates`, `/blueboat/pinger/*` (`filter_config` republished latched) |
 | `/replay/<name>` | as recorded, out | everything else (commands, session plumbing, the raw odom) — never on a live name |
 
 Every `header.stamp` is rewritten to replay time; the bag's **receive** times drive the
@@ -152,7 +146,7 @@ pinned. The replay never starts a sonar; the operator (or the GCS) starts
 **`robot_interface`** subscribes `/mavros/state` (default QoS), `/mavros/imu/data`,
 `/mavros/local_position/odom`, `/mavros/global_position/global` (the last three BEST_EFFORT
 depth 10); publishes `/mavros/rc/override`; clients `/mavros/cmd/arming`,
-`/mavros/set_mode`, `/mavros/cmd/command`. **`param_set`** owns `/mavros/param/pull` and
+`/mavros/set_mode`. **`param_set`** owns `/mavros/param/pull` and
 `/mavros/param/{get,set}_parameters` (rcl_interfaces on the mavros node), never blocks on
 service availability in its constructor (checked per request; `robot_interface` re-sends).
 FCU endpoint: `BlueBoat_launch.py`'s `fcu_url` (default `udp://:14550@192.168.2.2:14550`;
@@ -214,19 +208,23 @@ ros2 topic pub --once /blueboat/run_command std_msgs/msg/String '{data: "{\"cmd\
 The pinger is estimated and logged in follow and log modes; `pinger_estimator` runs in every real launch.
 
 **Parameters.** `pinger_estimator`: `pinger_source` (`filter` | `legacy`), `pinger_preset` (`slow_rov` |
-`static_target`), `pinger_filter_yaml` (a saved set; it builds on the preset it names), `allow_live_retune`
-(false: a `configure` filter block during a run is refused; the filter restarts only when the set's hash
-changes), `clock_source` (`node`; `replay` in `Replay_launch.py`: the bag's timeline rebuilt from
-`/replay/state`, so every filter duration is bag time at any rate, pause or Gazebo real-time factor),
-`snapshot_period_s` (10). `master_control`: `pinger_mode` (''), `has_path` (true),
-`pinger_stale_timeout` (3.0 s). `robot_interface`: `pinger_mode` (''). `uwgps_log`: `raw_rate_hz` (4),
-`full_rate_hz` (2), `connect_timeout_s` (0.25), `read_timeout_s` (0.4), `info_period_s` (60). Every filter
-parameter (name, unit, range, description): `blueboat_control/config/pinger_filter.yaml`, the one schema
-the node, the CLI and the station read; values and their evidence: `docs/PARAMETER_REGISTER.md`.
+`static_target`), `pinger_filter_yaml` (the live tuning file, '' = none; `BlueBoat_launch.py` defaults it
+to `~/.config/blueboat_control/pinger_tuning.yaml`). `master_control`: `pinger_mode` (''), `has_path`
+(true), `pinger_stale_timeout` (3.0 s). `robot_interface`: `pinger_mode` (''). `uwgps_log`: `raw_rate_hz`
+(4), `full_rate_hz` (2), `connect_timeout_s` (0.25), `read_timeout_s` (0.4). Every filter parameter (name,
+unit, range, what raising / lowering it does): `blueboat_control/config/pinger_filter.yaml`, the one file
+the node and the station read; values: `docs/PARAMETER_REGISTER.md`.
+
+**Live tuning.** The node creates its tuning file if missing, every parameter listed commented out with its
+value, range and description; a saved edit is applied within a second, a station `configure` pinger block
+at any time. The estimate is kept (only a `model` change restarts it); a bad set is refused with the
+reason and the previous one stays. Both echo on `/blueboat/pinger/filter_config`. The station re-sends
+its dialog set at every `configure`, so that set is the one in force at each run start.
 
 **Timing truth** is the receive time on the estimator's clock (mavros header stamps read 0 on the real
 launch), corrected for the time a `/uw_gps/fix` cycle spent on later requests after that endpoint
 answered (`t_end − t_resp`, uwgps_log's own clock). A fix's measurement time is `t_rx − latency_s`; the
-pose there comes from a pose buffer of `/blueboat/odom` receive times (no pose across an odometry gap
-longer than `max_pose_gap_s`; a clock stepping back restarts the buffer). Between fixes the world estimate does not move; the body vector is
-recomputed from it at odom rate. Frames, latency and noise: `docs/PINGER_FILTER_FINDINGS.md`.
+pose there comes from a 30 s pose history of `/blueboat/odom` receive times (no pose across an odometry
+gap longer than 2 s; a clock stepping back restarts it). Only `/uw_gps/fix` feeds the filter;
+`/uw_gps_data` drives the legacy pinger. Between fixes the world estimate does not move; the body vector
+is recomputed from it at odom rate.

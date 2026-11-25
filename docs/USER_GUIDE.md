@@ -89,8 +89,7 @@ ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: <command>"
 | `pinger_mode` | real | empty | `off`, `follow` (PID and LoS steer to the pinger, no path), `log` (the pinger is only logged: the boat follows its path with any controller, or with `has_path:=False` only holds a manual target). Empty = from `use_pinger`. See section 8. |
 | `has_path` | real | `True` | `False` with `pinger_mode:=off` or `log`: no path at all (no path server, no path request); the boat only holds a manual target or obeys the arrow keys. Ignored when following the pinger. |
 | `pinger_source` | real | `filter` | What `/blueboat/pinger_coordinates` carries: the filtered pinger, or `legacy` (the old value, dragged by the boat between fixes). |
-| `pinger_preset`, `pinger_filter_yaml` | real | `slow_rov`, empty | The pinger filter's parameter set: a preset, and optionally a saved YAML over it. |
-| `allow_live_retune` | real | `False` | Allow pinger filter changes during a run. |
+| `pinger_preset`, `pinger_filter_yaml` | real | `slow_rov`, `~/.config/blueboat_control/pinger_tuning.yaml` | The pinger filter's preset, and the live tuning file over it (see section 8). |
 | `session_mode` | real | `False` | Run session (the station passes true): connect and wait; each run is started and stopped on `/blueboat/run_command` and gets its own logs. Needs a `controller_type`. |
 | `record_bag` | real | `True` | In a run session, record a ros2 bag of every topic except the sonar. |
 | `spawn_yaw` | simulation | `0.0` | Start heading in radians, east-north-up convention (0 = East). |
@@ -102,8 +101,7 @@ ros2 topic pub --once /blueboat/input_str std_msgs/msg/String "data: <command>"
 
 `Replay_launch.py` takes `bag` (required: a run folder or its bag folder), `world_dir` (empty =
 the stock world), `rate`, `heave`, `heave_gate`, `start_paused`, `gui` and `placement` (`gps`
-or `origin`). `pinger_estimator:=True` re-estimates the pinger with the current filter
-(`pinger_source`, `pinger_preset`, `pinger_filter_yaml`); the default shows what the bag holds.
+or `origin`). The recorded pinger is replayed as the bag holds it.
 
 Every controller gain is a ROS parameter: `ros2 param list /blueboat/master_control`. What each
 one does: [FIELD_TUNING.md](../FIELD_TUNING.md).
@@ -119,10 +117,9 @@ Under `<data_dir>/data/` (by default `~/ros2_ws/data/`):
 
 When a run ends, its log is moved into its own folder `Robot_data/<log name>/`, together with:
 the world-frame origin (`-origin.yaml`), a report picture (`.png`), the path it followed
-(`-path.yaml`, for a designer path) and, in a run session, the run's ros2 bag (`-bag/`). A run
-that tracked the pinger (`follow` or `log`) also gets its per-fix log (`-pingerlog.csv`: every
-fix, what the filter decided, the legacy value) and the smoothed pinger track
-(`-pinger-smoothed.csv`); its report picture draws the legacy, filtered and smoothed pinger.
+(`-path.yaml`, for a designer path) and, in a run session, the run's ros2 bag (`-bag/`). For a run
+that tracked the pinger (`follow` or `log`) the log carries the filtered pinger (`pf_*`) and the
+legacy one, and the report picture draws both.
 
 The log has a description row and a unit row before the column names. Read it with
 `pandas.read_csv(path, header=2)`. To redraw a report:
@@ -149,7 +146,7 @@ the trimmed run to `~/ros2_ws/data/Processed_Robot_data/`. No ROS needed. Detail
 - The thrust columns of the manual-target and pinger modes are not calibrated newtons. Compare
   them within one run only.
 - The pinger filter's latency (1.5 s) and frame mapping are provisional: no recorded run had a
-  still pinger. Calibrate them in the field first ([PINGER_FIELD_CALIBRATION.md](PINGER_FIELD_CALIBRATION.md)).
+  still pinger. Calibrate them live in the field first ([FIELD_TUNING.md](../FIELD_TUNING.md), "Pinger filter").
 - The live path update is tested in Gazebo only. Its first water test follows
   [PATH_UPDATE_REAL_WATER_TEST.md](PATH_UPDATE_REAL_WATER_TEST.md).
 - Simulated MPC turns less and simulated LoS turns more than the real boat. Simulated results are
@@ -190,10 +187,10 @@ fix arrives, whatever the boat does. The legacy pinger, drawn beside it for comp
 dragged by the boat between fixes and sits off the true pinger along the boat's travel and,
 in turns, to the side, because it applies a 1.5–2.5 s old fix at the current pose.
 
-**Tuning** is in [FIELD_TUNING.md](../FIELD_TUNING.md) ("Pinger filter"). Every parameter, its
-unit and range: `blueboat_control/config/pinger_filter.yaml`. Replay a recorded run through the
-filter, with figures:
-
-```bash
-python3 blueboat_control/src/_custom_libraries/pinger_filter_replay.py run <run folder>/<...>-bag --out /tmp/pf
-```
+**Tuning, live.** The node keeps its parameters in a tuning file, by default
+`~/.config/blueboat_control/pinger_tuning.yaml`, created on first launch with every parameter listed
+(commented out, with its range and what raising or lowering it does). Uncomment a line, change the
+value and save: the filter applies it within a second and keeps its estimate. A wrong value is refused
+and the log says why. The station's pinger filter dialog sets the values at each run start. Every
+parameter: `blueboat_control/config/pinger_filter.yaml`; symptom → knob and the field calibration:
+[FIELD_TUNING.md](../FIELD_TUNING.md) ("Pinger filter").

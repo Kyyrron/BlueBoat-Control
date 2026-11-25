@@ -6,94 +6,43 @@ find_package(ament_cmake REQUIRED)
 find_package(rclpy REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
-find_package(rosidl_default_generators REQUIRED)
 
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
-
-install(PROGRAMS src/MPC/ur_mpc_control.py
-        DESTINATION lib/${PROJECT_NAME})
-install(PROGRAMS src/MPC/uvr_mpc_control.py
-        DESTINATION lib/${PROJECT_NAME})
-
-install(PROGRAMS src/MPC/ur_mpc.py
-        DESTINATION lib/${PROJECT_NAME})
-install(PROGRAMS src/MPC/uvr_mpc.py
-        DESTINATION lib/${PROJECT_NAME})
-
-install(PROGRAMS src/PID/PID.py
-        DESTINATION lib/${PROJECT_NAME})
-
-install(PROGRAMS src/_custom_libraries/path_publisher.py
-        DESTINATION lib/${PROJECT_NAME})
-install(PROGRAMS src/_custom_libraries/path_generation.py
-        DESTINATION lib/${PROJECT_NAME})
-install(PROGRAMS src/_custom_libraries/custom_functions.py
-        DESTINATION lib/${PROJECT_NAME})
-install(PROGRAMS src/_custom_libraries/yaml_trajectory.py
-        DESTINATION lib/${PROJECT_NAME})
-# ROS-free helper modules. They are imported as bare modules (`import
-# frame_math`) exactly like custom_functions, which only works because every
-# script below lands FLAT in lib/blueboat_control -- so a new file that is not
-# installed here works from the source tree and dies with ModuleNotFoundError
-# at node start after a clean colcon build.
-install(PROGRAMS src/_custom_libraries/frame_math.py
-        DESTINATION lib/${PROJECT_NAME})
-install(PROGRAMS src/_custom_libraries/robot_log_schema.py
-        DESTINATION lib/${PROJECT_NAME})
-# Also the post-mission report CLI: the flat destination is what makes both
-# `import poslog_report` (from robot_interface's shutdown hook) and
-# `ros2 run blueboat_control poslog_report.py <csv>` resolve from one install.
-install(PROGRAMS src/_custom_libraries/poslog_report.py
-        DESTINATION lib/${PROJECT_NAME})
-install(PROGRAMS src/_custom_libraries/path_stamp.py
-  DESTINATION lib/${PROJECT_NAME})
-
-install(PROGRAMS src/_custom_libraries/thrust_limits.py
-        DESTINATION lib/${PROJECT_NAME})
-# v1.1: the per-run ros2bag recorder process (imported by robot_interface)
-# and the bag replay node (Replay_launch.py).
-install(PROGRAMS src/_custom_libraries/run_bag.py
-        DESTINATION lib/${PROJECT_NAME})
-install(PROGRAMS src/_custom_libraries/path_update.py
-        DESTINATION lib/${PROJECT_NAME})
-install(PROGRAMS src/_custom_libraries/path_update_log.py
-        DESTINATION lib/${PROJECT_NAME})
-install(PROGRAMS src/bag_replay.py
-        DESTINATION lib/${PROJECT_NAME})
-# 2026-10-27: the replay's attitude/heave maths (ROS-free, imported by bag_replay).
-install(PROGRAMS src/_custom_libraries/replay_attitude.py
-        DESTINATION lib/${PROJECT_NAME})
-
-# 2026-11-13: field odometry timing for simulation (ROS-free, imported by simulation_interface).
-install(PROGRAMS src/_custom_libraries/odom_emulation.py
-        DESTINATION lib/${PROJECT_NAME})
-# 2026-11-13: per-run controller configurations (gains flown on a given field day).
+# Controller configurations (gains flown on a given field day) and the pinger
+# filter parameters with the station's tuning pictures.
 install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 
-install(PROGRAMS src/robot_interaction/robot_interface.py
-        DESTINATION lib/${PROJECT_NAME})
-install(PROGRAMS src/robot_interaction/param_set.py
-        DESTINATION lib/${PROJECT_NAME})
-install(PROGRAMS src/robot_interaction/uwgps_log.py
-        DESTINATION lib/${PROJECT_NAME})
-
-# Pinger pipeline (2026-11-24): the estimator node and its ROS-free modules
-# (installed flat, like every library here, so they import each other by name).
-install(PROGRAMS src/robot_interaction/pinger_estimator.py
-        DESTINATION lib/${PROJECT_NAME})
-install(PROGRAMS src/_custom_libraries/pinger_filter_replay.py
-                 src/_custom_libraries/pinger_filter.py
-                 src/_custom_libraries/pinger_estimator_core.py
-                 src/_custom_libraries/pinger_params.py
-                 src/_custom_libraries/pinger_input.py
-                 src/_custom_libraries/pinger_log.py
-                 src/_custom_libraries/legacy_pinger.py
-                 src/_custom_libraries/mcap_lite.py
-        DESTINATION lib/${PROJECT_NAME})
-
-install(PROGRAMS src/master_control.py
-        DESTINATION lib/${PROJECT_NAME})
-install(PROGRAMS src/simulation_interface.py
+# Every node and every library lands FLAT in lib/blueboat_control: they import
+# each other as bare modules (`import frame_math`), so a file missing here works
+# from the source tree and dies with ModuleNotFoundError after a clean build.
+# poslog_report.py is also the post-mission report CLI
+# (`ros2 run blueboat_control poslog_report.py <csv>`).
+install(PROGRAMS
+        src/master_control.py
+        src/simulation_interface.py
+        src/bag_replay.py
+        src/robot_interaction/robot_interface.py
+        src/robot_interaction/param_set.py
+        src/robot_interaction/uwgps_log.py
+        src/robot_interaction/pinger_estimator.py
+        src/MPC/ur_mpc.py
+        src/PID/PID.py
+        src/_custom_libraries/path_publisher.py
+        src/_custom_libraries/path_generation.py
+        src/_custom_libraries/custom_functions.py
+        src/_custom_libraries/yaml_trajectory.py
+        src/_custom_libraries/frame_math.py
+        src/_custom_libraries/robot_log_schema.py
+        src/_custom_libraries/poslog_report.py
+        src/_custom_libraries/path_stamp.py
+        src/_custom_libraries/thrust_limits.py
+        src/_custom_libraries/run_bag.py
+        src/_custom_libraries/path_update.py
+        src/_custom_libraries/path_update_log.py
+        src/_custom_libraries/replay_attitude.py
+        src/_custom_libraries/odom_emulation.py
+        src/_custom_libraries/pinger_filter.py
+        src/_custom_libraries/pinger_params.py
         DESTINATION lib/${PROJECT_NAME})
 
 ament_python_install_package(${PROJECT_NAME})

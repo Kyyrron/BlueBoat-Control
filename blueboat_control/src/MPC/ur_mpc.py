@@ -370,16 +370,6 @@ class MPCController:
 
         return ocp
 
-    def update_weights(self, Q_weight=None, R_weight=None):
-        if Q_weight is not None:
-            self.Q = Q_weight
-        if R_weight is not None:
-            self.R = R_weight
-
-        # New weights change the OCP, so build_solver regenerates.
-        self.ocp = self._build_ocp()
-        self.solver, self.reused_solver = build_solver(self.ocp, self.build_dir)
-
     def solve(self, path, x_current):
         poses = path.poses[:self.N + 1]
         if len(poses) < self.N + 1:

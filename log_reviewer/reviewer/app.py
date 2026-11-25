@@ -550,7 +550,8 @@ class ReviewerWindow(QMainWindow):
         self.texts["report_title"] = text
 
     def _texts_changed(self):
-        """Panel text is not data, so only the affected panels are redrawn."""
+        """Panel text is not data and is not drawn on screen (show_headline
+        False): it is only kept for the export, so nothing is redrawn."""
         if self.run is None:
             return
         self.texts["track_title"], self.texts["track_desc"] = self.track_header.values()
@@ -559,7 +560,6 @@ class ReviewerWindow(QMainWindow):
             self.texts[key + "_title"] = title
             self.texts[key + "_desc"] = description
         self.texts["summary_title"] = self.summary_title.text()
-        self._redraw.start()
 
     # -- rebuilding -------------------------------------------------------
 

@@ -132,10 +132,8 @@ turn-slowdown. An invariant holds it compatible with point-following: when `psi_
 the position error is projected onto the **boat heading** and `gamma_p` is taken from
 `ref[2]`; when `psi_path` is supplied it is projected onto the **path tangent**.
 
-`PIDLoS` is always constructed with `lookahead = pid_lookahead = 2.5 m`; the class's own
-backward-compatible default of `1.0` is never used. The `Delta = 1/los_gain`
-re-parameterisation the class documents is an exact algebraic identity, so the claimed
-equivalence to the pre-rework point controller holds only at the matching `Delta`.
+`PIDLoS` is constructed with `lookahead = pid_lookahead = 2.5 m` (a required argument since
+2026-11-25; the old `1.0` default and the `los_gain = 1/Delta` alias were never used).
 
 **Which law runs where:**
 

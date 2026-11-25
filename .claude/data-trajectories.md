@@ -11,8 +11,6 @@
 | Run bag | `<root>/data/Robot_data/<csv stem>/{date}-{note}-bag/` (mcap) | **Raw field record**, sessions only: every topic except `/side_scan_sonar/*`, `/sss_processor/*`, `/sss_ai/*` |
 | Path snapshot | `<root>/data/Robot_data/<csv stem>/{date}-{note}-path.yaml` | Copy of a path run's `from_yaml` mission; not for replanner runs |
 | Path-update log | `<root>/data/Robot_data/<csv stem>/{date}-{note}-pathlog.csv` | **Raw field record**: one row per `/blueboat/path_update_event`, 3 header rows (`path_update_log.LEGEND`); only if the run received a request; never for a pinger-following run |
-| Pinger per-fix log | `<root>/data/Robot_data/<csv stem>/{date}-{note}-pingerlog.csv` | **Raw field record** (2026-11-24): one row per `/blueboat/pinger/fix` (every processed fix with the pose used at its measurement time, the filter's decision and the legacy value), 3 header rows (`pinger_log.LEGEND`); `config` rows carry the filter set applied from then on and `state` rows a snapshot of the filter (the estimator emits one at every run start, after every parameter change and every 10 s); `robot_interface` starts the file AT a snapshot, so the file alone re-runs the live filter bit for bit from its first row (checked on a live graph by `test/pinger_integration.py`); follow and log modes only |
-| Pinger smoothed track | `<root>/data/Robot_data/<csv stem>/{date}-{note}-pinger-smoothed.csv` | Derived, written once by `poslog_report` at filing: the RTS smoother over the re-run of the per-fix log |
 
 **Per run in a session**: nothing is claimed until `start`; `master_control` reserves the
 `.npy` at `start`, `robot_interface` opens the CSV when `run_state` reports the run (layout
@@ -56,8 +54,9 @@ disabled, `1` live, `2` enabled but not in override, `3` watchdog forcing zero. 
 `<stem>-origin.yaml` sidecar carries `latitude`, `longitude` (the local-ENU frame's origin,
 latched at the first odom) and `yaw0_rad` (provenance only; since 2026-08-31 `relative_psi`
 is absolute ENU yaw, before it was `yaw − yaw0`); a follow- or log-mode run's sidecar also carries
-`pinger_mode`, `pinger_source`, `pinger_filter_preset`, `pinger_filter_hash`, `pinger_mapping` and
-`pinger_filter_params` (one-line JSON) of the filter in force when it was written (2026-11-24).
+`pinger_mode`, `pinger_source`, `pinger_filter_preset`, `pinger_filter_hash` and
+`pinger_filter_params` (one-line JSON) of the filter in force when it was written (2026-11-24); a
+live retune afterwards is in the run's bag (`/blueboat/pinger/filter_config`).
 
 **Simulation writes the same CSV** (`simulation_interface`, always no-pinger): date columns
 are **sim time** (1970-01-01), `lin_acc_*` is differentiated odometry (no gravity),

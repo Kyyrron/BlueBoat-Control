@@ -27,11 +27,9 @@ written then, so a replanner run nobody sent a path to leaves no file. A pinger
 run gets no PathLog at all.
 """
 
-import os
-
 from poslog_report import pathlog_path      # the naming rule, owned by the filer
 
-__all__ = ["COLUMNS", "LEGEND", "PathLog", "pathlog_path", "row_from_event", "exists_for",
+__all__ = ["COLUMNS", "LEGEND", "PathLog", "pathlog_path", "row_from_event",
            "read_pathlog", "REQUEST_EVENTS"]
 
 REQUEST_EVENTS = ("request_accepted", "request_refused")
@@ -193,8 +191,3 @@ def read_pathlog(path):
     descriptions, units = lines[0].split(","), lines[1].split(",")
     rows = [dict(zip(COLUMNS, line.split(","))) for line in lines[3:] if line]
     return descriptions, units, rows
-
-
-def exists_for(csv_path):
-    """True when a pathlog exists beside this poslog."""
-    return os.path.isfile(pathlog_path(csv_path))

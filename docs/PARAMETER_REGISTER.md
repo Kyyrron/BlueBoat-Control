@@ -225,9 +225,11 @@ falls behind its target by 1.5–2.7 m); the field PID runs were flown on 0.5 m/
 
 ## 9. Pinger filter (`pinger_estimator`, 2026-11-24)
 
-The schema (name, unit, default, range, description) is `blueboat_control/config/pinger_filter.yaml`;
-this table gives where each value comes from. Phase 0/1 evidence: `docs/PINGER_FILTER_FINDINGS.md`.
-"Provisional" = to be re-fitted by `docs/PINGER_FIELD_CALIBRATION.md`.
+Every parameter (unit, default, range, what it does) is in `blueboat_control/config/pinger_filter.yaml`;
+this table gives where the main values come from. "Provisional" = to be re-fitted by the live field
+calibration (`FIELD_TUNING.md`, "Pinger filter"). Fixed in `pinger_filter.py`, not parameters: 30 s pose
+history, 0.5 s pose extrapolation, 2 s maximum odometry gap (odometry ran at 3.8–16 Hz in the field), 1 s
+estimate heartbeat, 60 s statistics window.
 
 | Parameter | `slow_rov` value | Origin | Interval / note |
 |---|---|---|---|
@@ -244,8 +246,6 @@ this table gives where each value comes from. Phase 0/1 evidence: `docs/PINGER_F
 | `init_n`, `init_radius_m` | 3, 3 m | design | `static_target`: radius 5 m |
 | `reinit_n`, `reinit_radius_m`, `reinit_window_s` | 4, 2 m, 6 s | A1: a 15 m relocation is re-acquired in 4 fixes | |
 | `coast_after_s`, `stale_timeout_s` | 2 s, 6 s | device ~1.6 fixes/s; dropouts | |
-| `max_pose_gap_s` | 2 s | odometry 3.8–16 Hz in the field (gaps of several seconds at the 103 s hang) | no pose interpolated across a longer gap |
-| `heartbeat_hz` | 1 Hz | range 0.5–10 Hz: below 0.4 Hz `master_control`'s 3 s `pinger_stale_timeout` would hold on a live estimate | |
-| `pinger_stale_timeout` (`master_control`) | 3 s | 3 × the 1 Hz estimate heartbeat | follow mode holds beyond it |
+| `pinger_stale_timeout` (`master_control`) | 3 s | 3 × the 1 s estimate heartbeat | follow mode holds beyond it |
 | `raw_rate_hz`, `full_rate_hz` (`uwgps_log`) | 4 Hz, 2 Hz | the legacy packet stays on its 2 Hz cycle | device ≥ 1.7 Hz |
 | `connect_timeout_s`, `read_timeout_s` (`uwgps_log`) | 0.25 s, 0.4 s | one cycle median 30 ms, p95 0.1–1.0 s; one 103 s hang without a timeout | |

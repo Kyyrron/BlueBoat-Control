@@ -3,7 +3,7 @@
 locations, thrust->PWM calibration, odometry/target extraction, Gazebo calls,
 quaternion maths. ROS-free geometry lives in frame_math.py instead."""
 
-from geometry_msgs.msg import Pose, Quaternion
+from geometry_msgs.msg import Quaternion
 from visualization_msgs.msg import Marker
 from scipy.spatial.transform import Rotation as R
 import math
@@ -92,23 +92,8 @@ def generate_interpolator():
     thr = 9.80665*np.array([-2.81,-2.78,-2.64,-2.42,-2.21,-2.04,-1.83,-1.57,-1.42,-1.2,-0.98,-0.82,-0.6,-0.41,-0.24,-0.09,0,0.21,0.5,0.82,1.17,1.58,1.93,2.37,2.76,3.23,3.57,3.99,4.36,4.84,5.22,5.45,5.63])
     return PchipInterpolator(thr, pwm)
 
-#################### Gazebo interaction ####################
-def pause_gz(pause):
-    os.system(f'gz service -s /world/ocean/control --reqtype gz.msgs.WorldControl --reptype gz.msgs.Boolean --req \'pause: {pause}\' --timeout 1000')
-
-def set_pose_gz(pose):
-    x,y,z,phi,theta,psi = pose.astype(float)
-    qx, qy, qz, qw = R.from_euler('xyz',[phi, theta, psi]).as_quat()
-    
-    pause_gz(True)
-    os.system(f'gz service -s /world/ocean/set_pose --reqtype gz.msgs.Pose --reptype gz.msgs.Boolean --req \'name: "blueboat" position: {{ x: {x}, y: {y}, z: {z} }} orientation: {{ x: {qx}, y: {qy}, z: {qz}, w: {qw} }}\' --timeout 1000')
-    pause_gz(False)
-
-def set_current_gz(x, y, z):
-    os.system(f'gz topic -t "/ocean_current" -m gz.msgs.Vector3d -p "x: {x}, y: {y}, z: {z}"')
-
 #################### ROS2 interaction ####################
-def odometry(msg, quat = False):
+def odometry(msg):
     # Extract pose
     msg_pose = msg.pose.pose
 
@@ -123,15 +108,11 @@ def odometry(msg, quat = False):
     qz = msg_pose.orientation.z
     qw = msg_pose.orientation.w
 
-    if quat: # Use quaternion directly
-        pose = [x,y,z,qx,qy,qz,qw]
+    # Quaternion to roll, pitch, yaw
+    rot = R.from_quat([qx, qy, qz, qw])
+    roll, pitch, yaw = rot.as_euler('xyz', degrees=False)
 
-    else:
-        # Convert quaternion to roll, pitch, yaw
-        rot = R.from_quat([qx, qy, qz, qw])
-        roll, pitch, yaw = rot.as_euler('xyz', degrees=False)
-
-        pose = [x,y,z,roll,pitch,yaw]
+    pose = [x,y,z,roll,pitch,yaw]
 
     # Extract twist
     twist = msg.twist.twist
@@ -185,94 +166,6 @@ def compute_target(path, dt):
     v = dy_b / dt
     
     return [x, y, psi, u, v, r]
-
-def planeFromQuaternion(inState):
-    # Extract position
-    x,y,z = inState[0:3]
-
-    #Convert and extract euler angles
-    phi,theta,psi = R.from_quat(inState[3:7]).as_euler('xyz')
-
-    # Extract robot frame's speeds
-    u,v,r = inState[7:]
-
-    return np.array([x,y,psi,u,v,r]).reshape(-1,1)
-
-def quaternion_multiply(q0, q1): # From https://docs.ros.org/en/foxy/Tutorials/Intermediate/Tf2/Quaternion-Fundamentals.html
-    """
-    Multiplies two quaternions.
-
-    Input
-    :param q0: A 4 element array containing the first quaternion (q01, q11, q21, q31)
-    :param q1: A 4 element array containing the second quaternion (q02, q12, q22, q32)
-
-    Output
-    :return: A 4 element array containing the final quaternion (q03,q13,q23,q33)
-
-    """
-    # Extract the values from q0
-    w0 = q0[0]
-    x0 = q0[1]
-    y0 = q0[2]
-    z0 = q0[3]
-
-    # Extract the values from q1
-    w1 = q1[0]
-    x1 = q1[1]
-    y1 = q1[2]
-    z1 = q1[3]
-
-    # Computer the product of the two quaternions, term by term
-    q0q1_w = w0 * w1 - x0 * x1 - y0 * y1 - z0 * z1
-    q0q1_x = w0 * x1 + x0 * w1 + y0 * z1 - z0 * y1
-    q0q1_y = w0 * y1 - x0 * z1 + y0 * w1 + z0 * x1
-    q0q1_z = w0 * z1 + x0 * y1 - y0 * x1 + z0 * w1
-
-    # Create a 4 element array containing the final quaternion
-    final_quaternion = np.array([q0q1_w, q0q1_x, q0q1_y, q0q1_z])
-
-    # Return a 4 element array containing the final quaternion (q02,q12,q22,q32)
-    return final_quaternion
-
-def quaternion_error(q2, q1): # Returns "q2-q1"
-    q1[3] *= -1 # Negate for inverse
-
-    return quaternion_multiply(q2, q1)
-
-def make_pose(pose_list, quat = False): #TODO: Make it usable in 3D
-    pose = Pose()
-
-    if quat:
-        # Position
-        pose.position.x = float(pose_list[0])
-        pose.position.y = float(pose_list[1])
-        pose.position.z = float(pose_list[2])
-
-        pose.orientation.x = float(pose_list[3])
-        pose.orientation.y = float(pose_list[4])
-        pose.orientation.z = float(pose_list[5])
-        pose.orientation.w = float(pose_list[6])
-
-    else:
-        x = pose_list[0]
-        y = pose_list[1]
-        theta = pose_list[2]
-
-        # Position
-        pose.position.x = x
-        pose.position.y = y
-        pose.position.z = 0.0
-
-        # Orientation from yaw (theta)
-        qz = np.sin(theta / 2.0)
-        qw = np.cos(theta / 2.0)
-
-        pose.orientation.x = 0.0
-        pose.orientation.y = 0.0
-        pose.orientation.z = qz
-        pose.orientation.w = qw
-
-    return pose
 
 def create_pose_marker(inPose, inPub):
     marker = Marker()
@@ -427,9 +320,6 @@ def yaw_to_quaternion(yaw: float):
     q.y = 0.0
     q.z = math.sin(yaw * 0.5)
     return q
-
-def normalize_angle(angle):
-    return math.atan2(math.sin(angle), math.cos(angle))
 
 def transform_body_to_world(x_r, y_r, yaw, x_b, y_b):
     c = math.cos(yaw)

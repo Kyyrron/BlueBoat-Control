@@ -45,6 +45,17 @@ THROTTLE_LEFT = 73
 # SYSID_MYGCS: 'override' points it at mavros (1), 'default' back to QGC (255).
 MAVROS_SYSID = 1
 QGC_SYSID = 255
+
+# mode -> (SERVO function targets, the autopilot's GCS sysid). 'override' routes
+# both thrusters to RC passthrough so robot_interface can stream PWM on
+# /mavros/rc/override (fire-and-forget, no ACK round-trips) and makes the
+# autopilot listen to mavros as its GCS; 'default' is also the shutdown restore.
+MODE_TARGETS = {
+    "override": ((("SERVO1_FUNCTION", RCIN1_PASSTHROUGH), ("SERVO3_FUNCTION", RCIN3_PASSTHROUGH)),
+                 MAVROS_SYSID),
+    "default": ((("SERVO1_FUNCTION", THROTTLE_RIGHT), ("SERVO3_FUNCTION", THROTTLE_LEFT)),
+                QGC_SYSID),
+}
 # Renamed between ArduPilot versions; the one that exists is detected.
 GCS_ID_PARAM_CANDIDATES = ["SYSID_MYGCS", "MAV_GCS_SYSID"]
 
@@ -132,22 +143,12 @@ class BlueBoatParameterControl(Node):
         self.apply_mode(mode)
 
     def apply_mode(self, mode):
-        if mode == "override":
-            # Route both thrusters to RC passthrough so robot_interface can stream
-            # PWM on /mavros/rc/override (fire-and-forget, no ACK round-trips),
-            # and make the autopilot listen to mavros as its GCS.
-            servo_targets = [("SERVO1_FUNCTION", RCIN1_PASSTHROUGH),
-                             ("SERVO3_FUNCTION", RCIN3_PASSTHROUGH)]
-            gcs_target = MAVROS_SYSID
-        elif mode == "default":
-            servo_targets = [("SERVO1_FUNCTION", THROTTLE_RIGHT),
-                             ("SERVO3_FUNCTION", THROTTLE_LEFT)]
-            gcs_target = QGC_SYSID
-        else:
+        if mode not in MODE_TARGETS:
             # Report state, so the requester sees nothing changed.
             self.get_logger().error(f"Unknown mode: {mode}")
             self.publish_state()
             return
+        servo_targets, gcs_target = MODE_TARGETS[mode]
 
         # Make sure mavros services exist before starting (non-blocking check)
         for cli in [self.pull_client, self.get_client, self.set_client]:
@@ -418,10 +419,10 @@ class BlueBoatParameterControl(Node):
                 "mavros is back.")
             return False
 
-        targets = [("SERVO1_FUNCTION", THROTTLE_RIGHT),
-                   ("SERVO3_FUNCTION", THROTTLE_LEFT)]
+        servo_targets, gcs_target = MODE_TARGETS["default"]
+        targets = list(servo_targets)
         if self.gcs_id_param is not None:
-            targets.append((self.gcs_id_param, QGC_SYSID))
+            targets.append((self.gcs_id_param, gcs_target))
 
         deadline = time.monotonic() + budget_s
         ok = True

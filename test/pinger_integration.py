@@ -4,9 +4,10 @@ End-to-end check of the pinger logging chain on a real ROS graph (R7):
 
   fake MAVROS (odom, IMU, GPS at 10 Hz) + fake Water Linked (/uw_gps/fix at 4 Hz,
   /uw_gps_data at 2 Hz; a still pinger seen from a boat on a circle)
-    -> pinger_estimator -> robot_interface (CSV, -pingerlog.csv, sidecar)
-    -> SIGINT -> robot_interface's shutdown files the run (poslog_report):
-       PNG, -pingerlog.csv moved in, -pinger-smoothed.csv written.
+    -> pinger_estimator -> robot_interface (CSV pf_* / legacy columns, sidecar)
+    -> SIGINT -> robot_interface's shutdown files the run (poslog_report);
+  plus the live tuning file: created by the estimator, one value changed
+  halfway, applied without restarting the estimate.
 
     source /opt/ros/jazzy/setup.bash && source ~/ros2_ws/install/setup.bash   # (or an overlay)
     python3 test/pinger_integration.py [--mode log|follow] [--seconds 40]
@@ -38,11 +39,14 @@ def check(name, cond, detail=""):
     print(("ok    " if cond else "FAIL  ") + name + ("" if cond else f"  {detail}"))
 
 
-def feeder(seconds, target=(12.0, 6.0)):
+def feeder(seconds, tuning_file, heard, target=(12.0, 6.0)):
+    """Fake MAVROS + Water Linked for `seconds`; halfway, one line of the live
+    tuning file is uncommented and changed. `heard` collects (time, payload) of
+    /blueboat/pinger/filter_config and /blueboat/pinger/estimate."""
     import rclpy
     from geometry_msgs.msg import Quaternion
     from nav_msgs.msg import Odometry
-    from rclpy.qos import QoSProfile, ReliabilityPolicy
+    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
     from sensor_msgs.msg import Imu, NavSatFix
     from std_msgs.msg import Float32MultiArray, String
 
@@ -54,7 +58,14 @@ def feeder(seconds, target=(12.0, 6.0)):
     gps_pub = node.create_publisher(NavSatFix, "/mavros/global_position/global", be)
     fix_pub = node.create_publisher(String, "/uw_gps/fix", QoSProfile(depth=50, reliability=ReliabilityPolicy.RELIABLE))
     pkt_pub = node.create_publisher(Float32MultiArray, "/uw_gps_data", 10)
+    latched = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                         durability=DurabilityPolicy.TRANSIENT_LOCAL)
+    for topic, key, qos in (("/blueboat/pinger/filter_config", "config", latched),
+                            ("/blueboat/pinger/estimate", "estimate", 10)):
+        node.create_subscription(String, topic, lambda m, k=key: heard[k].append(
+            (time.time(), json.loads(m.data))), qos)
     t0 = time.time()
+    edited = False
     seq = 0
     k = 0
     lat0, lon0 = 31.2639365, 130.2989003
@@ -94,7 +105,13 @@ def feeder(seconds, target=(12.0, 6.0)):
                 pkt_pub.publish(Float32MultiArray(data=[2026.0, 11.0, 24.0, 0.0, 0.0, 0.0, 0.0,
                                                         a[0], a[1], a[2], 0.0, 0.0, 0.0, 0.0, 0.0, a[2],
                                                         a[0], a[1], a[2]]))
+        if not edited and t > seconds / 2:
+            text = open(tuning_file).read().replace("  # sigma_bearing_deg: 12.0 ", "  sigma_bearing_deg: 15.0 ")
+            open(tuning_file, "w").write(text)
+            heard["edit_t"] = time.time()
+            edited = True
         k += 1
+        rclpy.spin_once(node, timeout_sec=0.0)
         time.sleep(0.1)
     node.destroy_node()
     rclpy.shutdown()
@@ -129,17 +146,30 @@ def main():
                 "-p", "session_mode:=false", "-p", f"pinger_mode:={args.mode}",
                 "-p", f"use_UWgps:={'true' if args.mode == 'follow' else 'false'}",
                 "-p", f"data_dir:={root}", "-p", "note:=pinger_it", "-p", "use_sim_time:=false"], env, logs)
-    pe = start(["ros2", "run", "blueboat_control", "pinger_estimator.py"], env, logs)
+    tuning = os.path.join(root, "pinger_tuning.yaml")
+    pe = start(["ros2", "run", "blueboat_control", "pinger_estimator.py", "--ros-args",
+                "-p", f"pinger_filter_yaml:={tuning}"], env, logs)
     time.sleep(4.0)
     os.environ.update(ROS_DOMAIN_ID=env["ROS_DOMAIN_ID"])
+    heard = {"config": [], "estimate": [], "edit_t": None}
     try:
-        feeder(args.seconds)
+        feeder(args.seconds, tuning, heard)
     finally:
         stop(pe)
         stop(ri, wait=60.0)
         logs.close()
     import robot_log_schema as rls
-    import pinger_log as plog
+    import pinger_params as pp
+    text = open(tuning).read()
+    check("the tuning file was created with every parameter and its description",
+          all(f" {n}: " in text for n in pp.load_schema()["parameters"]))   # one line was uncommented above
+    after = [c for t, c in heard["config"] if heard["edit_t"] and t > heard["edit_t"]]
+    check("a saved tuning-file edit is applied live (filter_config echo)",
+          any(c.get("ok") and c["params"]["sigma_bearing_deg"] == 15.0 for c in after),
+          [c.get("detail") for c in after])
+    states = {e["status"] for t, e in heard["estimate"] if heard["edit_t"] and t > heard["edit_t"]}
+    check("the estimate is kept across the live change (never re-initialising)",
+          states and states <= {"tracking", "coasting"}, states)
     folders = [f for f in glob.glob(os.path.join(root, "data", "Robot_data", "*-poslog*")) if os.path.isdir(f)]
     check("the run was filed into its own folder", len(folders) == 1, folders)
     if not folders:
@@ -171,24 +201,6 @@ def main():
     check("the legacy pinger columns are filled", any(abs(a) + abs(b) > 0 for a, b in legacy))
     if args.mode == "log":
         check("log layout keeps the path target columns", "target_x" in header)
-    log = [n for n in names if n.endswith("-pingerlog.csv")]
-    check("the per-fix log was filed into the run folder", len(log) == 1, names)
-    if log:
-        prow = plog.read_rows(os.path.join(folder, log[0]))
-        check("the per-fix log opens with the applied filter (config row)", prow[0]["decision"] == "config")
-        check("the per-fix log has the processed fixes", sum(r["decision"] != "config" for r in prow) > 50)
-        check("it starts at a filter snapshot (config, then state)",
-              [r["decision"] for r in prow[:2]] == ["config", "state"], [r["decision"] for r in prow[:3]])
-        # Review #1: the filed log alone re-runs the LIVE filter bit for bit.
-        import pinger_filter_replay as pfr
-        import pinger_params as pp
-        rerun = pfr.replay(pfr.load_pingerlog(os.path.join(folder, log[0])), pp.load_params())
-        live = [(r["decision"], r["est_x"], r["est_y"]) for r in prow if r["decision"] not in ("config", "state")]
-        again = [(f["decision"], "" if not f.get("posterior") else repr(float(f["posterior"]["x"])),
-                  "" if not f.get("posterior") else repr(float(f["posterior"]["y"]))) for f in rerun["fixes"]]
-        check(f"re-running the filed per-fix log reproduces the live estimate ({len(live)} rows)",
-              live == again, next(((a, b) for a, b in zip(live, again) if a != b), None))
-    check("the RTS-smoothed track was written", any(n.endswith("-pinger-smoothed.csv") for n in names), names)
     check("the report picture was rendered", any(n.endswith(".png") for n in names), names)
     sidecar = [n for n in names if n.endswith("-origin.yaml")]
     if sidecar:

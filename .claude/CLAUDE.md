@@ -86,8 +86,8 @@ operator `default` before shutdown stays the reliable route (CM-15).
 
 **N6 — Thrust is streamed as RC override, never as per-tick acknowledged MAVLink commands.**
 `OverrideRCIn` at ~20 Hz is latest-wins and feeds ArduPilot's `RC_OVERRIDE_TIME`; per-tick
-`/mavros/cmd/command` calls stall the command plugin for seconds on one lost ACK.
-`set_servo()` is a documented legacy fallback called from nowhere.
+`/mavros/cmd/command` calls stall the command plugin for seconds on one lost ACK (the legacy
+`set_servo()` that used them was removed 2026-11-25).
 
 **N7 — Controller iteration happens offline** (rosbags, the harness of §3), never in a field
 session.
@@ -135,8 +135,8 @@ Executables (node names in `.claude/interface.md` §2.1): `master_control.py` (`
 `robot_interface.py` (`blueboat_controller`), `simulation_interface.py` (`pid_sim`), `param_set.py`
 (`blueboat_parameter_control`), `uwgps_log.py`, `pinger_estimator.py` (`pinger_estimator`, since
 2026-11-24 the one producer of `/blueboat/pinger_coordinates` and `/blueboat/pinger/*`; pinger modes
-`off|follow|log`, interface §2.7), `path_generation.py`, `path_publisher.py`, `bag_replay.py`; CLI
-`pinger_filter_replay.py`.
+`off|follow|log`, live tuning file, interface §2.7), `path_generation.py`, `path_publisher.py`,
+`bag_replay.py`.
 Operator commands on `/blueboat/input_str` (`std_msgs/String`): `enable` · `disable` · `stop` · `override` ·
 `default` · `arm` · `disarm` · `rearm` · `manual` · `move <left> <right> <seconds>`. Services
 `/path_request` (`RequestPath.srv`, `path_generation` only) and `/blueboat/update_path` (`UpdatePath.srv`,

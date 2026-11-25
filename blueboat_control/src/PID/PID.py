@@ -1,5 +1,7 @@
 import numpy as np
 
+import thrust_limits as tl      # the one uniform saturation rule
+
 
 def wrap_angle(a):
     return (a + np.pi) % (2 * np.pi) - np.pi
@@ -30,39 +32,15 @@ class PID:
 
 
 class ThrustAllocator:
-    """
-    Allocates a desired wrench to individual thrusters with per-thruster limits.
-    """
+    """A desired wrench to thruster forces, uniformly scaled to +/-limit
+    (thrust_limits.scale_to_limit: one factor keeps the wrench's direction)."""
 
-    def __init__(self, B, limits=None):
-        self.set_matrix(B)
-        self.limits = limits
-
-    def set_matrix(self, B):
-        self.B = B
+    def __init__(self, B, limit):
         self.B_pinv = np.linalg.pinv(B)
-
-    def set_limits(self, limits):
-        """
-        limits: dict with 'min' and 'max' arrays of size n_thrusters
-        """
-        self.limits = limits
+        self.limit = limit
 
     def allocate(self, tau):
-        f = self.B_pinv @ tau
-
-        if self.limits is None:
-            return f
-
-        # Apply per-thruster limits with uniform scaling to preserve direction
-        scale = 1.0
-        for i in range(len(f)):
-            if f[i] > self.limits["max"][i]:
-                scale = min(scale, self.limits["max"][i] / f[i])
-            elif f[i] < self.limits["min"][i]:
-                scale = min(scale, self.limits["min"][i] / f[i])
-
-        return f * scale
+        return tl.scale_to_limit(self.B_pinv @ tau, self.limit)[0]
 
 
 class PIDLoS:
@@ -82,14 +60,11 @@ class PIDLoS:
     speed at the current point) plus an along-track proportional-integral
     term, so a spatially varying speed profile is honored.
 
-    Backward compatibility: called as compute(state, ref) with the defaults
-    (lookahead = 1.0, u_ff = 0.0, psi_path = None -> gamma_p taken from
-    ref[2]), this reproduces the previous behavior exactly, so the pinger /
-    manual point-following paths are unchanged.
+    Called as compute(state, ref) (u_ff = 0.0, psi_path = None -> gamma_p
+    taken from ref[2]) it is point following: the pinger branch.
     """
 
-    def __init__(self, dt, B, outer_gains, inner_gains,
-                 lookahead=1.0, los_gain=None, thruster_limits=None):
+    def __init__(self, dt, B, outer_gains, inner_gains, lookahead, thrust_limit):
         """
         dt : float
             Control timestep
@@ -97,16 +72,12 @@ class PIDLoS:
         outer_gains : dict {'x': (kp, ki, kd), 'psi': (kp, ki, kd)}
         inner_gains : dict {'u': (kp, ki, kd), 'r': (kp, ki, kd)}
         lookahead : float
-            LoS lookahead distance Delta (metres). Replaces the old
-            'los_gain' (Delta = 1 / los_gain). If los_gain is given it takes
-            precedence for backward compatibility.
-        thruster_limits : dict with 'min' and 'max' arrays
+            LoS lookahead distance Delta (metres)
+        thrust_limit : float
+            Symmetric per-thruster bound (N), applied by uniform scaling
         """
         self.dt = dt
-        if los_gain is not None and los_gain != 0.0:
-            self.lookahead = 1.0 / los_gain
-        else:
-            self.lookahead = lookahead
+        self.lookahead = lookahead
 
         # Outer loop PIDs
         self.pid_x = PID(*outer_gains['x'], dt)     # along-track -> surge speed correction
@@ -117,13 +88,7 @@ class PIDLoS:
         self.pid_r = PID(*inner_gains['r'], dt)     # yaw-rate error -> moment
 
         # Thruster allocation
-        self.allocator = ThrustAllocator(B, limits=thruster_limits)
-
-    def set_allocation_matrix(self, B):
-        self.allocator.set_matrix(B)
-
-    def set_thruster_limits(self, thruster_limits):
-        self.allocator.set_limits(thruster_limits)
+        self.allocator = ThrustAllocator(B, thrust_limit)
 
     def reset(self):
         self.pid_x.reset()
@@ -141,9 +106,7 @@ class PIDLoS:
         slow_on_turn : if True, scale the surge command by max(0, cos(psi_err))
                    so the boat slows while turning hard onto the path. Off by
                    default to preserve prior point-following behavior.
-        Returns:
-            thrusts : np.ndarray (n_thrusters)
-            tau : np.ndarray [X, Y=0, N]
+        Returns the thruster forces (np.ndarray, n_thrusters).
         """
         x, y, psi, u, v, r = state
         x_ref, y_ref, psi_ref = ref
@@ -187,7 +150,5 @@ class PIDLoS:
         N = self.pid_r.update(r_ref - r)
         tau = np.array([X, 0.0, N])  # No sway actuation
 
-        # --- Allocate to thrusters with per-thruster limits ---
-        thrusts = self.allocator.allocate(tau)
-
-        return thrusts, tau
+        # --- Allocate to thrusters, uniformly saturated ---
+        return self.allocator.allocate(tau)

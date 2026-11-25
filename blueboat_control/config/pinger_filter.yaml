@@ -1,19 +1,19 @@
-# Pinger filter: the ONE parameter schema and its presets.
+# Pinger filter parameters: every knob, its range, and in plain words what it changes.
 #
-# Read by:
-#   * blueboat_control/src/_custom_libraries/pinger_params.py (pinger_estimator node, pinger_filter_replay CLI,
-#     poslog_report, log_reviewer);
-#   * BlueBoat-MCS (the "Advanced..." panel is generated from this file).
-# It is data, not code: the station reads it and imports nothing from Control (MCS N9).
+# Read by the pinger_estimator node (pinger_params.py) and by the station (BlueBoat-MCS builds its pinger
+# filter dialog from this file). The defaults ARE the `slow_rov` preset; a preset lists only what it changes.
 #
-# Each parameter: group, type (float | int | bool | enum), unit, default, min/max (numbers) or choices
-# (enum), and a one-line description (shown as the tooltip). The defaults ARE the `slow_rov` preset; a
-# preset only lists what it changes. Values marked "provisional" come from docs/PINGER_FILTER_FINDINGS.md
-# (no still-pinger data exists) and must be re-fitted by the field calibration
-# (docs/PINGER_FIELD_CALIBRATION.md).
+# TUNING LIVE: launch with `pinger_filter_yaml:=<your file>` (BlueBoat_launch.py) and edit that file while
+# the boat runs. Every save is applied within a second, without losing the estimate; a bad value is refused
+# with the reason in the log and the previous set stays. The file names only what you change:
+#     preset: slow_rov
+#     params:
+#       latency_s: 1.2
+#       sigma_bearing_deg: 15.0
+# Symptom -> knob: FIELD_TUNING.md, "Pinger filter".
 #
-# Frames: acoustic (a_x, a_y, a_z) as the Water Linked API returns them; body = Control's base frame
-# (x forward, y left); world = /blueboat/odom local ENU. Depth is positive down.
+# Frames: acoustic (a_x, a_y, a_z) as Water Linked reports them; body = the boat (x forward, y left);
+# world = /blueboat/odom. Depth is positive down.
 
 schema: blueboat_pinger_filter/1
 
@@ -34,7 +34,7 @@ parameters:
     choices: [raw, filtered]
     default: raw
     unit: ""
-    description: "Water Linked fix fed to the filter: raw acoustic position (default) or WL's own filtered one (>= 1 s more lag)."
+    description: "Which Water Linked position the filter uses. raw: the unit's own fix, fresh but noisy (default). filtered: Water Linked's smoothed fix, steadier but at least 1 s older."
   latency_s:
     group: Input & geometry
     type: float
@@ -42,7 +42,7 @@ parameters:
     default: 1.5
     min: 0.0
     max: 5.0
-    description: "Receive time minus measurement time of a fix; the boat pose is taken at t_rx - latency (provisional, 1.5 s)."
+    description: "How old a fix is when it arrives; each fix is placed with the boat's pose of that moment. Wrong (either way): while the boat turns, a still pinger smears into an arc and shifts with every turn. Right: the fixes stay in one place while the boat turns on the spot. Provisional 1.5 s."
   y_sign:
     group: Input & geometry
     type: int
@@ -50,7 +50,7 @@ parameters:
     default: 1
     min: -1
     max: 1
-    description: "+1 keeps the acoustic y as received (data: points left), -1 mirrors it. 0 is invalid."
+    description: "Left/right of the USBL antenna. +1: as installed. -1 mirrors it; only after re-mounting the antenna, if a pinger on the boat's left is drawn on its right."
   z_sign:
     group: Input & geometry
     type: int
@@ -58,7 +58,7 @@ parameters:
     default: 1
     min: -1
     max: 1
-    description: "+1: acoustic z is depth positive down (WL convention); -1 flips it. 0 is invalid."
+    description: "Depth sign. +1: depth positive down, as Water Linked reports it. -1 flips it; only if the pinger depth reads negative."
   mount_yaw_deg:
     group: Input & geometry
     type: float
@@ -66,7 +66,7 @@ parameters:
     default: 0.0
     min: -180.0
     max: 180.0
-    description: "Rotation of the acoustic frame about the vertical, CCW positive, applied before the lever arm (provisional, 0)."
+    description: "Rotation of the USBL antenna against the boat's bow (counter-clockwise positive). Wrong: a still pinger seems to circle its true place as the boat changes heading. Adjust until circling a still pinger gives a cloud of fixes, not a ring."
   lever_x_m:
     group: Input & geometry
     type: float
@@ -74,7 +74,7 @@ parameters:
     default: 0.0
     min: -5.0
     max: 5.0
-    description: "Body x (forward) of the acoustic origin relative to the boat's odom point."
+    description: "How far forward of the boat's position point the antenna sits. Wrong: the pinger is off by that error along the boat's heading, so it moves as the boat turns."
   lever_y_m:
     group: Input & geometry
     type: float
@@ -82,31 +82,7 @@ parameters:
     default: 0.0
     min: -5.0
     max: 5.0
-    description: "Body y (left) of the acoustic origin relative to the boat's odom point."
-  pose_buffer_s:
-    group: Input & geometry
-    type: float
-    unit: s
-    default: 30.0
-    min: 5.0
-    max: 300.0
-    description: "How much boat pose history is kept for latency compensation."
-  max_pose_extrap_s:
-    group: Input & geometry
-    type: float
-    unit: s
-    default: 0.5
-    min: 0.0
-    max: 2.0
-    description: "A fix measured after the newest pose by more than this is invalid (no pose); within it, the newest pose is used."
-  max_pose_gap_s:
-    group: Input & geometry
-    type: float
-    unit: s
-    default: 2.0
-    min: 0.1
-    max: 30.0
-    description: "A fix whose measurement time falls in an odometry gap longer than this is invalid (no pose interpolated across it)."
+    description: "How far left of the boat's position point the antenna sits. Wrong: the pinger is off by that error sideways, so it moves as the boat turns."
   # ---------------------------------------------------------------- Validity
   min_range_m:
     group: Validity
@@ -115,7 +91,7 @@ parameters:
     default: 0.2
     min: 0.0
     max: 10.0
-    description: "Horizontal range below which a fix is invalid (the zero vector is always invalid)."
+    description: "Fixes closer than this to the antenna are ignored. Raise it if fixes right under the boat are wild."
   max_range_m:
     group: Validity
     type: float
@@ -123,13 +99,13 @@ parameters:
     default: 60.0
     min: 1.0
     max: 1000.0
-    description: "Horizontal range above which a fix is invalid."
+    description: "Fixes farther than this are ignored. Lower it to the size of the area (a pool) to drop impossible far-off fixes."
   require_position_valid:
     group: Validity
     type: bool
     unit: ""
     default: true
-    description: "Reject a fix whose WL position_valid is false (when the field exists)."
+    description: "Ignore fixes that Water Linked itself flags as invalid. Turn off only if the unit flags good fixes as invalid; it lets more bad fixes in."
   min_receivers:
     group: Validity
     type: int
@@ -137,13 +113,7 @@ parameters:
     default: 3
     min: 0
     max: 4
-    description: "Reject a fix with fewer valid receivers than this (when WL reports them)."
-  use_legacy_fallback_input:
-    group: Validity
-    type: bool
-    unit: ""
-    default: true
-    description: "Use /uw_gps_data fixes when no /uw_gps/fix has arrived for 3 s (old bags, old uwgps_log)."
+    description: "Ignore fixes heard by fewer receivers than this. Raise: fewer but more reliable fixes. Lower: more fixes in poor acoustic conditions, more of them wrong."
   # ---------------------------------------------------------------- Motion model
   model:
     group: Motion model
@@ -151,7 +121,7 @@ parameters:
     choices: [cv, static]
     default: cv
     unit: ""
-    description: "cv: constant velocity with white acceleration noise; static: position only (robust running mean)."
+    description: "cv: the pinger moves (a robot); the filter also tracks its speed. static: the pinger is on a fixed object; position only, the steadiest. Changing it restarts the estimate."
   sigma_a:
     group: Motion model
     type: float
@@ -159,7 +129,7 @@ parameters:
     default: 0.02
     min: 0.0
     max: 5.0
-    description: "Process noise of the cv model (acceleration std); tuned 0.02 for the 0.1-0.3 m/s crawler."
+    description: "How quickly the robot may change speed or direction (cv). Raise: follows the robot's turns sooner, but wanders while it is still. Lower: smoother and steadier, but overshoots corners and turns late."
   v_max:
     group: Motion model
     type: float
@@ -167,7 +137,7 @@ parameters:
     default: 0.5
     min: 0.0
     max: 5.0
-    description: "Cap on the estimated speed after every update (the brush robot crawls at 0.1-0.3 m/s)."
+    description: "The fastest the estimate may move (cv). Set it a little above the robot's real top speed. Too low: the estimate falls behind a moving robot. Too high: a wild fix can drag it faster."
   static_drift:
     group: Motion model
     type: float
@@ -175,7 +145,7 @@ parameters:
     default: 0.01
     min: 0.0
     max: 1.0
-    description: "Random-walk position noise of the static model, so a slow drift is still followed."
+    description: "How much a pinger on a fixed object may still drift (static). Raise: follows a slow drift sooner but is less steady. Lower: steadier."
   depth_drift:
     group: Motion model
     type: float
@@ -183,15 +153,8 @@ parameters:
     default: 0.02
     min: 0.0
     max: 1.0
-    description: "Random-walk noise of the separate depth filter."
+    description: "How quickly the pinger's depth may change. Raise: the depth follows changes sooner but is noisier. Lower: steadier depth."
   # ---------------------------------------------------------------- Measurement noise
-  noise_model:
-    group: Measurement noise
-    type: enum
-    choices: [aniso, iso]
-    default: aniso
-    unit: ""
-    description: "aniso: separate along-range and cross-range std, rotated to the line of sight; iso: one std."
   range_floor_m:
     group: Measurement noise
     type: float
@@ -199,7 +162,7 @@ parameters:
     default: 0.1
     min: 0.0
     max: 10.0
-    description: "Along-range std = range_floor_m + range_k * range."
+    description: "Distance error of a fix even at short range. Raise: each fix's distance is trusted less (smoother, slower). Lower: trusted more."
   range_k:
     group: Measurement noise
     type: float
@@ -207,7 +170,7 @@ parameters:
     default: 0.2
     min: 0.0
     max: 1.0
-    description: "Along-range std per metre of range (spec 0.002; field data ~0.2, provisional 0.2)."
+    description: "Distance error per metre of range (0.2 = 20 %). Raise: far fixes count less. Lower: far fixes count more."
   sigma_bearing_deg:
     group: Measurement noise
     type: float
@@ -215,7 +178,7 @@ parameters:
     default: 12.0
     min: 0.1
     max: 60.0
-    description: "Acoustic bearing std (spec 1 deg; field data 13-17 deg median; tuned 12, provisional)."
+    description: "How noisy a fix's direction is (the sideways error, as an angle). The main smoothing knob. Raise: steadier, slower to follow a real move. Lower: follows sooner, jumps with the noise. Field data: 13-17 deg."
   sigma_heading_deg:
     group: Measurement noise
     type: float
@@ -223,7 +186,7 @@ parameters:
     default: 2.0
     min: 0.0
     max: 30.0
-    description: "Boat heading std, added to the bearing in quadrature."
+    description: "Error of the boat's own heading, added to the direction error. Raise it if the compass is poor: far fixes then count less."
   sigma_time_s:
     group: Measurement noise
     type: float
@@ -231,21 +194,13 @@ parameters:
     default: 0.3
     min: 0.0
     max: 3.0
-    description: "Latency jitter; times the yaw rate it adds cross-range error while turning."
-  iso_sigma_m:
-    group: Measurement noise
-    type: float
-    unit: m
-    default: 2.0
-    min: 0.01
-    max: 50.0
-    description: "Std of the iso noise model."
+    description: "Uncertainty of the fix delay. While the boat turns it makes fixes count less, the more the faster it turns. Raise: steadier during turns. Lower: fixes taken in turns count more."
   use_wl_std:
     group: Measurement noise
     type: bool
     unit: ""
     default: true
-    description: "Never let a std be smaller than WL's own reported std (when present)."
+    description: "Never trust a fix more than Water Linked's own error estimate allows. Turn off to ignore the unit's error estimate."
   depth_sigma_m:
     group: Measurement noise
     type: float
@@ -253,15 +208,8 @@ parameters:
     default: 0.3
     min: 0.01
     max: 10.0
-    description: "Std of one depth reading."
+    description: "Error of one depth reading. Raise: steadier depth, slower to change. Lower: the depth follows each fix more."
   # ---------------------------------------------------------------- Robustness
-  robust:
-    group: Robustness
-    type: enum
-    choices: [huber, student_t, chi2, none]
-    default: huber
-    unit: ""
-    description: "huber: inflate R by NIS/gate_soft above the soft gate; student_t: variational t update; chi2: hard gate; none."
   gate_soft:
     group: Robustness
     type: float
@@ -269,7 +217,7 @@ parameters:
     default: 5.99
     min: 0.5
     max: 100.0
-    description: "NIS above which a fix is down-weighted (chi2 2-dof 95 % = 5.99); the hard gate of the chi2 mode."
+    description: "How far (statistically) a fix may land from the estimate before it is believed less; 5.99 lets 95 % of good fixes through. Lower: more fixes are doubted (steadier, slower to follow). Raise: wild fixes are believed and pull the estimate off."
   gate_hard:
     group: Robustness
     type: float
@@ -277,7 +225,7 @@ parameters:
     default: 18.42
     min: 1.0
     max: 1000.0
-    description: "NIS above which a fix may be set aside (chi2 2-dof 99.99 % = 18.42), if it also implies > v_hard."
+    description: "Beyond this (statistical) distance a fix that would also need an impossible speed (v_hard) is ignored outright. Lower: more far-off fixes ignored. Raise: fewer. Must be at least gate_soft."
   v_hard:
     group: Robustness
     type: float
@@ -285,23 +233,7 @@ parameters:
     default: 1.5
     min: 0.0
     max: 20.0
-    description: "Implied speed (fix to estimate over the time since the last update) above which a beyond-gate fix is set aside."
-  t_dof:
-    group: Robustness
-    type: float
-    unit: ""
-    default: 4.0
-    min: 1.0
-    max: 100.0
-    description: "Degrees of freedom of the Student-t noise (student_t mode)."
-  t_iters:
-    group: Robustness
-    type: int
-    unit: ""
-    default: 5
-    min: 1
-    max: 50
-    description: "Variational iterations per update (student_t mode)."
+    description: "The speed the pinger would need to reach a far-off fix; above it (and beyond gate_hard) the fix is ignored. Lower: more jumps ignored. Raise: faster moves accepted."
   # ---------------------------------------------------------------- Re-acquisition
   init_n:
     group: Re-acquisition
@@ -310,7 +242,7 @@ parameters:
     default: 3
     min: 1
     max: 20
-    description: "Mutually consistent fixes needed to initialise."
+    description: "How many fixes must agree before the estimate starts. Raise: a safer start that takes longer. Lower: starts sooner, possibly on bad fixes."
   init_radius_m:
     group: Re-acquisition
     type: float
@@ -318,7 +250,7 @@ parameters:
     default: 3.0
     min: 0.1
     max: 50.0
-    description: "Initialising fixes must all lie within this of their median."
+    description: "How close to each other those starting fixes must be. Raise: starts sooner in noisy water. Lower: a stricter start."
   init_window_s:
     group: Re-acquisition
     type: float
@@ -326,7 +258,7 @@ parameters:
     default: 10.0
     min: 0.5
     max: 120.0
-    description: "Initialising fixes must lie within this time span."
+    description: "Time within which the starting fixes must arrive. Raise it if fixes are sparse and the estimate never starts."
   reinit_n:
     group: Re-acquisition
     type: int
@@ -334,7 +266,7 @@ parameters:
     default: 4
     min: 2
     max: 20
-    description: "Consecutive fixes beyond the soft gate (down-weighted or set aside) that, if they agree, re-initialise the estimate there."
+    description: "How many doubted fixes in a row, if they agree, make the estimate jump to them (the robot was moved). Raise: jumps less readily, safer against bursts of wild fixes. Lower: jumps sooner."
   reinit_radius_m:
     group: Re-acquisition
     type: float
@@ -342,7 +274,7 @@ parameters:
     default: 2.0
     min: 0.1
     max: 50.0
-    description: "Re-acquiring fixes must all lie within this of their median."
+    description: "How close to each other those fixes must be to jump. Raise (5-8 m) if the estimate is slow to follow a robot that was moved. Lower: jumps only on very consistent fixes."
   reinit_window_s:
     group: Re-acquisition
     type: float
@@ -350,7 +282,7 @@ parameters:
     default: 6.0
     min: 0.5
     max: 120.0
-    description: "Re-acquiring fixes must lie within this time span."
+    description: "Time within which those fixes must arrive. Raise it if fixes are sparse and a moved robot is never re-acquired."
   # ---------------------------------------------------------------- Output & safety
   coast_after_s:
     group: Output & safety
@@ -359,7 +291,7 @@ parameters:
     default: 2.0
     min: 0.1
     max: 60.0
-    description: "Status 'coasting' when the last update is older than this."
+    description: "Seconds without a new fix before the estimate is 'coasting' (still followed). Shorter: a dropout is shown sooner."
   stale_timeout_s:
     group: Output & safety
     type: float
@@ -367,43 +299,23 @@ parameters:
     default: 6.0
     min: 0.5
     max: 300.0
-    description: "Status 'stale' when the last update is older than this (follow mode then holds position)."
-  heartbeat_hz:
-    group: Output & safety
-    type: float
-    unit: Hz
-    default: 1.0
-    min: 0.5
-    max: 10.0
-    description: "Rate at which the estimate is re-published between fixes (same position, fresh status and age); >= 0.5 Hz so master_control's 3 s pinger_stale_timeout never trips on a live estimate."
-  stats_window_s:
-    group: Output & safety
-    type: float
-    unit: s
-    default: 60.0
-    min: 5.0
-    max: 600.0
-    description: "Window of the decision statistics (% down-weighted / set aside) in the estimate."
+    description: "Seconds without a new fix before the estimate is 'stale': Follow mode then holds the boat in place. Raise it if the boat stops during short dropouts; lower it if the boat keeps driving to an out-of-date position. Must be at least coast_after_s."
 
 presets:
   slow_rov:
-    description: "Default: a slow underwater robot (the brush robot crawls at 0.1-0.3 m/s); constant velocity, Huber."
+    description: "Default: a slow underwater robot (the brush robot crawls at 0.1-0.3 m/s)."
     values: {}
   static_target:
-    description: "A pinger on a fixed object: position-only robust running mean with a tiny drift."
+    description: "A pinger on a fixed object: position only, with a tiny drift."
     values:
       model: static
       v_max: 0.0
       init_radius_m: 5.0
 
-# ---------------------------------------------------------------- field tuning (2026-11-24)
-# The station's "Field tuning" tab: the knobs worth touching in the field, in plain words, each with a
-# picture of its effect (pinger_tuning/<file>, beside this file). The pictures come from THE filter run on
-# synthetic scenes with the field-measured noise, at a low value, the default and a high value:
-#   /usr/bin/python3 docs/img/pinger_findings/make_tuning_figures.py   (re-run after any filter change)
-# `slider`: the field-sensible range of the card's slider, [low, high, lin|log] (the spin box beside it
-# still takes the schema's whole min..max). Every other parameter stays in the "All parameters" tab.
-# Read by MCS only; Control ignores this block.
+# ---------------------------------------------------------------- the station's "Field tuning" tab
+# The knobs worth touching in the field, each with a picture of its effect (pinger_tuning/<file>, beside
+# this file: the filter at a low value, the default and a high value). `slider`: the card's slider range,
+# [low, high, lin|log]. Read by the station only.
 field_tuning:
   - title: "Fix delay"
     params: [latency_s]
@@ -412,7 +324,7 @@ field_tuning:
     what: "How old a USBL fix is when it arrives. The filter places each fix with the boat pose of that moment, not of now."
     lower: "Too low: while the boat turns, fixes are swung around the boat; the pinger smears into a blob and shifts with every turn."
     higher: "Too high: the same smear, the other way round."
-    field: "Calibration (docs/PINGER_FIELD_CALIBRATION.md): with the pinger still, turn the boat on the spot; the right value makes the fixes stay in one place during turns. Provisional 1.5 s."
+    field: "With the pinger still, turn the boat on the spot; the right value makes the fixes stay in one place during turns. Provisional 1.5 s."
   - title: "Receiver rotation"
     params: [mount_yaw_deg]
     slider: {mount_yaw_deg: [-45.0, 45.0, lin]}
@@ -420,7 +332,7 @@ field_tuning:
     what: "How the USBL antenna's forward direction is rotated against the boat's bow."
     lower: "Wrong either way: a still pinger seems to circle around its true place as the boat changes heading."
     higher: "Wrong either way: the same ring, turning the other way."
-    field: "Calibration: circle a still pinger; adjust until the fixes form a cloud instead of a ring. Data so far say 0 deg."
+    field: "Circle a still pinger; adjust until the fixes form a cloud instead of a ring. Data so far say 0 deg."
   - title: "Left / right mirror"
     params: [y_sign]
     picture: pinger_tuning/y_sign.png

@@ -15,11 +15,6 @@ from the header; with or without the two legend rows CSVs carry since
         <date>-<note>-bag/          the run's ros2bag, MOVED here from its
                                     hidden staging name (run sessions - v1.1,
                                     run_bag.py; replay it with bag_replay.py)
-        <date>-<note>-pingerlog.csv the pinger filter's per-fix log, MOVED here
-                                    (2026-11-24; any run that tracked the pinger)
-        <date>-<note>-pinger-smoothed.csv
-                                    the RTS-smoothed pinger track, WRITTEN here
-                                    from the per-fix log (derived, 2026-11-24)
         <csv stem>.png          the report
 
 ROS-FREE. numpy is required; matplotlib is imported lazily inside the renderer
@@ -53,6 +48,7 @@ import sys
 import numpy as np
 
 # Flat beside this file in the source tree and in lib/blueboat_control alike.
+import frame_math
 import robot_log_schema as rls
 
 # ---------------------------------------------------------------------------
@@ -124,6 +120,10 @@ class PoslogError(Exception):
 # Reading
 # ---------------------------------------------------------------------------
 
+# `<date>-<note>-poslog[-N].csv`: every file of a run is named from it, keeping -N.
+POSLOG_RE = r"-poslog(-\d+)?\.csv$"
+
+
 def sidecar_path(csv_path):
     """The `-origin.yaml` written beside a poslog, by the same rule the writer uses.
 
@@ -131,38 +131,25 @@ def sidecar_path(csv_path):
     collision makes the CSV `...-poslog-2.csv`, chopping len('-poslog.csv')
     characters lands mid-name.
     """
-    return re.sub(r"-poslog(-\d+)?\.csv$", r"-origin\1.yaml", str(csv_path))
+    return re.sub(POSLOG_RE, r"-origin\1.yaml", str(csv_path))
 
 
 def path_snapshot_path(csv_path):
     """The `-path.yaml` trajectory snapshot robot_interface copies beside a
     run-session poslog (same naming rule as the sidecar)."""
-    return re.sub(r"-poslog(-\d+)?\.csv$", r"-path\1.yaml", str(csv_path))
+    return re.sub(POSLOG_RE, r"-path\1.yaml", str(csv_path))
 
 
 def pathlog_path(csv_path):
     """The `-pathlog.csv` live-path-update log written beside a poslog
     (path_update_log.py; same naming rule as the sidecar). Absent for any run
     that never received a path update request."""
-    return re.sub(r"-poslog(-\d+)?\.csv$", r"-pathlog\1.csv", str(csv_path))
-
-
-def pingerlog_path(csv_path):
-    """The `-pingerlog.csv` per-fix log of the pinger filter written beside a
-    poslog (robot_interface, 2026-11-24; same naming rule as the sidecar)."""
-    return re.sub(r"-poslog(-\d+)?\.csv$", r"-pingerlog\1.csv", str(csv_path))
-
-
-def pinger_smoothed_name(csv_path):
-    """`<date>-<note>-pinger-smoothed[-N].csv`, the derived RTS track."""
-    return re.sub(r"-poslog(-\d+)?\.csv$", r"-pinger-smoothed\1.csv",
-                  os.path.basename(str(csv_path)))
+    return re.sub(POSLOG_RE, r"-pathlog\1.csv", str(csv_path))
 
 
 def bag_name(csv_path):
     """The run's bag directory name inside its folder: `<date>-<note>-bag[-N]`."""
-    return re.sub(r"-poslog(-\d+)?\.csv$", r"-bag\1",
-                  os.path.basename(str(csv_path)))
+    return re.sub(POSLOG_RE, r"-bag\1", os.path.basename(str(csv_path)))
 
 
 def read_origin(csv_path):
@@ -500,11 +487,9 @@ def _style(ax, grid="both"):
     ax.set_axisbelow(True)
 
 
-def render_report(run, out_png, pinger_smoothed=None):
+def render_report(run, out_png):
     """One figure per mission. Raises ImportError when matplotlib is absent -
-    the caller decides whether that is fatal (it is not). `pinger_smoothed`:
-    the RTS track [(t, x, y), ...] in the run's local frame, drawn beside the
-    logged legacy and filtered pinger tracks."""
+    the caller decides whether that is fatal (it is not)."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -543,7 +528,7 @@ def render_report(run, out_png, pinger_smoothed=None):
     ax_state = fig.add_subplot(gs[3, 0:4], sharex=ax_thr)
     ax_table = fig.add_subplot(gs[4, 0:4])
 
-    _plot_track(ax_track, run, spec, pinger_smoothed)
+    _plot_track(ax_track, run, spec)
     _plot_distance(ax_dist, t, dist, have_target, spec, m)
     _plot_speed(ax_speed, t, speed, jumps, m)
     _plot_thrusters(ax_thr, t, d)
@@ -566,15 +551,13 @@ def render_report(run, out_png, pinger_smoothed=None):
 
 PINGER_LEGACY = "#e8812a"      # legacy pinger (dragged by the boat between fixes)
 PINGER_FILTERED = "#7a3db8"    # filtered estimate
-PINGER_SMOOTHED = "#1f9e89"    # RTS smoothed
 
 
-def pinger_tracks(run, smoothed=None):
-    """The pinger tracks a run carries, in the frame track_series draws.
+def pinger_tracks(run):
+    """The pinger tracks a run logged, in the frame track_series draws.
 
     {label: (x, y)}: 'legacy' (corrected_pinger_*, unless it is already the
-    target line), 'filtered' (pf_*), 'smoothed' (the RTS list passed in).
-    Empty for a run without pinger data."""
+    target line) and 'filtered' (pf_*). Empty for a run without pinger data."""
     d = run["data"]
     series = track_series(run)
     origin = run.get("origin") or {}
@@ -586,7 +569,6 @@ def pinger_tracks(run, smoothed=None):
             return x, y
         if not isinstance(lat0, float) or not isinstance(lon0, float):
             return None
-        import frame_math
         lat, lon = frame_math.local_en_to_latlon(x, y, lat0, lon0)
         return np.asarray(lon, float), np.asarray(lat, float)
 
@@ -602,15 +584,10 @@ def pinger_tracks(run, smoothed=None):
         f = frame(d["pf_x"][ok], d["pf_y"][ok])
         if f is not None:
             out["pinger (filtered)"] = f
-    if smoothed:
-        a = np.asarray(smoothed, float)
-        f = frame(a[:, 1], a[:, 2])
-        if f is not None:
-            out["pinger (smoothed)"] = f
     return out
 
 
-def _plot_track(ax, run, spec, pinger_smoothed=None):
+def _plot_track(ax, run, spec):
     series = track_series(run)
     x, y = series["x"], series["y"]
     ok, tok = series["ok"], series["tok"]
@@ -631,9 +608,8 @@ def _plot_track(ax, run, spec, pinger_smoothed=None):
         ax.plot(series["tx"][tok], series["ty"][tok], "-", color=TARGET,
                 linewidth=2.0, label=("target (legacy pinger)" if run["layout"] == "pinger"
                                       else "target"), zorder=2)
-    colours = {"pinger (legacy)": PINGER_LEGACY, "pinger (filtered)": PINGER_FILTERED,
-               "pinger (smoothed)": PINGER_SMOOTHED}
-    for label, (px, py) in pinger_tracks(run, pinger_smoothed).items():
+    colours = {"pinger (legacy)": PINGER_LEGACY, "pinger (filtered)": PINGER_FILTERED}
+    for label, (px, py) in pinger_tracks(run).items():
         ax.plot(px, py, "-", color=colours[label], linewidth=1.2, alpha=0.9,
                 label=label, zorder=2)
     ax.plot(x[ok], y[ok], "-", color=ROBOT, linewidth=2.0, label="robot", zorder=3)
@@ -868,10 +844,8 @@ def finalise_run(csv_path, archive=True, bag=None):
     Ordering matters and is deliberate:
       1. create the folder            stdlib, cannot fail for a plotting reason
       2. render the PNG into it       optional; a failure here is reported, not raised
-      2b. (before 2) RTS-smooth the pinger from the per-fix log, when there is
-         one, into `-pinger-smoothed.csv` -- derived, written once, optional
-      3. move the CSV, its sidecar, its trajectory snapshot, its path-update
-         log and its pinger per-fix log (when they exist)
+      3. move the CSV, its sidecar, its trajectory snapshot and its
+         path-update log (when they exist)
                                       so the record is filed even with no picture
       4. move the run's bag (`bag`, a directory) in as `<date>-<note>-bag`.
          It is a record like the CSV: moved, never rewritten. A bag whose
@@ -900,11 +874,10 @@ def finalise_run(csv_path, archive=True, bag=None):
     os.makedirs(folder, exist_ok=False)
 
     out_png = os.path.join(folder, stem + ".png")
-    smoothed = _pinger_smoothed_guarded(csv_path, folder)
-    _render_guarded(csv_path, out_png, smoothed)
+    _render_guarded(csv_path, out_png)
 
     for source in (csv_path, sidecar_path(csv_path), path_snapshot_path(csv_path),
-                   pathlog_path(csv_path), pingerlog_path(csv_path)):
+                   pathlog_path(csv_path)):
         if not os.path.isfile(source):
             continue
         destination = os.path.join(folder, os.path.basename(source))
@@ -921,33 +894,10 @@ def finalise_run(csv_path, archive=True, bag=None):
     return folder
 
 
-def _pinger_smoothed_guarded(csv_path, folder):
-    """RTS-smooth the run's pinger from its per-fix log and write
-    `<date>-<note>-pinger-smoothed.csv` into the run folder. Re-runs the
-    filter from the log (bit-identical to the live forward pass). Returns
-    [(t, x, y), ...] or None; never raises (the record is filed regardless)."""
-    log = pingerlog_path(csv_path)
-    if not os.path.isfile(log):
-        return None
-    try:
-        import pinger_filter_replay as pfr
-        import pinger_params as pp
-        result = pfr.replay(pfr.load_pingerlog(log), pp.load_params())
-        smoothed = result["smoothed"]
-        destination = os.path.join(folder, pinger_smoothed_name(csv_path))
-        if not os.path.exists(destination):
-            pfr.write_smoothed(destination, smoothed)
-        return [(s["t"], s["x"], s["y"]) for s in smoothed]
-    except Exception as exc:                            # noqa: BLE001 - teardown
-        print(f"poslog_report: pinger smoothing skipped for {os.path.basename(csv_path)}: "
-              f"{type(exc).__name__}: {exc}", file=sys.stderr)
-        return None
-
-
-def _render_guarded(csv_path, out_png, pinger_smoothed=None):
+def _render_guarded(csv_path, out_png):
     try:
         run = read_poslog(csv_path)
-        render_report(run, out_png, pinger_smoothed)
+        render_report(run, out_png)
     except ImportError as exc:
         print(f"poslog_report: matplotlib unavailable ({exc}); "
               f"no picture rendered for {os.path.basename(csv_path)}",

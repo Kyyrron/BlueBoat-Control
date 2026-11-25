@@ -30,9 +30,8 @@ What the launch files do not make obvious:
 - **Pinger** (2026-11-24): `BlueBoat_launch.py` always starts `pinger_estimator` (the one producer of
   `/blueboat/pinger_coordinates` and `/blueboat/pinger/*`). `pinger_mode` (`off|follow|log`, '' = from
   `use_pinger`), `has_path` (false: a run with no path, pinger mode off or log; no `path_generation` outside a session),
-  `pinger_source` (`filter|legacy`), `pinger_preset`, `pinger_filter_yaml`, `allow_live_retune`
-  (interface §2.7). `Replay_launch.py pinger_estimator:=true` re-estimates the pinger on the replayed
-  inputs (the recorded pinger outputs then move to `/replay/*`).
+  `pinger_source` (`filter|legacy`), `pinger_preset`, `pinger_filter_yaml` (the live tuning file, default
+  `~/.config/blueboat_control/pinger_tuning.yaml`, created if missing; interface §2.7).
 - **`path_source`** (default `mission`): `replanner` makes runs replanner-owned (§4), in both
   launch files and per run through `configure`; with `use_pinger` it is a FATAL at launch.
   (2026-11-18, R-3) The simulator's `full_mission_launch.py` takes it too and passes it the same
@@ -66,10 +65,10 @@ No lint or type-check target. Scripts with exit codes, pytest-compatible:
 python3 test/test_yaw_wrap.py                     # heading at +-180 deg, MPC/PID/LoS (32 checks; needs what mc_harness needs)
 /usr/bin/python3 test/test_path_update_log.py     # ROS-free pathlog + filing (24 checks)
 python3 test/test_bag_replay_track.py             # 18 ROS-free checks; 29 with ROS + the recorded bag
-/usr/bin/python3 test/test_pinger_filter.py       # pinger filter A1 + legacy bit-identity + review fixes (148 checks; recorded-bag checks need ~/ros2_ws/data)
+/usr/bin/python3 test/test_pinger_filter.py       # pinger filter, parameters + tuning file, live retune, legacy bit-identity (101 checks)
 /usr/bin/python3 test/test_yaml_trajectory_end.py # a non-loop path clamps (pose + heading), a loop wraps (21 checks)
 python3 test/mc_harness.py --pinger-modes         # pinger modes A4: configure table, log w/o path = 0 /path_request, stale hold
-python3 test/pinger_integration.py --mode log     # ROS graph: estimator -> robot_interface CSV, per-fix log, sidecar, smoothing (also --mode follow)
+python3 test/pinger_integration.py --mode log     # ROS graph: estimator -> robot_interface CSV + sidecar, tuning file created and a live edit applied (also --mode follow)
 python3 test/gazebo_path_end.py --controllers PID,LoS,MPC   # Gazebo, headless, isolated: non-loop end held >= 60 s, loop wraps
 QT_QPA_PLATFORM=offscreen python3 log_reviewer/smoke_test.py   # skips without a poslog under ~/ros2_ws/data
 python3 .claude/tools/interface_inventory.py --check .claude/tools/interface_baseline.json  # 0 = unchanged

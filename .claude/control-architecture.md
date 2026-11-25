@@ -86,9 +86,9 @@ Evidence and tables: `blueboat_control/src/CLAUDE.md` §5.
   `solve_LoS`, `manualMove`, the CLI's `move <left> <right> <s>`).
 - `left_pwm = 3000 − pwm`: the left thruster is reversed for an asymmetric propeller —
   intentional.
-- `manualMove`'s `compensation_gain` conditional (1.2 / 0.75) is overridden by a hard-coded
-  `1.0`, and keys on `input[1]` while scaling `input[0]`. Dead — do not tidy without
-  deciding what it should do.
+- `manualMove` applies no per-side compensation: v1.0's `compensation_gain` (1.2 / 0.75,
+  keyed on the wrong side) was always overridden by 1.0 and was removed 2026-11-25. A
+  right-thruster correction, if the boat needs one, is a field decision.
 - Thrust→PWM is a `PchipInterpolator` on a measured bollard-pull table
   (`cf.generate_interpolator`): about −27.6 N to +55.2 N; PWM clamps to `[1100, 1900]`.
 - **Saturation is uniform, and one number**: every exit (`ThrustAllocator.allocate`,

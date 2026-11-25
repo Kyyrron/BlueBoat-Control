@@ -107,17 +107,7 @@ def default_texts(stem="", run=None):
 # Shared styling
 # ---------------------------------------------------------------------------
 
-def style(ax, grid="both"):
-    """`poslog_report._style`, unchanged."""
-    ax.set_facecolor(SURFACE)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    for side in ("left", "bottom"):
-        ax.spines[side].set_color(GRID)
-    ax.tick_params(colors=INK2, labelsize=8, length=3, color=GRID)
-    ax.grid(True, axis=grid if grid != "both" else "both",
-            color=GRID, linewidth=0.7)
-    ax.set_axisbelow(True)
+style = pb.style       # poslog_report's axes style, so the export matches the archived PNG
 
 
 def headline(ax, title, description, wrap=WRAP_CHARS, show=True):

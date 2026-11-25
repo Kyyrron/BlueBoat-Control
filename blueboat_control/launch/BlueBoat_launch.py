@@ -6,7 +6,7 @@ sl_motors = sl.declare_arg('enable_motors', default_value = False)              
 sl_note = sl.declare_arg('note', default_value= '')                             # Add additionnal info on the log name
 sl_controller = sl.declare_arg('controller_type', default_value = '')           # As an option, it is possible to launch a controller along the robot interaction
 sl_trajectory = sl.declare_arg('trajectory', default_value = 'station_keeping') # Trajectory reference for the control
-sl_pinger = sl.declare_arg('use_pinger', default_value = False)                 # Tell the controller to rely on pinger coordinates or computed trajectory
+sl.declare_arg('use_pinger', default_value = False)                             # Tell the controller to rely on pinger coordinates or computed trajectory
 sl_fcu = sl.declare_arg('fcu_url', default_value = 'udp://:14550@192.168.2.2:14550') # MAVROS <-> autopilot endpoint. Port 14550 is also QGroundControl's default listen port: a running QGC takes it first and mavros fails to bind, which shows up as an intermittent launch failure. Close QGC, or move this launch to another port.
 sl_data = sl.declare_arg('data_dir', default_value = '')                       # Root for run artifacts (position CSV, controller .npy). Empty resolves to $BLUEBOAT_DATA_DIR, else the sourced workspace root.
 sl_session = sl.declare_arg('session_mode', default_value = False)             # Run session (the Mission Control Station passes true): connect and idle; path/pinger following and logging only between run start/stop on /blueboat/run_command, one CSV + .npy per run. Needs a controller_type. False = the classic one-launch-one-mission behaviour.
@@ -17,8 +17,7 @@ sl_pinger_mode = sl.declare_arg('pinger_mode', default_value = '')
 sl_has_path = sl.declare_arg('has_path', default_value = True)                 # a run without a path (pinger mode off or log): false (no path server outside a session, no /path_request)
 sl_pinger_source = sl.declare_arg('pinger_source', default_value = 'filter')   # what /blueboat/pinger_coordinates carries: filter (default) | legacy (v1.1 vector: dragged by the boat between fixes)
 sl_pinger_preset = sl.declare_arg('pinger_preset', default_value = 'slow_rov') # pinger filter preset (config/pinger_filter.yaml)
-sl_pinger_yaml = sl.declare_arg('pinger_filter_yaml', default_value = '')      # a saved pinger filter parameter YAML (MCS format), over the preset
-sl_retune = sl.declare_arg('allow_live_retune', default_value = False)         # allow pinger filter changes during a run
+sl_pinger_yaml = sl.declare_arg('pinger_filter_yaml', default_value = '~/.config/blueboat_control/pinger_tuning.yaml')  # the LIVE tuning file: created with every filter parameter listed if missing; edit and save while the boat runs, applied within a second ('' = none)
 
 def _pinger_mode():
     mode = str(sl.arg('pinger_mode') or '').strip().lower()
@@ -50,8 +49,7 @@ def launch_setup():
             parameters={'enable_motors' : sl_motors,
                         'note' : sl_note,
                         'controller_type' : sl_controller,
-                        'use_UWgps': follow,
-                        'pinger_mode': pinger_mode,
+                        'pinger_mode': pinger_mode,        # resolved here; wins over the nodes' use_* aliases
                         'data_dir': sl_data,
                         'session_mode': sl_session,
                         'record_bag': sl_bag,
@@ -71,7 +69,6 @@ def launch_setup():
             parameters={'pinger_source': sl_pinger_source,
                         'pinger_preset': sl_pinger_preset,
                         'pinger_filter_yaml': sl_pinger_yaml,
-                        'allow_live_retune': sl_retune,
                         'use_sim_time': False})
 
     # Handle parameter setting (mainly used to override motor control for teleoperation)                                       
@@ -86,7 +83,6 @@ def launch_setup():
                 'master_control.py', 
                 parameters={'controller_type' : sl_controller,
                             'simulation' : False,
-                            'use_pinger': follow,
                             'pinger_mode': pinger_mode,
                             'has_path': sl_has_path,
                             'data_dir': sl_data,

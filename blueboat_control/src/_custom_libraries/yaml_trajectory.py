@@ -28,45 +28,37 @@ class YamlTrajectory:
 
     def __init__(self, path: str) -> None:
         with open(path, "r") as handle:
-            data = yaml.safe_load(handle) or {}
+            # The C parser when PyYAML has it: the same objects, ~5x faster on
+            # a long mission (parsed inside the /path_request callback).
+            data = yaml.load(handle, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader)) or {}
         fmt = data.get("format", "")
         if fmt != SUPPORTED_FORMAT:
             raise ValueError(
                 f"Unsupported trajectory format '{fmt}' in {path} "
                 f"(expected {SUPPORTED_FORMAT})")
-        points = np.asarray(data.get("points", []), dtype=float)
+        self._set(data.get("points", []), data.get("name", ""), data.get("loop", False), f" in {path}")
+
+    @classmethod
+    def from_points(cls, points, name: str = "", loop: bool = False) -> "YamlTrajectory":
+        """Build a trajectory from ``[t, x, y, yaw]`` rows already in memory:
+        the samples of a ``/blueboat/update_path`` request are evaluated by THIS
+        class, so an updated path is followed exactly as a designer file
+        holding the same samples would be."""
+        self = cls.__new__(cls)
+        self._set(points, name, loop)
+        return self
+
+    def _set(self, points, name, loop, where=""):
+        points = np.asarray(points, dtype=float)
         if points.ndim != 2 or points.shape[1] != 4 or len(points) == 0:
-            raise ValueError(f"No valid points in {path}")
-        self.name: str = str(data.get("name", ""))
-        self.loop: bool = bool(data.get("loop", False))
+            raise ValueError(f"No valid points{where}")
+        self.name: str = str(name)
+        self.loop: bool = bool(loop)
         self.duration: float = float(points[-1, 0])
         self._t = points[:, 0]
         self._x = points[:, 1]
         self._y = points[:, 2]
         self._yaw = points[:, 3]
-
-    @classmethod
-    def from_points(cls, points, name: str = "", loop: bool = False) -> "YamlTrajectory":
-        """Build a trajectory from ``[t, x, y, yaw]`` rows already in memory.
-
-        Additive (2026-10-15, live path update): the samples of a
-        ``/blueboat/update_path`` request are evaluated by THIS class, so an
-        updated path is followed exactly as a designer file holding the same
-        samples would be. ``__init__`` is untouched; the attributes set here are
-        the ones it sets, from the same array slices.
-        """
-        points = np.asarray(points, dtype=float)
-        if points.ndim != 2 or points.shape[1] != 4 or len(points) == 0:
-            raise ValueError("No valid points")
-        self = cls.__new__(cls)
-        self.name = str(name)
-        self.loop = bool(loop)
-        self.duration = float(points[-1, 0])
-        self._t = points[:, 0]
-        self._x = points[:, 1]
-        self._y = points[:, 2]
-        self._yaw = points[:, 3]
-        return self
 
     def pose(self, t: float) -> tuple[float, float, float, float, float, float]:
         """Return ``(x, y, z, roll, pitch, yaw)`` at time ``t`` seconds."""
@@ -93,14 +85,3 @@ class YamlTrajectory:
 def _wrap(angle: float) -> float:
     return math.atan2(math.sin(angle), math.cos(angle))
 
-
-def read_yaml(trajectory: "YamlTrajectory | str", t: float):
-    """Convenience wrapper: ``x, y, z, roll, pitch, yaw = read_yaml(traj, t)``.
-
-    Accepts either an already-loaded :class:`YamlTrajectory` (recommended —
-    load once in the node constructor) or a file path (loaded on every call;
-    only for quick experiments).
-    """
-    if isinstance(trajectory, str):
-        trajectory = YamlTrajectory(trajectory)
-    return trajectory.pose(t)

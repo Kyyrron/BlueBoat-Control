@@ -55,6 +55,7 @@ track_series = pr.track_series
 origin_label = pr.origin_label
 fmt = pr._fmt
 fmt_duration = pr._fmt_duration
+style = pr._style
 
 SURFACE, INK, INK2, MUTED, GRID = pr.SURFACE, pr.INK, pr.INK2, pr.MUTED, pr.GRID
 ROBOT, TARGET, REF = pr.ROBOT, pr.TARGET, pr.REF
