@@ -207,7 +207,7 @@ def write_cropped_csv(source_csv, out_csv, row_index, pinger_columns=None):
 
     `pinger_columns` (from `pinger_bag.export_columns`, one value per kept row
     in order) turns the export into a WITH-PINGER log, so this same app reads it
-    back with no second code path: the header is `COLUMNS_PINGER`, the target
+    back with no second code path: the header is `COLUMNS_PINGER_V11`, the target
     block is the pinger, the raw Water Linked packet fills `aco..filaco`, and
     every source column the pinger layout does not have - the path target
     (`target_x/y`, `target_latitude/longitude`) above all - follows at the end,
@@ -228,8 +228,10 @@ def write_cropped_csv(source_csv, out_csv, row_index, pinger_columns=None):
     legend_from = "source" if legend else "schema"
     out_header = header
     if pinger_columns is not None:
-        out_header = list(pb.rls.COLUMNS_PINGER) + [
-            name for name in header if name not in pb.rls.COLUMNS_PINGER]
+        # The v1.1 with-pinger columns (39); every other source column -- the
+        # path target, and a 2026-11-24 log's filtered pf_* block -- follows.
+        out_header = list(pb.rls.COLUMNS_PINGER_V11) + [
+            name for name in header if name not in pb.rls.COLUMNS_PINGER_V11]
         legend, legend_from = None, "schema"
     if legend is None:
         legend = pb.rls.legend_rows(out_header)

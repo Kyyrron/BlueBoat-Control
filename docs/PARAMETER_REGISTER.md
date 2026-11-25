@@ -222,3 +222,30 @@ The hull interval moves the duration of that mission by −5.2 % … +1.6 % arou
 straight lines both ends hold 1.0 m/s (20 N of the 40 N available); the difference is made in the turns.
 The PID with the real gains does not complete this 1.0 m/s route within 1350 s on any of the three plants (it
 falls behind its target by 1.5–2.7 m); the field PID runs were flown on 0.5 m/s routes.
+
+## 9. Pinger filter (`pinger_estimator`, 2026-11-24)
+
+The schema (name, unit, default, range, description) is `blueboat_control/config/pinger_filter.yaml`;
+this table gives where each value comes from. Phase 0/1 evidence: `docs/PINGER_FILTER_FINDINGS.md`.
+"Provisional" = to be re-fitted by `docs/PINGER_FIELD_CALIBRATION.md`.
+
+| Parameter | `slow_rov` value | Origin | Interval / note |
+|---|---|---|---|
+| `latency_s` | 1.5 s | pooled local consistency of raw fixes on 20 pool bags (flat 1.0–1.75 s); literature 1.5 s | **provisional**; WL filtered lags ≥ 1 s more |
+| `y_sign` | +1 | world consistency (flip worse on 19/20 runs), pool outline (14/20) | **provisional** until a still-pinger run |
+| `mount_yaw_deg` | 0° | per-run regression −9…+9° | not identifiable on a moving target; **provisional** |
+| `lever_x_m`, `lever_y_m` | 0 | unknown (4 receivers at the boat's corners, reference point unknown) | **provisional** |
+| `sigma_bearing_deg` | 12° | tuning sweep (flat 10–14°); field residual 13–17° median | spec 1° |
+| `range_k` | 0.2 | tuning sweep; along-range residual ≈ 20 % of range | spec 0.002 |
+| `sigma_a` | 0.02 m/s² | tuning sweep (0.02–0.03) | crawler 0.1–0.3 m/s |
+| `v_max` | 0.5 m/s | owner: the brush robot crawls at 0.1–0.3 m/s | `static_target`: 0 |
+| `gate_soft`, `gate_hard` | 5.99, 18.42 | χ²₂ 95 %, 99.99 % | |
+| `v_hard` | 1.5 m/s | no effect in the sweep (1.0–3.0) | |
+| `init_n`, `init_radius_m` | 3, 3 m | design | `static_target`: radius 5 m |
+| `reinit_n`, `reinit_radius_m`, `reinit_window_s` | 4, 2 m, 6 s | A1: a 15 m relocation is re-acquired in 4 fixes | |
+| `coast_after_s`, `stale_timeout_s` | 2 s, 6 s | device ~1.6 fixes/s; dropouts | |
+| `max_pose_gap_s` | 2 s | odometry 3.8–16 Hz in the field (gaps of several seconds at the 103 s hang) | no pose interpolated across a longer gap |
+| `heartbeat_hz` | 1 Hz | range 0.5–10 Hz: below 0.4 Hz `master_control`'s 3 s `pinger_stale_timeout` would hold on a live estimate | |
+| `pinger_stale_timeout` (`master_control`) | 3 s | 3 × the 1 Hz estimate heartbeat | follow mode holds beyond it |
+| `raw_rate_hz`, `full_rate_hz` (`uwgps_log`) | 4 Hz, 2 Hz | the legacy packet stays on its 2 Hz cycle | device ≥ 1.7 Hz |
+| `connect_timeout_s`, `read_timeout_s` (`uwgps_log`) | 0.25 s, 0.4 s | one cycle median 30 ms, p95 0.1–1.0 s; one 103 s hang without a timeout | |

@@ -77,6 +77,20 @@ install(PROGRAMS src/robot_interaction/param_set.py
 install(PROGRAMS src/robot_interaction/uwgps_log.py
         DESTINATION lib/${PROJECT_NAME})
 
+# Pinger pipeline (2026-11-24): the estimator node and its ROS-free modules
+# (installed flat, like every library here, so they import each other by name).
+install(PROGRAMS src/robot_interaction/pinger_estimator.py
+        DESTINATION lib/${PROJECT_NAME})
+install(PROGRAMS src/_custom_libraries/pinger_filter_replay.py
+                 src/_custom_libraries/pinger_filter.py
+                 src/_custom_libraries/pinger_estimator_core.py
+                 src/_custom_libraries/pinger_params.py
+                 src/_custom_libraries/pinger_input.py
+                 src/_custom_libraries/pinger_log.py
+                 src/_custom_libraries/legacy_pinger.py
+                 src/_custom_libraries/mcap_lite.py
+        DESTINATION lib/${PROJECT_NAME})
+
 install(PROGRAMS src/master_control.py
         DESTINATION lib/${PROJECT_NAME})
 install(PROGRAMS src/simulation_interface.py

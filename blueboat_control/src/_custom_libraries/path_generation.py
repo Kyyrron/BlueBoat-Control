@@ -22,8 +22,11 @@
 #     4. THE SHAPE LIBRARY    single_pose
 # ============================================================================
 
+import json
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import String
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 import numpy as np
@@ -35,6 +38,10 @@ import time
 import custom_functions as cf
 import path_stamp as ps
 import yaml_trajectory as yt
+
+# Where a library shape ends (it then holds its last pose); None = never ends.
+SHAPE_END_S = {'sin': 500.0, 'kin_square': 500.0, 'seabed_scanning': 40.0 + 12.0 * math.pi}
+SCHEMA_PATH_INFO = "blueboat_path_info/1"
 
 # Every `trajectory:=` selector single_pose serves; anything else is a FATAL
 # at construction.
@@ -137,6 +144,12 @@ class PathGeneration(Node):
             self.get_logger().fatal(msg)
             raise ValueError(msg)
 
+        # What is served (duration, loop), latched, so master_control can
+        # report `path_complete` (additive, 2026-11-24).
+        info_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.path_info_publisher = self.create_publisher(String, '/blueboat/path_info', info_qos)
+
         # trajectory:=from_yaml:<abs path>, or trajectory:=from_yaml with the
         # optional yaml_path:=<path> (which wins; no launch file passes it).
         self.declare_parameter('yaml_path', '')
@@ -162,6 +175,27 @@ class PathGeneration(Node):
             self._refuse_if_server_running()
 
         self.path_service = self.create_service(RequestPath, '/path_request', self.generate_path)
+        self.publish_path_info()
+
+    def publish_path_info(self):
+        """/blueboat/path_info: the served trajectory's duration and loop flag.
+        A from_yaml path not loaded yet (the origin hold) reports loaded false."""
+        if self.trajectory.startswith('from_yaml'):
+            traj = self.yaml_traj
+            info = {"trajectory": "from_yaml", "file": self._yaml_selected_path,
+                    "loaded": traj is not None,
+                    "name": traj.name if traj is not None else None,
+                    "duration_s": float(traj.duration) if traj is not None else None,
+                    "loop": bool(traj.loop) if traj is not None else None,
+                    "mtime": self._yaml_mtime}
+        else:
+            end = SHAPE_END_S.get(self.trajectory)
+            info = {"trajectory": self.trajectory, "file": None, "loaded": True, "name": self.trajectory,
+                    "duration_s": end, "loop": False, "mtime": None}
+        info["schema"] = SCHEMA_PATH_INFO
+        msg = String()
+        msg.data = json.dumps(info)
+        self.path_info_publisher.publish(msg)
 
     def _path_request_servers(self):
         """Nodes currently offering /path_request, as distinct 'ns/name'.
@@ -249,8 +283,10 @@ class PathGeneration(Node):
             self._yaml_mtime = mtime
             self.get_logger().info(
                 f"Loaded YAML trajectory '{self.yaml_traj.name}' "
-                f"({self.yaml_traj.duration:.1f} s) from "
+                f"({self.yaml_traj.duration:.1f} s, "
+                f"{'loops' if self.yaml_traj.loop else 'ends and holds its last pose'}) from "
                 f"{self._yaml_selected_path}")
+            self.publish_path_info()        # the publisher exists before the first load
         except Exception as exc:
             self.get_logger().error(
                 f"Failed to load YAML trajectory "

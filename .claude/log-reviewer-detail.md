@@ -183,6 +183,15 @@ committed one. The gate's `[1b]` section carries the simulated-frame checks, inc
 
 ## 9.7 The pinger from the run's ros2 bag
 
+**Since 2026-11-24** `pinger_bag.attach` looks, in order: (1) the log's own filtered block (`pf_*`
+columns, written by `robot_interface` from `pinger_estimator`); (2) the run's bag **re-filtered with the
+current pinger filter** (`pinger_filter_replay`, the estimator's own core; needs `/blueboat/odom` in
+the bag); (3) for a pinger-layout log without a bag, its UGPS columns re-filtered with the same core
+(rows 0.33 s apart); (4) only when the filter cannot read the run, the heuristic filter described below
+(kept as the fallback). The MCAP reader itself moved to `_custom_libraries/mcap_lite.py`;
+`pinger_bag` re-exports its names. A with-pinger export keeps the v1.1 39 columns first
+(`COLUMNS_PINGER_V11`); a source's `pf_*` block follows with the other source columns.
+
 A path-mode run logs the no-pinger CSV layout, so its poslog has no pinger columns, but the
 run's bag (`<date>-<note>-bag/`, filed beside the poslog) still holds `/uw_gps_data` and
 `/blueboat/pinger_coordinates` (every run session tracks the pinger whatever the follow

@@ -464,7 +464,7 @@ def section_pinger(logs, workspace):
     check("the export reads back as a with-pinger log",
           back["layout"] == "pinger" and back["n_rows"] == run["n_rows"])
     check("its columns are the with-pinger layout, the path target kept after them",
-          list(back["data"])[:len(rls.COLUMNS_PINGER)] == list(rls.COLUMNS_PINGER)
+          list(back["data"])[:len(rls.COLUMNS_PINGER_V11)] == list(rls.COLUMNS_PINGER_V11)
           and {"target_x", "target_y", "target_latitude", "target_longitude"}
           <= set(back["data"]))
     check("the path target is not lost",

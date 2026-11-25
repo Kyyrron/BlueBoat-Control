@@ -20,8 +20,14 @@
 #   /set_path           the run's `-path.yaml` snapshot, world frame, every 5 s.
 #   original names      every /mavros/* topic but rc/override (recorded GPS
 #                       fixes, compass, IMU, state, ...), /thruster_input,
-#                       /controller_target, /blueboat/pinger_coordinates,
-#                       /uw_gps_data -- unchanged but for header.stamp.
+#                       /controller_target, /uw_gps_data, /uw_gps/fix,
+#                       /uw_gps/info -- unchanged but for header.stamp.
+#   pinger outputs      /blueboat/pinger_coordinates and /blueboat/pinger/*
+#                       (2026-11-24): under their own names (the bag's pinger,
+#                       as recorded) -- or, with `pinger_estimator:=true`, under
+#                       /replay/<name>, because a pinger_estimator then runs on
+#                       the replayed inputs and owns the live names (one
+#                       publisher per topic).
 #   /replay/<name>      everything else (operator commands, session plumbing,
 #                       param handshake, rc/override, the raw /blueboat/odom):
 #                       nothing lost, nothing that triggers a live consumer.
@@ -102,8 +108,14 @@ T_MONITORING = '/monitoring_data'
 T_MAVLINK = '/uas1/mavlink_source'
 
 # Republished unchanged under their own names (beside every /mavros/* topic).
-LIVE_TOPICS = {'/thruster_input', '/controller_target',
-               '/blueboat/pinger_coordinates', '/uw_gps_data'}
+LIVE_TOPICS = {'/thruster_input', '/controller_target', '/uw_gps_data',
+               '/uw_gps/fix', '/uw_gps/info'}
+# What pinger_estimator publishes: live names unless a replay estimator runs.
+PINGER_OUTPUTS = {'/blueboat/pinger_coordinates', '/blueboat/pinger/legacy_body',
+                  '/blueboat/pinger/estimate', '/blueboat/pinger/fix',
+                  '/blueboat/pinger/filter_config'}
+# Latched at both ends live (CM-4): republished latched.
+LATCHED_TOPICS = {'/blueboat/pinger/filter_config', '/uw_gps/info'}
 # Never republished: graph plumbing of the recording session.
 DROPPED_TOPICS = {'/rosout', '/parameter_events', '/tf', '/tf_static', '/clock'}
 # /mavros/* topics that are commands TO the boat, not telemetry from it.
@@ -484,6 +496,9 @@ class BagReplay(Node):
         # rest height sss_sim_node takes as the still waterline -- cited, not
         # imported (CM-3), so the transducers sit at its sensor_depth_m.
         self.declare_parameter('boat_pose_waterline_z', -0.111)
+        # True when Replay_launch runs a pinger_estimator on the replayed
+        # inputs: the recorded pinger outputs then go to /replay/<name>.
+        self.declare_parameter('pinger_estimator', False)
 
         gp = self.get_parameter
         self.bag_dir = resolve_bag(gp('bag').get_parameter_value().string_value)
@@ -593,6 +608,10 @@ class BagReplay(Node):
             return topic, 'live'
         if topic in LIVE_TOPICS:
             return topic, 'live'
+        if topic in PINGER_OUTPUTS:
+            if self.get_parameter('pinger_estimator').get_parameter_value().bool_value:
+                return REPLAY_PREFIX + topic, 'raw'
+            return topic, 'live'
         return REPLAY_PREFIX + topic, 'raw'
 
     def publisher_for(self, out, type_name):
@@ -601,9 +620,16 @@ class BagReplay(Node):
             cls = self.class_for(type_name)
             if cls is None:
                 return None
-            pub = self.create_publisher(cls, out, self.reliable)
+            pub = self.create_publisher(cls, out, self.qos_for(out))
             self.pubs[out] = pub
         return pub
+
+    def qos_for(self, out):
+        """Reliable depth 10; latched where the live publisher is (CM-4)."""
+        if out in LATCHED_TOPICS:
+            return QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                              durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        return self.reliable
 
     def class_for(self, type_name):
         if type_name not in self.classes:

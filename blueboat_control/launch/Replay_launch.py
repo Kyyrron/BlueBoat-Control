@@ -50,6 +50,10 @@ sl.declare_arg('heave_gate', default_value = True)      # ... only when it looks
 sl.declare_arg('start_paused', default_value = False)
 sl.declare_arg('gui', default_value = True)
 sl.declare_arg('placement', default_value = 'gps')      # gps: placed by the world's anchor; origin: the run's launch point on the world origin
+sl.declare_arg('pinger_estimator', default_value = False)   # True: re-estimate the pinger with the CURRENT filter (pinger_estimator on the replayed /uw_gps/fix or /uw_gps_data); the recorded pinger outputs move to /replay/*. False: show what the bag holds
+sl.declare_arg('pinger_source', default_value = 'filter')   # with pinger_estimator: filter | legacy (what /blueboat/pinger_coordinates carries)
+sl.declare_arg('pinger_preset', default_value = 'slow_rov') # with pinger_estimator: filter preset
+sl.declare_arg('pinger_filter_yaml', default_value = '')    # with pinger_estimator: a saved parameter YAML (MCS format)
 
 STOCK_WORLD_NAME = 'ocean'
 
@@ -130,8 +134,22 @@ def launch_setup():
               'start_paused': sl.arg('start_paused'),
               'placement': placement,
               # The pose a simulated sonar started over this world renders from.
-              'publish_boat_pose': True}
+              'publish_boat_pose': True,
+              'pinger_estimator': sl.arg('pinger_estimator')}
     sl.node('blueboat_control', 'bag_replay.py', output='screen', parameters=params)
+
+    if sl.arg('pinger_estimator'):
+        # The SAME node as live; bag_replay moved the recorded pinger outputs
+        # to /replay/* so each name has one publisher.
+        # Its clock is the BAG's timeline (clock_source replay: rebuilt from
+        # /replay/state), not Gazebo's: every filter duration stays bag time
+        # at any replay rate, pause or real-time factor.
+        sl.node('blueboat_control', 'pinger_estimator.py', output='screen',
+                parameters={'pinger_source': sl.arg('pinger_source'),
+                            'pinger_preset': sl.arg('pinger_preset'),
+                            'pinger_filter_yaml': sl.arg('pinger_filter_yaml'),
+                            'clock_source': 'replay',
+                            'use_sim_time': False})
 
     return sl.launch_description()
 

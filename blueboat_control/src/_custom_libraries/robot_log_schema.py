@@ -35,11 +35,22 @@ de-synchronise from the values written into it. Keep it that way.
 
 Which layout is used
 --------------------
-Selected once, at construction, by the `use_UWgps` launch parameter -- which
-is itself set from `use_pinger` by BlueBoat_launch.py:
+Selected per run by the pinger mode (since 2026-11-24; before it, by the
+`use_UWgps` launch parameter, itself set from `use_pinger`):
 
-    use_UWgps = False  ->  COLUMNS_NO_PINGER  (27 columns)  <- always, in sim
-    use_UWgps = True   ->  COLUMNS_PINGER     (39 columns)
+    pinger_mode off     ->  COLUMNS_NO_PINGER   (27 columns)  <- always, in sim
+    pinger_mode follow  ->  COLUMNS_PINGER      (52 columns; 39 before 2026-11-24)
+    pinger_mode log     ->  COLUMNS_PINGER_LOG  (56 columns, new 2026-11-24)
+
+SCHEMA REVISION -- 2026-11-24 (append-only; every earlier CSV stays valid and is
+read by column name as before):
+  * the FILTERED pinger block FILTER_COLUMNS (13, `pf_*`) is APPENDED to the
+    pinger layout. The 39 v1.1 columns are unchanged in name, order and meaning
+    (`corrected_pinger_*` is still the legacy world value, `filaco_*` still WL's
+    filtered fix) and stay available as COLUMNS_PINGER_V11;
+  * a new layout for "log pinger only" runs: the no-pinger columns (the PATH
+    target stays the target), then the legacy pinger world value, the raw Water
+    Linked packet and the filtered block.
 
 The two layouts are NOT a subset of one another, but as of this revision they
 share the SAME FIRST 19 COLUMNS STRUCTURALLY -- time, robot pose, target pose,
@@ -157,6 +168,24 @@ COLUMNS_PINGER only, between the two blocks:
                               set from the same value as aco_z rather than
                               from an independent depth sensor.
 
+COLUMNS_PINGER (since 2026-11-24) and COLUMNS_PINGER_LOG, trailing block:
+  pf_x/y                 (2)  the pinger_estimator's filtered WORLD estimate,
+                              same frame as relative_x/y (held between fixes:
+                              it only changes when a fix is processed). NaN
+                              until the filter has initialised.
+  pf_depth               (1)  filtered depth, positive down.
+  pf_vx/vy               (2)  filtered velocity (capped at v_max).
+  pf_var_x/cov_xy/var_y  (3)  position covariance, propagated to the row time.
+  pf_r95                 (1)  95 % uncertainty radius (major semi-axis).
+  pf_status              (1)  0 no_data, 1 initialising, 2 tracking,
+                              3 coasting, 4 stale.
+  pf_fix_age             (1)  seconds since the last processed fix updated it.
+  pf_latitude/longitude  (2)  pf_x/y through the origin fix (derived).
+
+COLUMNS_PINGER_LOG ("log pinger only", 2026-11-24): COLUMNS_NO_PINGER, then
+  corrected_pinger_x/y, pinger_latitude/longitude (the legacy pinger, as in the
+  pinger layout's target block), aco..filaco (12), then the filtered block.
+
 Legend rows -- 2026-10-08
 -------------------------
 A CSV started on or after this revision opens with TWO legend rows above
@@ -204,8 +233,9 @@ COLUMNS_NO_PINGER = (
     'lin_acc_x', 'lin_acc_y', 'lin_acc_z',
 )
 
-# 39 columns. use_UWgps = True.
-COLUMNS_PINGER = (
+# 39 columns: the pinger layout as written until 2026-11-24 (v1.1). Kept for the
+# readers of those files and for exports of runs that carry no filtered block.
+COLUMNS_PINGER_V11 = (
     'Year', 'Month', 'Day', 'Hour', 'Minute', 'Second', 'MicroSecond',
     'relative_x', 'relative_y', 'relative_psi',
     'corrected_pinger_x', 'corrected_pinger_y',
@@ -220,6 +250,29 @@ COLUMNS_PINGER = (
     'ang_vel_x', 'ang_vel_y', 'ang_vel_z',
     'lin_acc_x', 'lin_acc_y', 'lin_acc_z',
 )
+
+# The raw Water Linked packet (/uw_gps_data[7:19]) and the legacy pinger pair.
+UGPS_COLUMNS = ('aco_x', 'aco_y', 'aco_z', 'ant_x', 'ant_y', 'ant_z',
+                'lat', 'lon', 'dep', 'filaco_x', 'filaco_y', 'filaco_z')
+LEGACY_PINGER_COLUMNS = ('corrected_pinger_x', 'corrected_pinger_y',
+                         'pinger_latitude', 'pinger_longitude')
+
+# 13 columns, the pinger_estimator's filtered estimate (2026-11-24).
+FILTER_COLUMNS = ('pf_x', 'pf_y', 'pf_depth', 'pf_vx', 'pf_vy',
+                  'pf_var_x', 'pf_cov_xy', 'pf_var_y', 'pf_r95',
+                  'pf_status', 'pf_fix_age', 'pf_latitude', 'pf_longitude')
+
+# 52 columns. pinger_mode follow (use_UWgps = True).
+COLUMNS_PINGER = COLUMNS_PINGER_V11 + FILTER_COLUMNS
+
+# 56 columns. pinger_mode log ("log pinger only").
+COLUMNS_PINGER_LOG = (COLUMNS_NO_PINGER + LEGACY_PINGER_COLUMNS + UGPS_COLUMNS
+                      + FILTER_COLUMNS)
+
+PINGER_MODES = ('off', 'follow', 'log')
+LAYOUT_OF_MODE = {'off': 'no_pinger', 'follow': 'pinger', 'log': 'pinger_log'}
+COLUMNS_OF_LAYOUT = {'no_pinger': COLUMNS_NO_PINGER, 'pinger': COLUMNS_PINGER,
+                     'pinger_log': COLUMNS_PINGER_LOG}
 
 # The two names that differ between the layouts, for code that fills the
 # shared leading block once instead of branching twice. Index 0 is the
@@ -295,6 +348,19 @@ LEGEND = {
     'lin_acc_x': ('Body acceleration X', 'm/s^2'),
     'lin_acc_y': ('Body acceleration Y', 'm/s^2'),
     'lin_acc_z': ('Body acceleration Z', 'm/s^2'),
+    'pf_x': ('Filtered pinger X (odom)', 'm'),
+    'pf_y': ('Filtered pinger Y (odom)', 'm'),
+    'pf_depth': ('Pinger depth filtered', 'm'),
+    'pf_vx': ('Pinger velocity X filtered', 'm/s'),
+    'pf_vy': ('Pinger velocity Y filtered', 'm/s'),
+    'pf_var_x': ('Pinger X variance', 'm^2'),
+    'pf_cov_xy': ('Pinger XY covariance', 'm^2'),
+    'pf_var_y': ('Pinger Y variance', 'm^2'),
+    'pf_r95': ('Pinger 95% radius', 'm'),
+    'pf_status': ('Pinger filter status', 'code 0-4'),
+    'pf_fix_age': ('Pinger fix age', 's'),
+    'pf_latitude': ('Pinger latitude filtered (derived)', 'deg'),
+    'pf_longitude': ('Pinger longitude filtered (derived)', 'deg'),
 }
 
 
@@ -356,3 +422,41 @@ def target_columns_for(use_UWgps: bool) -> tuple:
              layout it is writing.
     """
     return TARGET_COLUMNS_PINGER if use_UWgps else TARGET_COLUMNS_NO_PINGER
+
+
+def pinger_mode_of(pinger_mode='', use_pinger=False) -> str:
+    """The effective pinger mode: `pinger_mode` when given, else the
+    `use_pinger` alias (True = follow, False = off)."""
+    mode = str(pinger_mode or '').strip().lower()
+    if mode:
+        if mode not in PINGER_MODES:
+            raise ValueError(f"pinger_mode '{pinger_mode}' is not one of {', '.join(PINGER_MODES)}")
+        return mode
+    return 'follow' if use_pinger else 'off'
+
+
+def columns_for_mode(pinger_mode: str) -> list:
+    """A NEW list of the column names the run's pinger mode writes."""
+    return list(COLUMNS_OF_LAYOUT[LAYOUT_OF_MODE[pinger_mode]])
+
+
+def target_columns_for_mode(pinger_mode: str) -> tuple:
+    """The target pairs of the mode's layout: the pinger is the target only when
+    the boat follows it; in log mode the path target stays the target."""
+    return TARGET_COLUMNS_PINGER if pinger_mode == 'follow' else TARGET_COLUMNS_NO_PINGER
+
+
+def layout_of_header(header) -> str:
+    """'no_pinger' | 'pinger' | 'pinger_log' of a header (any revision).
+
+    Decided by NAME: the target pair that comes FIRST is the run's target (the
+    schema puts it in the shared leading block). A log-mode run has `target_x`
+    before the legacy `corrected_pinger_x`; a pinger run (and a log reviewer
+    with-pinger export, which appends the path target at the end) has
+    `corrected_pinger_x` first."""
+    header = list(header)
+    has_p = 'corrected_pinger_x' in header
+    has_t = 'target_x' in header
+    if has_p and has_t:
+        return 'pinger_log' if header.index('target_x') < header.index('corrected_pinger_x') else 'pinger'
+    return 'pinger' if has_p else 'no_pinger'

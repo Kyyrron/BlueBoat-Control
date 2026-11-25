@@ -10,7 +10,9 @@
 | Controller log | `<root>/data/{ctrl}_data/{date}-{ctrl}_{sim}_data.npy` | Per run |
 | Run bag | `<root>/data/Robot_data/<csv stem>/{date}-{note}-bag/` (mcap) | **Raw field record**, sessions only: every topic except `/side_scan_sonar/*`, `/sss_processor/*`, `/sss_ai/*` |
 | Path snapshot | `<root>/data/Robot_data/<csv stem>/{date}-{note}-path.yaml` | Copy of a path run's `from_yaml` mission; not for replanner runs |
-| Path-update log | `<root>/data/Robot_data/<csv stem>/{date}-{note}-pathlog.csv` | **Raw field record**: one row per `/blueboat/path_update_event`, 3 header rows (`path_update_log.LEGEND`); only if the run received a request; never for the pinger layout |
+| Path-update log | `<root>/data/Robot_data/<csv stem>/{date}-{note}-pathlog.csv` | **Raw field record**: one row per `/blueboat/path_update_event`, 3 header rows (`path_update_log.LEGEND`); only if the run received a request; never for a pinger-following run |
+| Pinger per-fix log | `<root>/data/Robot_data/<csv stem>/{date}-{note}-pingerlog.csv` | **Raw field record** (2026-11-24): one row per `/blueboat/pinger/fix` (every processed fix with the pose used at its measurement time, the filter's decision and the legacy value), 3 header rows (`pinger_log.LEGEND`); `config` rows carry the filter set applied from then on and `state` rows a snapshot of the filter (the estimator emits one at every run start, after every parameter change and every 10 s); `robot_interface` starts the file AT a snapshot, so the file alone re-runs the live filter bit for bit from its first row (checked on a live graph by `test/pinger_integration.py`); follow and log modes only |
+| Pinger smoothed track | `<root>/data/Robot_data/<csv stem>/{date}-{note}-pinger-smoothed.csv` | Derived, written once by `poslog_report` at filing: the RTS smoother over the re-run of the per-fix log |
 
 **Per run in a session**: nothing is claimed until `start`; `master_control` reserves the
 `.npy` at `start`, `robot_interface` opens the CSV when `run_state` reports the run (layout
@@ -39,9 +41,13 @@ targets world-frame (N9). The header is a row of **strings** in the same array, 
 coerces everything to strings — cast back on load. Written by `save_monitoring` on a 2 s
 timer and at shutdown, never from the control tick.
 
-**CSV.** Two layouts by `use_UWgps`: **no pinger, 27 columns** and **pinger, 39 columns**,
-sharing the first 19 (`robot_log_schema.py`'s docstring is the column list and revision
-record). Rows are filled **by column name**. Two **legend rows** (description, unit) precede
+**CSV.** Three layouts by pinger mode (`robot_log_schema.py`'s docstring is the column list and
+revision record): **no pinger, 27 columns** (`off`); **pinger, 52 columns** (`follow`: the 39 v1.1
+columns + the 13-column filtered block `pf_*` appended 2026-11-24; the target slot
+`corrected_pinger_*` keeps meaning the LEGACY pinger); **pinger_log, 56 columns** (`log`, new: the 27
+no-pinger columns with the path target, then the legacy pinger, the UGPS packet and `pf_*`). The
+first 19 are shared structurally; a reader decides the layout by name
+(`robot_log_schema.layout_of_header`: the target pair that comes first is the target). Rows are filled **by column name**. Two **legend rows** (description, unit) precede
 the column names, written at file creation (a killed run keeps them); older logs have none
 and are never rewritten — `robot_log_schema.split_header` finds the header row in both,
 pandas reads a new log with `header=2`. No description or unit may contain a comma. In the
@@ -49,7 +55,9 @@ pinger layout `ant_*` is all-zero and `dep` duplicates `aco_z`. `actuation_state
 disabled, `1` live, `2` enabled but not in override, `3` watchdog forcing zero. The
 `<stem>-origin.yaml` sidecar carries `latitude`, `longitude` (the local-ENU frame's origin,
 latched at the first odom) and `yaw0_rad` (provenance only; since 2026-08-31 `relative_psi`
-is absolute ENU yaw, before it was `yaw − yaw0`).
+is absolute ENU yaw, before it was `yaw − yaw0`); a follow- or log-mode run's sidecar also carries
+`pinger_mode`, `pinger_source`, `pinger_filter_preset`, `pinger_filter_hash`, `pinger_mapping` and
+`pinger_filter_params` (one-line JSON) of the filter in force when it was written (2026-11-24).
 
 **Simulation writes the same CSV** (`simulation_interface`, always no-pinger): date columns
 are **sim time** (1970-01-01), `lin_acc_*` is differentiated odometry (no gravity),

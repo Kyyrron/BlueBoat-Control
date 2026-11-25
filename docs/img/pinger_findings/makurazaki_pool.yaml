@@ -1,0 +1,9 @@
+# Outline of the Makurazaki pool (50 x 20 m, 0.85 m deep) from the side-scan sonar wall fit of the
+# GPS accuracy study (~/Desktop/randomData/report_Kagoshima/gps_accuracy_study, table "corners").
+# Used by pinger_filter_replay --outline as a weak ground truth: the brush robot is always inside.
+name: makurazaki_pool
+corners:   # [latitude, longitude], degrees
+  - [31.26388154, 130.29900505]   # bottom-right
+  - [31.26405645, 130.29897899]   # top-right
+  - [31.26399972, 130.29845774]   # top wall, west end
+  - [31.26382480, 130.29848379]   # bottom wall, west end

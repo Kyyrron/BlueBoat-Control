@@ -163,8 +163,15 @@ Evaluation is a binary search plus linear interpolation
 ([`YamlTrajectory.pose`](_custom_libraries/yaml_trajectory.py)), with yaw interpolated
 the short way around the circle. Two edge rules:
 
-* **past the end** → clamps to the last sample (the boat stops there), unless `loop: true`,
-  in which case `t` wraps modulo the duration;
+* **past the end** → clamps to the last sample, position **and heading** (the boat holds the
+  final pose until STOP RUN: MPC regulates to it, PID/LoS engage the station-keeping hold),
+  unless `loop: true`, in which case `t` wraps modulo the duration and the path repeats forever.
+  `path_generation` publishes the served file's `duration_s` and `loop` on `/blueboat/path_info`
+  and `master_control` reports `path_complete` (run state, path progress) once `tau` passes the
+  end of a non-loop path. (2026-11-24: "every path loops" was the mission files' own `loop: true`,
+  written by the designer's former single "Loop mission" box, which also closed the path; the
+  designer now has two boxes, "Return to start" (the closing leg, flown once) and "Repeat
+  forever" (`loop`).)
 * **before the start** → clamps to the first sample.
 
 All the hard geometry (arcs, Béziers, splines, lawnmower patterns, per-segment speeds) is

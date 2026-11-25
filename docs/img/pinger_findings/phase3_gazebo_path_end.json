@@ -1,0 +1,38 @@
+[
+ {
+  "controller": "PID",
+  "target_reached_end_at_s": 34.64999999999418,
+  "hold_span_s": 97.01999999998952,
+  "max_dist_m": 0.6347257750853024,
+  "median_dist_m": 0.16243992767138374,
+  "min_progress_x_m": 11.851282603458023,
+  "target_held": true,
+  "ok": true
+ },
+ {
+  "controller": "LoS",
+  "target_reached_end_at_s": 35.30999999999767,
+  "hold_span_s": 96.35999999998603,
+  "max_dist_m": 0.37470240929103166,
+  "median_dist_m": 0.3745240153527942,
+  "min_progress_x_m": 11.625297996834918,
+  "target_held": true,
+  "ok": true
+ },
+ {
+  "controller": "MPC",
+  "target_reached_end_at_s": 31.679999999993015,
+  "hold_span_s": 99.98999999999069,
+  "max_dist_m": 0.0004740430307810044,
+  "median_dist_m": 0.0002383592943451277,
+  "min_progress_x_m": 11.999996014688074,
+  "target_held": true,
+  "ok": true
+ },
+ {
+  "target_back_near_start": true,
+  "first_at_s": 35.30999999999767,
+  "ok": true,
+  "controller": "PID (loop: true)"
+ }
+]

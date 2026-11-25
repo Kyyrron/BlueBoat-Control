@@ -295,6 +295,8 @@ def run_one(src_root, scenario, controller, real, out_path, time_source=None):
         args += ["-p", f"path_source:={sc['path_source']}"]
     if sc.get("use_pinger"):
         args += ["-p", "use_pinger:=true"]
+    for key, value in sc.get("params", {}).items():          # scenario-specific parameters
+        args += ["-p", f"{key}:={value}"]
     if time_source == "ros":
         args += ["-p", "time_source:=ros"]
     # Extra parameter overrides (`--param k:=v`, or MC_HARNESS_PARAMS="k:=v;k:=v"):
@@ -482,10 +484,17 @@ SCENARIOS = {
 
 def _pinger_feed_factory(goal=(8.0, 5.0)):
     """Feed /blueboat/pinger_coordinates every tick: the body-frame vector from
-    the plant to a fixed world point, as robot_interface publishes it."""
+    the plant to a fixed world point, as pinger_estimator publishes it -- and,
+    to a tree that has it (2026-11-24), a 'tracking' /blueboat/pinger/estimate,
+    so follow mode chases exactly as v1.1 did (the HEAD comparison stays
+    bit-identical; a stale estimate's hold is tested by mc_pinger_scenarios)."""
+    estimate = json.dumps({"schema": "blueboat_pinger_estimate/1", "status": "tracking"})
+
     def feed(c):
         x, y, psi = c.plant.s[:3]
         dx, dy = goal[0] - x, goal[1] - y
+        if hasattr(c.node, "pinger_estimate_callback"):
+            c.node.pinger_estimate_callback(c.String(data=estimate))
         c.node.pinger_callback(c.F32(data=[math.cos(psi) * dx + math.sin(psi) * dy,
                                            -math.sin(psi) * dx + math.cos(psi) * dy, 0.0]))
     return feed
@@ -522,6 +531,12 @@ try:                                    # the live-path-update scenarios
     sys.path.insert(0, HERE)
     import mc_replanner_scenarios as _rs
     SCENARIOS.update(_rs.SCENARIOS)
+except ImportError:                     # pragma: no cover
+    pass
+
+try:                                    # the pinger-mode scenarios (2026-11-24, A4)
+    import mc_pinger_scenarios as _ps
+    SCENARIOS.update(_ps.SCENARIOS)
 except ImportError:                     # pragma: no cover
     pass
 
@@ -605,6 +620,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--compare", metavar="REV", help="regression: REV vs working tree")
     ap.add_argument("--replanner", action="store_true", help="offline path-update scenarios")
+    ap.add_argument("--pinger-modes", action="store_true",
+                    help="pinger modes: configure table, log mode with/without a path, stale hold")
     ap.add_argument("--controllers", default=",".join(CONTROLLERS))
     ap.add_argument("--scenarios", default=",".join(REGRESSION))
     ap.add_argument("--no-real", action="store_true", help="skip the real-parameter runs")
@@ -643,6 +660,9 @@ def main():
     if args.replanner:
         import mc_replanner_scenarios as rs
         return rs.main(controllers)
+    if args.pinger_modes:
+        import mc_pinger_scenarios as ps
+        return ps.main(controllers)
     ap.print_help()
     return 2
 

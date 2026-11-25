@@ -35,7 +35,6 @@ TIMESTAMPS - the part that goes wrong silently.
     own time, never matched to the nearest row (rows are 0.33 s apart).
 """
 
-import mmap
 import os
 import struct
 import time
@@ -45,11 +44,11 @@ import numpy as np
 from . import poslog_bridge as pb
 
 import frame_math                                                   # noqa: E402
+import mcap_lite                                                    # noqa: E402
 
 BODY_TOPIC = "/blueboat/pinger_coordinates"
 UGPS_TOPIC = "/uw_gps_data"
-UGPS_COLUMNS = ("aco_x", "aco_y", "aco_z", "ant_x", "ant_y", "ant_z",
-                "lat", "lon", "dep", "filaco_x", "filaco_y", "filaco_z")
+UGPS_COLUMNS = pb.rls.UGPS_COLUMNS     # /uw_gps_data[7:19], as robot_interface logs them
 
 MAX_START_GAP_S = 120.0     # bag start vs first poslog row, after zone removal
 ZONE_STEP_S = 1800.0        # time zones are whole multiples of 30 minutes
@@ -79,8 +78,13 @@ FILTER = {"max_yaw_rate": 0.35, "max_speed": 1.0, "reanchor_s": 3.0,
           "consensus_s": 10.0, "consensus_m": 3.0}
 
 
-class PingerBagError(Exception):
-    """The bag cannot give a pinger for this run (the message says why)."""
+# The MCAP reader and the CDR decoders live in `_custom_libraries/mcap_lite.py`
+# (moved there 2026-11-24, so the pinger_filter_replay CLI and poslog_report read
+# bags with the same code). These names are kept for the reviewer's callers.
+PingerBagError = mcap_lite.McapError
+_mcap_files = mcap_lite.mcap_files
+read_topics = mcap_lite.read_topics
+decode_float32_multiarray = mcap_lite.decode_float32_multiarray
 
 
 # ---------------------------------------------------------------------------
@@ -98,103 +102,6 @@ def find_bag(csv_path):
     return path if os.path.isdir(path) else None
 
 
-def _mcap_files(bag):
-    # os.listdir, not glob: a bag filed from staging keeps a hidden
-    # `.run-bag-<pid>-<k>_0.mcap` name, which a `*.mcap` glob skips.
-    names = sorted(n for n in os.listdir(bag) if n.endswith(".mcap"))
-    return [os.path.join(bag, n) for n in names]
-
-
-def _string(buf, pos):
-    n = struct.unpack_from("<I", buf, pos)[0]
-    return bytes(buf[pos + 4:pos + 4 + n]).decode("utf-8", "replace"), pos + 4 + n
-
-
-def _decompress(name, blob):
-    if name == "zstd":
-        try:
-            import zstandard
-        except ImportError as exc:
-            raise PingerBagError("the bag's chunks are zstd-compressed and "
-                                 "'zstandard' is not installed") from exc
-        return zstandard.ZstdDecompressor().decompress(blob)
-    if name == "lz4":
-        try:
-            import lz4.frame
-        except ImportError as exc:
-            raise PingerBagError("the bag's chunks are lz4-compressed and "
-                                 "'lz4' is not installed") from exc
-        return lz4.frame.decompress(blob)
-    raise PingerBagError("unknown MCAP chunk compression %r" % name)
-
-
-def _records(buf, pos, end):
-    while pos + 9 <= end:
-        op = buf[pos]
-        length = struct.unpack_from("<Q", buf, pos + 1)[0]
-        yield op, pos + 9, pos + 9 + length
-        pos += 9 + length
-
-
-def read_topics(path, topics):
-    """{topic: [(log_time_ns, payload bytes), ...]} and the file's (first, last)
-    message time in ns. Only the wanted topics are copied out."""
-    wanted = set(topics)
-    out = {topic: [] for topic in topics}
-    channels = {}
-    span = [None, None]
-
-    def visit(buf, start, end):
-        for op, a, b in _records(buf, start, end):
-            if op == 0x04:                                   # Channel
-                cid = struct.unpack_from("<H", buf, a)[0]
-                channels[cid] = _string(buf, a + 4)[0]
-            elif op == 0x05:                                 # Message
-                cid, _seq, log_time = struct.unpack_from("<HIQ", buf, a)
-                topic = channels.get(cid)
-                if topic in wanted:
-                    out[topic].append((log_time, bytes(buf[a + 22:b])))
-
-    with open(path, "rb") as handle:
-        with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as buf:
-            if bytes(buf[:8]) != b"\x89MCAP0\r\n":
-                raise PingerBagError("%s is not an MCAP file" % os.path.basename(path))
-            for op, a, b in _records(buf, 8, len(buf) - 8):
-                if op == 0x06:                               # Chunk
-                    first, last = struct.unpack_from("<QQ", buf, a)
-                    span[0] = first if span[0] is None else min(span[0], first)
-                    span[1] = last if span[1] is None else max(span[1], last)
-                    compression, p = _string(buf, a + 28)
-                    records_len = struct.unpack_from("<Q", buf, p)[0]
-                    body = bytes(buf[p + 8:p + 8 + records_len])
-                    if compression:
-                        body = _decompress(compression, body)
-                    visit(body, 0, len(body))
-                elif op == 0x0F:                             # DataEnd
-                    break
-                else:
-                    visit(buf, a - 9, b)                     # loose records
-    return out, tuple(span)
-
-
-def decode_float32_multiarray(payload):
-    """The `data` of a std_msgs/Float32MultiArray in little-endian CDR."""
-    if len(payload) < 16 or payload[1] != 1:
-        raise PingerBagError("unexpected CDR encoding in a pinger message")
-    pos = 4
-    dims = struct.unpack_from("<I", payload, pos)[0]
-    pos += 4
-    for _ in range(dims):                       # MultiArrayDimension: label, size, stride
-        n = struct.unpack_from("<I", payload, pos)[0]
-        pos = (pos + 4 + n + 3) & ~3
-        pos += 8
-    pos = (pos + 3) & ~3
-    pos += 4                                    # layout.data_offset
-    count = struct.unpack_from("<I", payload, pos)[0]
-    pos += 4
-    return np.frombuffer(payload, "<f4", count, pos).astype(float)
-
-
 def read_bag(bag):
     """The pinger messages of a bag.
 
@@ -202,21 +109,9 @@ def read_bag(bag):
     times are EPOCH seconds of the bag's receive clock, `body` is (n, 3) and
     `ugps` is (n, 19) - the raw packet exactly as `robot_interface` logs it.
     """
-    files = _mcap_files(bag)
-    if not files:
-        raise PingerBagError("no .mcap file inside %s" % bag)
-    topics = {BODY_TOPIC: [], UGPS_TOPIC: []}
-    first = last = None
-    for path in files:
-        part, span = read_topics(path, topics)
-        for topic in topics:
-            topics[topic].extend(part[topic])
-        if span[0] is not None:
-            first = span[0] if first is None else min(first, span[0])
-            last = span[1] if last is None else max(last, span[1])
+    topics, (first, last) = mcap_lite.read_bag(bag, (BODY_TOPIC, UGPS_TOPIC))
 
-    def unpack(rows, width):
-        rows.sort(key=lambda r: r[0])
+    def unpack(rows, width):                    # rows already sorted by time
         times = np.array([r[0] for r in rows], dtype=float) * 1e-9
         values = np.zeros((len(rows), width))
         for i, (_t, payload) in enumerate(rows):
@@ -396,15 +291,95 @@ def estimate_from_log(run, params=None):
             "params": params, "bag": None, "shift_s": 0.0}
 
 
+def from_filter_columns(run):
+    """The pinger_estimator's own filtered estimate, as the log recorded it
+    (`pf_*` columns, written since 2026-11-24). None when the log has none."""
+    d = run["data"]
+    if "pf_x" not in d or "pf_y" not in d:
+        return None
+    ok = np.isfinite(d["pf_x"]) & np.isfinite(d["pf_y"])
+    if not np.any(ok):
+        return None
+    t = np.asarray(run["t"], dtype=float)
+    raw_t = raw_x = raw_y = np.zeros(0)
+    if "corrected_pinger_x" in d:
+        found = (d["corrected_pinger_x"] != 0.0) | (d["corrected_pinger_y"] != 0.0)
+        raw_t, raw_x, raw_y = t[found], d["corrected_pinger_x"][found], d["corrected_pinger_y"][found]
+    ugps = np.zeros((len(t), 19))
+    for j, name in enumerate(UGPS_COLUMNS):
+        if name in d:
+            ugps[:, 7 + j] = d[name]
+    return {"t": t[ok], "x": d["pf_x"][ok], "y": d["pf_y"][ok],
+            "raw_t": raw_t, "raw_x": raw_x, "raw_y": raw_y,
+            "n_detected": int(ok.sum()), "n_trusted": int(ok.sum()), "n_accepted": int(ok.sum()),
+            "ugps_t": t, "ugps": ugps, "first_t": float(t[ok][0]), "last_t": float(t[ok][-1]),
+            "params": {"method": "pinger_estimator, as logged (pf_* columns)"},
+            "bag": None, "shift_s": 0.0, "method": "logged", "hold_s": HOLD_S}
+
+
+def _from_core(core_run, to_mission, ugps_t, ugps, bag, shift):
+    """Re-filter with the CURRENT pinger filter (pinger_filter_replay, the
+    pinger_estimator's own core). None when the core cannot use the run (no
+    pose topic, no usable fix) -- the heuristic below is then the fallback."""
+    import pinger_filter_replay as pfr
+    import pinger_params as pp
+    if not any(k == "odom" for _, k, _v in core_run.events):
+        return None
+    params = pp.load_params()
+    res = pfr.replay(core_run, params)
+    est = [e for e in res["estimates"] if e.get("x") is not None]
+    if len(est) < 2:
+        return None
+    t = to_mission(np.array([e["t"] for e in est], dtype=float))
+    leg = np.array(res["legacy"], dtype=float) if res["legacy"] else np.zeros((0, 3))
+    dec = [f["decision"] for f in res["fixes"]]
+    used = sum(dec.count(k) for k in ("accepted", "downweighted", "reinit"))
+    detected = len([d for d in dec if d not in ("duplicate", "invalid")])
+    return {"t": t, "x": np.array([e["x"] for e in est]), "y": np.array([e["y"] for e in est]),
+            "raw_t": to_mission(leg[:, 0]) if len(leg) else np.zeros(0),
+            "raw_x": leg[:, 1] if len(leg) else np.zeros(0),
+            "raw_y": leg[:, 2] if len(leg) else np.zeros(0),
+            "n_detected": detected, "n_trusted": detected, "n_accepted": used,
+            "ugps_t": ugps_t, "ugps": ugps, "first_t": float(t[0]), "last_t": float(t[-1]),
+            "params": {"method": "re-filtered with the current pinger filter",
+                       "preset": params.preset, "hash": params.hash},
+            "bag": bag, "shift_s": float(shift), "method": "core",
+            "hold_s": float(params["stale_timeout_s"])}
+
+
 def attach(run):
     """Find the run's pinger and record the outcome on `run`: `run["pinger"]`
     is the estimate or None, `run["pinger_note"]` says why not (shown as the
     checkbox's tooltip). Never raises.
 
-    A with-pinger log carries the pinger itself; any other log is looked up in
-    its ros2 bag."""
+    In order (2026-11-24): the log's own filtered block (`pf_*`); the run's bag
+    re-filtered with the current pinger filter; a pinger log's UGPS columns
+    re-filtered with it; and, only when the filter cannot read the run, the
+    heuristic filter below (bag, or the log's corrected_pinger columns)."""
     run["pinger"] = None
-    if run["layout"] == "pinger":
+    found = from_filter_columns(run)
+    if found is not None:
+        run["pinger"] = found
+        run["pinger_note"] = ("Show the filtered pinger the run logged (pinger_estimator, "
+                              "pf_* columns): first at %.0f s" % found["first_t"])
+        return
+    if run["layout"] in ("pinger", "pinger_log") and find_bag(run["path"]) is None:
+        found = None
+        if "aco_x" in run["data"]:
+            try:
+                import pinger_filter_replay as pfr
+                found = _from_core(pfr.load_csv(run["path"]),
+                                   lambda tt: np.asarray(tt) - first_row_epoch(run),
+                                   np.zeros(0), np.zeros((0, 19)), None, 0.0)
+            except Exception:                           # noqa: BLE001 - fall back
+                found = None
+        if found is not None:
+            run["pinger"] = found
+            run["pinger_note"] = (
+                "Show the pinger re-filtered from this log's UGPS columns with the current "
+                "pinger filter (%s, rows 0.33 s apart): %d fixes, %d used"
+                % (found["params"]["hash"], found["n_detected"], found["n_accepted"]))
+            return
         found = estimate_from_log(run)
         if found is None:
             run["pinger_note"] = "this pinger log never detected the pinger"
@@ -425,6 +400,23 @@ def attach(run):
         if data["start_s"] is None:
             raise PingerBagError("the bag holds no messages")
         shift = time_shift(run, data["start_s"])
+    except (PingerBagError, OSError, struct.error, ValueError) as exc:
+        run["pinger_note"] = "bag unreadable: %s" % exc
+        return
+    try:
+        import pinger_filter_replay as pfr
+        found = _from_core(pfr.load_bag(bag), lambda tt: to_mission_time(run, tt, shift),
+                           to_mission_time(run, data["ugps_t"], shift), data["ugps"], bag, shift)
+    except Exception:                                   # noqa: BLE001 - fall back
+        found = None
+    if found is not None:
+        run["pinger"] = found
+        run["pinger_note"] = (
+            "Show the pinger from the bag, re-filtered with the current pinger filter "
+            "(%s): %d fixes, first at %.0f s, %d used"
+            % (found["params"]["hash"], found["n_detected"], found["first_t"], found["n_accepted"]))
+        return
+    try:
         found = estimate(run, data, shift)
     except (PingerBagError, OSError, struct.error, ValueError) as exc:
         run["pinger_note"] = "bag unreadable: %s" % exc
@@ -452,7 +444,7 @@ def held_at(found, when):
     index = np.searchsorted(found["t"], when, side="right") - 1
     ok = index >= 0
     safe = np.where(ok, index, 0)
-    ok &= (when - found["t"][safe]) <= HOLD_S
+    ok &= (when - found["t"][safe]) <= found.get("hold_s", HOLD_S)
     return (np.where(ok, found["x"][safe], np.nan),
             np.where(ok, found["y"][safe], np.nan))
 
@@ -531,6 +523,15 @@ def export_columns(run):
 def source_name(run):
     """Where the numbers came from, for export.yaml."""
     found = run["pinger"]
+    if found.get("method") in ("logged", "core"):
+        out = {"method": found["params"].get("method"),
+               "detections": found["n_detected"], "kept": found["n_accepted"],
+               "first_detection_s": round(found["first_t"], 3),
+               "last_sample_s": round(found["last_t"], 3),
+               "filter": found["params"], "hold_s": found.get("hold_s", HOLD_S)}
+        if found["bag"] is not None:
+            out.update(bag=os.path.basename(found["bag"]), bag_to_log_zone_shift_s=found["shift_s"])
+        return out
     if found["bag"] is None:
         return {"source": "the log's own corrected_pinger_x/y",
                 "detections": found["n_detected"], "kept": found["n_accepted"],

@@ -260,3 +260,62 @@ Register §4.
 | Toggles hold ↔ pursuit | manual | widen `manual_reacquire_radius` − `manual_hold_radius` |
 | Stops dead at the pinger | pinger | `safety_distance` = −1.0 |
 | Cannot hold on `station_keeping` | PID / LoS | `hold_speed` above the authored speed, then `los_hold_kx`/`umax` or `outer_gains_x` |
+
+## Pinger filter (2026-11-24)
+
+The pinger filter is `pinger_estimator`'s (not `master_control`'s): a robust Kalman estimate of the
+pinger's WORLD position from the Water Linked raw fixes, compensated for latency through a pose
+buffer, still between fixes. Every parameter with its unit, range and description is in
+`blueboat_control/config/pinger_filter.yaml`. Set them with `pinger_preset` / `pinger_filter_yaml`
+at launch, or per run from the station ("Advanced…"). Evidence and tuning:
+`docs/PINGER_FILTER_FINDINGS.md`.
+
+**Field tuning cards (2026-11-24).** The schema's `field_tuning` block lists the nine knobs worth
+touching in the field (fix delay, receiver rotation, left/right mirror, trust in each fix, agility,
+top speed, outlier tolerance, jump to a new place, when to give up), each in plain words (what it
+does, what lowering and raising it does, how to set it in the field), with a slider range and a
+picture of its effect: `config/pinger_tuning/*.png`, made by running the filter itself at a low
+value, the default and a high value on synthetic scenes with the field-measured noise, errors as the
+median of 5 scenes (`docs/img/pinger_findings/make_tuning_figures.py`; re-run after any filter or
+default change). The station shows them as its "Field tuning" tab. What the pictures say about the
+defaults (synthetic scenes, so a hint for the field calibration, not a re-tune):
+- **Re-acquisition rarely triggers with field-level noise.** `reinit_n` 4 within `reinit_radius_m`
+  2 m almost never agrees at 15–20 m range (12° bearing noise scatters fixes ±4 m), so a pinger moved
+  15 m is reached by walking at `v_max`: about 25 s. A 5–8 m radius re-acquires in about 13 s, and 4
+  fixes still ignore a 3-fix burst of wild fixes.
+- On a robot that drives long straight lines then stops, a lower `sigma_a` (0.002) and a lower
+  `gate_soft` scored slightly better than the defaults; `v_max` above the robot's speed changes little.
+
+Presets:
+- **`slow_rov`** (default): constant velocity, `sigma_a` 0.02 m/s², `v_max` 0.5 m/s (the brush
+  robot crawls at 0.1–0.3 m/s), bearing 12°, range noise 20 % of range, Huber.
+- **`static_target`**: position only, for a pinger on a fixed object.
+
+**Provisional values** (no still-pinger data): `latency_s` 1.5, `y_sign` +1, `mount_yaw_deg` 0, lever
+arm 0. Re-fit them first: `docs/PINGER_FIELD_CALIBRATION.md`.
+
+Replay any run through a changed set before flying it (the decisions, NIS and tracks are in the
+figures):
+
+```bash
+python3 blueboat_control/src/_custom_libraries/pinger_filter_replay.py run <bag> --out /tmp/pf --set latency_s=1.2 sigma_bearing_deg=10
+python3 blueboat_control/src/_custom_libraries/pinger_filter_replay.py grid <bag> --grid latency_s=0:3:0.25 y_sign=-1,1 mount_yaw_deg=-20:20:5
+```
+
+| Symptom | Try, in order |
+|---|---|
+| The filtered pinger swings sideways when the boat turns, still pinger | `latency_s` (grid on a calibration run), then `mount_yaw_deg` |
+| The filtered pinger is mirrored across the boat's axis / runs the wrong way when the boat turns | `y_sign` −1 (check on a still pinger first) |
+| It sits ahead of / behind the true pinger along the boat's travel | `latency_s` ↑ (ahead) / ↓ (behind) |
+| A constant offset that turns with the boat | `lever_x_m`, `lever_y_m` (the receiver layout's reference point vs the boat's odom point) |
+| Too jumpy (follows each noisy fix) | `sigma_bearing_deg` ↑, `range_k` ↑, `sigma_a` ↓; for a fixed pinger `static_target` |
+| Lags a moving pinger, cuts its turns | `sigma_a` ↑, `v_max` ↑ (≤ the robot's top speed) |
+| Many fixes set aside, estimate stuck | `gate_hard` ↑ or `v_hard` ↑; check `reinit_radius_m` / `reinit_n` (re-acquisition) |
+| Re-acquires (jumps) too often | `reinit_n` ↑, `reinit_radius_m` ↓ |
+| Slow to start / after a long dropout | `init_n` ↓, `init_radius_m` ↑ |
+| Status flips to `coasting` / `stale` during normal tracking | `coast_after_s` / `stale_timeout_s` ↑ (the device gives ~1.6 fixes/s) |
+| Follow mode holds too often | `stale_timeout_s` (filter) and `pinger_stale_timeout` (`master_control`, 3 s) |
+| Mean NIS on accepted fixes ≫ 3 (`metrics.json`) | the noise model is too optimistic: `sigma_bearing_deg` ↑, `range_k` ↑ |
+| Mean NIS ≪ 1 | too pessimistic: `sigma_bearing_deg` ↓ |
+| Everything invalid "no boat pose at the measurement time" | `latency_s` > `pose_buffer_s`, odometry not arriving (`/blueboat/odom`), or odometry gaps longer than `max_pose_gap_s` |
+| Fixes invalid "position_valid=false" / "valid receivers" | the device's own quality flags; `require_position_valid`, `min_receivers` only if the device misreports |

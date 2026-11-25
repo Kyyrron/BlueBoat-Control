@@ -30,6 +30,7 @@
 # ============================================================================
 
 from rclpy.node import Node, QoSProfile
+from rclpy.qos import DurabilityPolicy, ReliabilityPolicy
 import rclpy
 
 import contextlib
@@ -56,6 +57,10 @@ import frame_math as fm         # world<->body geometry (ROS-free)
 import path_stamp as ps         # /path_request response tag (ROS-free)
 import thrust_limits as tl      # uniform thrust saturation (ROS-free)
 import path_update as pu        # live path update core (ROS-free)
+import robot_log_schema as rls  # pinger modes: one resolver with robot_interface (ROS-free)
+
+# Statuses of /blueboat/pinger/estimate the follow law may steer to.
+PINGER_CHASE_STATUSES = ('tracking', 'coasting')
 
 # Column names of the controller .npy log; row 0 of the saved array (CM-7).
 NPY_HEADER = ['t', 'x', 'y', 'psi', 'x_d', 'y_d', 'psi_d', 'u1', 'u2']
@@ -100,6 +105,23 @@ class Controller(Node):
         self.controller_type = self._param('controller_type', 'MPC').string_value
         self.isSimulation = self._param('simulation', True).bool_value
         self.use_pinger = self._param('use_pinger', False).bool_value
+        # Pinger mode (2026-11-24, additive): off | follow | log; '' = from
+        # use_pinger. `use_pinger` below keeps meaning FOLLOW the pinger.
+        # log = "log the pinger only": the boat never steers to it. In off and
+        # log mode the run follows the path (any controller), or with has_path
+        # False requests no path at all and only holds a manual target /
+        # arrow keys (has_path means nothing when following the pinger).
+        try:
+            mode = rls.pinger_mode_of(self._param('pinger_mode', '').string_value,
+                                      self.use_pinger)
+        except ValueError as exc:
+            self.get_logger().fatal(str(exc))
+            raise
+        self._set_pinger_mode(mode, self._param('has_path', True).bool_value)
+        # Follow mode chases only a fresh estimate (status tracking/coasting,
+        # message younger than this); otherwise it holds position.
+        self.pinger_stale_timeout = self._param('pinger_stale_timeout', 3.0).double_value
+        self.pinger_source = 'filter'   # echoed in run_state (set by configure)
         # Run sessions (section 6): only a station real-robot launch sets it.
         self.session_mode = self._param('session_mode', False).bool_value
         # Empty = resolve it (custom_functions.data_root).
@@ -109,6 +131,14 @@ class Controller(Node):
 
         self.odom_subscriber = self.create_subscription(Odometry, '/blueboat/odom', self.odom_callback, 10)
         self.pinger_subscriber = self.create_subscription(Float32MultiArray, '/blueboat/pinger_coordinates', self.pinger_callback, 10)
+        # The estimate's status gates the follow law (stale -> hold position).
+        self.pinger_estimate_subscriber = self.create_subscription(
+            String, '/blueboat/pinger/estimate', self.pinger_estimate_callback, 10)
+        # What the path server serves (duration, loop) -> path_complete.
+        path_info_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                                   durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.path_info_subscriber = self.create_subscription(
+            String, '/blueboat/path_info', self.path_info_callback, path_info_qos)
         self.ready_subscriber = self.create_subscription(Bool, '/blueboat/controller_ready', self.ready_callback, 10)
         self.manual_target_subscriber = self.create_subscription(Float32MultiArray, '/blueboat/manual_target', self.manual_target_callback, 10)
         # Station arrow keys: [right, left] N while driving, [] to release.
@@ -124,8 +154,9 @@ class Controller(Node):
             self.run_state_publisher = self.create_publisher(String, '/blueboat/run_state', 10)
 
         # In a session path_generation always runs (the follow mode can change
-        # between runs), so the client does too.
-        if not self.use_pinger or self.session_mode:
+        # between runs), so the client does too. Outside one: not when
+        # following the pinger, nor in log mode without a path.
+        if self._follows_path() or self.session_mode:
             self.client = self.create_client(RequestPath, '/path_request')
 
             while not self.client.wait_for_service(timeout_sec=1.0):
@@ -146,6 +177,11 @@ class Controller(Node):
 
         self.ready = False
         self.pinger_target = None
+        self.pinger_estimate = None     # latest /blueboat/pinger/estimate (dict)
+        self.pinger_estimate_rx = None  # _world_clock() when it arrived
+        self.pinger_hold = None         # (x, y, yaw) held while the estimate is stale
+        self.path_info = None           # latest /blueboat/path_info (dict)
+        self.path_complete_logged = False
         self.manual_target = [0.0,0.0]
 
         self.controller_path = Path()
@@ -203,7 +239,7 @@ class Controller(Node):
         self.cmd_detail = ''
         self._build_pool = None         # worker thread for an MPC rebuild
         self._build_future = None
-        self._build_pinger = None       # follow mode requested with that build
+        self._build_mode = None         # (pinger_mode, has_path) with that build
 
         if not self.session_mode:
             self.title = self._reserve_npy(self.controller_type)
@@ -609,7 +645,7 @@ class Controller(Node):
         if self.path_source == 'replanner' and not self.use_pinger and self.run_active:
             self._replanner_reference_step(current_time, current_state,
                                            manual_active, arrow_active)
-        elif not self.use_pinger and self.run_active:
+        elif self._follows_path() and self.run_active:
             self._mission_reference_step(current_time, current_state,
                                          manual_active or arrow_active)
 
@@ -650,7 +686,8 @@ class Controller(Node):
             self.get_logger().info(f'\nManual target coordinates: \n{target_str}')
 
         if (self.controller_path.poses or (self.use_pinger and self.pinger_target is not None)
-                or manual_active or arrow_active or self._awaiting_hold_active()):
+                or manual_active or arrow_active or self._awaiting_hold_active()
+                or self.pinger_hold is not None):
             self._record_monitoring(current_time, current_state, u,
                                     world_target if world_target is not None else target)
 
@@ -712,6 +749,9 @@ class Controller(Node):
         is to be targeted. Priority: arrows, manual target, path following,
         replanner awaiting-hold, pinger. May zero current_state[:3] (pinger PID
         runs body-frame), as the monitoring row has always recorded."""
+        if (arrow_active or manual_active) and self.pinger_hold is not None:
+            # The operator took over: a later hold latches where they leave the boat.
+            self.pinger_hold = None
         if arrow_active:
             age = time.time() - self.arrow_rx if self.arrow_rx is not None else math.inf
             if age <= self.arrow_timeout:
@@ -750,10 +790,70 @@ class Controller(Node):
             target = fm.inRobotFrame(current_state, [hx, hy, 0, 0, 0, 0])
             return self.solve_LoS(target, current_time, keep_location=True), target, world_target
 
-        if self.run_active and self.use_pinger and self.pinger_target is not None:
-            return self._pinger_command(current_state, current_time)
+        if self.run_active and self.use_pinger:
+            ok, why = self._pinger_chase_ok()
+            if ok:                      # ok implies a finite, non-zero pinger_target
+                if self.pinger_hold is not None:
+                    self.get_logger().info("Pinger estimate tracking again - resuming pinger following.")
+                    self.pinger_hold = None
+                return self._pinger_command(current_state, current_time)
+            return self._pinger_hold_command(current_state, current_time, why)
 
         return None
+
+    def _follows_path(self):
+        """Does this run follow a path (and so request one)? Not when
+        following the pinger, nor without a path (has_path False, off or log)."""
+        return not self.use_pinger and self.has_path
+
+    def _set_pinger_mode(self, mode, has_path):
+        """The one place the run mode is set. `use_pinger` (what the v1.0 code
+        reads) is derived: True only in follow mode."""
+        self.pinger_mode, self.has_path = mode, has_path
+        self.use_pinger = mode == 'follow'
+
+    def _pinger_chase_ok(self):
+        """(ok, reason): may the follow law steer to /blueboat/pinger_coordinates?
+        Only on a fresh estimate whose status is tracking or coasting."""
+        est, rx = self.pinger_estimate, self.pinger_estimate_rx
+        if est is None or rx is None:
+            return False, "no estimate from pinger_estimator yet"
+        age = self._world_clock() - rx
+        if age > self.pinger_stale_timeout:
+            return False, f"estimate {age:.1f} s old (pinger_stale_timeout {self.pinger_stale_timeout:.1f} s)"
+        # The status of the source /blueboat/pinger_coordinates carries (the
+        # filter's, or the legacy input's with pinger_source legacy); an
+        # older estimator only has `status`.
+        status = est.get('source_status') or est.get('status')
+        if status not in PINGER_CHASE_STATUSES:
+            return False, f"pinger estimate is '{status}'"
+        tgt = self.pinger_target
+        if tgt is None or len(tgt) < 2:
+            return False, "no pinger vector yet"
+        if not all(math.isfinite(float(v)) for v in tgt[:2]):
+            return False, "pinger vector is not finite"
+        if float(tgt[0]) == 0.0 and float(tgt[1]) == 0.0:
+            return False, "pinger vector is zero (not detected)"
+        return True, ""
+
+    def _pinger_hold_command(self, current_state, current_time, why):
+        """Follow mode with no usable estimate: hold the position where the
+        estimate was lost (manual-target keep-location law, as the replanner's
+        awaiting-hold), until the estimate is tracking again."""
+        if self.pinger_hold is None:
+            self.pinger_hold = (float(current_state[0]), float(current_state[1]),
+                                float(current_state[2]))
+            if list(self.manual_target) == [0.0, 0.0]:
+                self._clear_manual_hold()
+            self.get_logger().warning(
+                f"Pinger following paused ({why}): holding position at "
+                f"({self.pinger_hold[0]:.2f}, {self.pinger_hold[1]:.2f}).")
+        else:
+            self.get_logger().warning(f"Pinger following paused: {why}.", throttle_duration_sec=5.0)
+        hx, hy, hyaw = self.pinger_hold
+        world_target = [hx, hy, hyaw]  # --- world-frame monitoring target ---
+        target = fm.inRobotFrame(current_state, [hx, hy, 0, 0, 0, 0])
+        return self.solve_LoS(target, current_time, keep_location=True), target, world_target
 
     def _path_following_command(self, current_state):
         """Path following on the held reference window (MPC / PID / LoS)."""
@@ -1200,6 +1300,40 @@ class Controller(Node):
     def pinger_callback(self, msg: Float32MultiArray):
         self.pinger_target = msg.data
 
+    def pinger_estimate_callback(self, msg: String):
+        try:
+            est = json.loads(msg.data)
+        except ValueError:
+            return
+        if isinstance(est, dict):
+            self.pinger_estimate = est
+            self.pinger_estimate_rx = self._world_clock()
+
+    def path_info_callback(self, msg: String):
+        try:
+            info = json.loads(msg.data)
+        except ValueError:
+            return
+        if isinstance(info, dict):
+            self.path_info = info
+            self.path_complete_logged = False
+
+    def path_complete(self):
+        """Has the run's (non-loop) path ended? The boat then holds the final
+        pose until STOP RUN (yaml_trajectory clamps; the controllers hold)."""
+        if not self.run_active or self.use_pinger:
+            return False
+        if self.path_source == 'replanner':
+            plan = self.path_updater.plan
+            return bool(plan) and plan.t_end is not None and self.tau >= plan.t_end
+        if not self._follows_path():
+            return False
+        info = self.path_info
+        if not info or not info.get('loaded') or info.get('loop'):
+            return False
+        duration = info.get('duration_s')
+        return duration is not None and self.tau >= float(duration)
+
     def ready_callback(self, msg: Bool):
         # Readiness is re-published periodically; log only the transition.
         if msg.data and not self.ready:
@@ -1345,7 +1479,20 @@ class Controller(Node):
             return
 
         ctype = str(cmd.get('controller_type', self.controller_type))
-        use_pinger = bool(cmd.get('use_pinger', self.use_pinger))
+        # Pinger mode (additive): `pinger_mode` wins; else `use_pinger`
+        # (True = follow, False = off); else unchanged.
+        try:
+            if cmd.get('pinger_mode') not in (None, ''):
+                mode = rls.pinger_mode_of(cmd.get('pinger_mode'))
+            elif 'use_pinger' in cmd:
+                mode = 'follow' if bool(cmd.get('use_pinger')) else 'off'
+            else:
+                mode = self.pinger_mode
+        except ValueError as exc:
+            self._answer(cmd, False, str(exc))
+            return
+        use_pinger = mode == 'follow'
+        has_path = bool(cmd.get('has_path', True))
         if ctype not in ('PID', 'LoS', 'MPC'):
             self._answer(cmd, False, f"unknown controller_type '{ctype}'")
             return
@@ -1362,20 +1509,25 @@ class Controller(Node):
             self._answer(cmd, False, "a replanner run follows paths, not the pinger - "
                                      "set use_pinger false or path_source 'mission'")
             return
+        if path_source == 'replanner' and not has_path:
+            self._answer(cmd, False, "a replanner run always has a path (the replanner's) - "
+                                     "has_path false needs path_source 'mission'")
+            return
         self.path_source = path_source
+        self.pinger_source = str(cmd.get('pinger_source', self.pinger_source))
 
         self.run_note = str(cmd.get('note', self.run_note))
         self.run_mission = str(cmd.get('mission', self.run_mission))
 
         if ctype == self.controller_type and self.run_status != 'error':
-            self.use_pinger = use_pinger
+            self._set_pinger_mode(mode, has_path)
             self.run_status = 'idle'
             self._answer(cmd, True, f"{ctype} ready")
             return
 
         if ctype == 'MPC':
             self.run_status = 'loading'
-            self._build_pinger = use_pinger
+            self._build_mode = (mode, has_path)
             if self._build_pool is None:
                 self._build_pool = ThreadPoolExecutor(max_workers=1,
                                                       thread_name_prefix='mpc_build')
@@ -1388,7 +1540,7 @@ class Controller(Node):
         self._apply_controller_setup(ctype)
         self.controller = self._make_controller(ctype)
         self.controller_type = ctype
-        self.use_pinger = use_pinger
+        self._set_pinger_mode(mode, has_path)
         self.run_status = 'idle'
         self.get_logger().info(f"Controller switched to {ctype} for the next run.")
         self._answer(cmd, True, f"{ctype} ready")
@@ -1413,7 +1565,7 @@ class Controller(Node):
         self._apply_controller_setup('MPC')
         self.controller = controller
         self.controller_type = 'MPC'
-        self.use_pinger = bool(self._build_pinger)
+        self._set_pinger_mode(*self._build_mode)    # set with every submit
         self.run_status = 'idle'
         self.cmd_ok = True
         self.cmd_detail = "MPC ready"
@@ -1458,6 +1610,8 @@ class Controller(Node):
         self.tau_requested = None
         self.path_rx_time = None
         self.last_world_target = None
+        self.pinger_hold = None
+        self.path_complete_logged = False
 
         # Controller memory from the previous run must not leak into this one.
         if ctrl == 'PID' and self.controller is not None:
@@ -1473,7 +1627,13 @@ class Controller(Node):
         self.run_status = 'running'
         # A new run never inherits a path (a replanner run starts holding).
         self._path_update_reset('run_started')
-        follow = 'pinger' if self.use_pinger else 'path'
+        logged = self.pinger_mode == 'log'
+        if self.use_pinger:
+            follow = 'pinger'
+        elif not self.has_path:         # never a replanner run (refused at launch / configure)
+            follow = 'nothing (no path, pinger logged)' if logged else 'nothing (no path)'
+        else:
+            follow = 'path (pinger logged)' if logged else 'path'
         self.get_logger().info(
             f"RUN {self.run_number} STARTED - {ctrl}, {follow} following"
             f"{' (' + self.run_mission + ')' if self.run_mission else ''}. "
@@ -1499,6 +1659,7 @@ class Controller(Node):
         self.future = None
         self.request_sent = None
         self.path_rx_time = None
+        self.pinger_hold = None
         self._path_update_reset('run_stopped')
 
         self.get_logger().info(
@@ -1523,6 +1684,16 @@ class Controller(Node):
             'npy': f"{self.title}.npy" if self.title else '',
             # Additive: robot_interface skips a replanner run's path snapshot.
             'path_source': self.path_source,
+            # Additive (2026-11-24): the pinger mode (robot_interface picks the
+            # CSV layout from it), the pinger source the station chose, the
+            # path parameter and whether a non-loop path has ended.
+            'pinger_mode': self.pinger_mode,
+            # What pinger_estimator applies (its estimate says), else the
+            # last configure's request.
+            'pinger_source': (self.pinger_estimate or {}).get('source') or self.pinger_source,
+            'has_path': bool(self.has_path),
+            'tau': float(self.tau),
+            'path_complete': bool(self.path_complete()),
         }
         msg = String()
         msg.data = json.dumps(state)
@@ -1548,6 +1719,11 @@ class Controller(Node):
         if self.path_source == 'replanner' and self.use_pinger:
             msg = ("path_source:=replanner follows paths, not the pinger: launch "
                    "with use_pinger:=false or path_source:=mission")
+            self.get_logger().fatal(msg)
+            raise ValueError(msg)
+        if self.path_source == 'replanner' and not self.has_path:
+            msg = ("path_source:=replanner always has a path (the replanner's): "
+                   "has_path:=false needs path_source:=mission")
             self.get_logger().fatal(msg)
             raise ValueError(msg)
 
@@ -1746,6 +1922,14 @@ class Controller(Node):
             self.get_logger().error(f"/blueboat/path_progress: {type(exc).__name__}: {exc}",
                                     throttle_duration_sec=10.0)
             return
+        # Additive (2026-11-24).
+        complete = self.path_complete()
+        payload['path_complete'] = bool(complete)
+        payload['pinger_mode'] = self.pinger_mode
+        if complete and not self.path_complete_logged:
+            self.path_complete_logged = True
+            self.get_logger().info(f"Path complete (tau {self.tau:.1f} s) - holding the final pose "
+                                   "until STOP RUN.")
         msg = String()
         msg.data = json.dumps(payload)
         self.path_progress_publisher.publish(msg)
