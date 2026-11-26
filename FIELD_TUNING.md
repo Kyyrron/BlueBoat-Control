@@ -1,48 +1,8 @@
 # FIELD TUNING — `master_control.py`
 
-Every knob below is a **declared ROS parameter**, so a change costs a launch argument, not a
-rebuild:
-
-```bash
-ros2 launch blueboat_control BlueBoat_launch.py controller_type:='PID' \
-  --ros-args -p /blueboat/master_control:los_ku:=25.0
-ros2 param list /blueboat/master_control      # the whole set
-```
-
-Defaults are given **real / sim**. A single value means both are the same. All of them are
-declared in one place, `Controller._declare_tuning_parameters`; the **Used in** column names
-the method that reads it, not a line number — lines move, methods do not.
-
-**Which column runs (2026-11-13).** "real" is the real boat's column. "sim" is the column
-tuned on the old Gazebo plant (BlueROV2 hull coefficients). The parameter `gain_profile`
-chooses:
-
-| `gain_profile` | Column | Where |
-|---|---|---|
-| `''` (default) or `field` | **real** | the real boat, always; and simulation by default: the **field-equivalent** configuration |
-| `sim` | **sim** | simulation only (refused with `simulation:=false`): the **legacy** configuration |
-
-So a simulation now runs the real boat's gains, MPC model, horizon and weights unless asked
-otherwise. `simulation` itself still decides the log file name, `/pose_arrow` and nothing else
-in this file. Proof that the two spellings of the real column are one: `simulation:=false`
-and `simulation:=true gain_profile:=field` are bit-identical on the harness (9 runs, 3
-controllers). See "Simulation configurations" at the end.
-
-Branch priority in `timer_callback`: arrow keys → manual target → path following → pinger →
-zero thrust. A manual target overrides the path in **every** `controller_type`; the station's
-arrow keys override both.
-
-**Run sessions** (`session_mode:=true`, every real-robot launch from the Mission Control
-Station since 2026-10-09). The knobs below are still read once, at node construction, so a
-value passed at launch holds for **every run** of the session. What changes between runs is
-only what the station's Update Mission sends: `controller_type`, pinger-vs-path and the log
-note (`configure` on `/blueboat/run_command`). A switch to MPC builds its solver then, on a
-worker thread — about a second when cached, about a minute after any MPC knob below changed
-— and START RUN waits for it. To change a gain, relaunch the session.
-
----
-
 ## Shared — all modes
+
+📍 `blueboat_control/src/master_control.py:475` (`control_dt`), `:584–602` (thrust, timeouts)
 
 | Parameter | Default | Used in | Effect |
 |---|---|---|---|
@@ -54,6 +14,8 @@ worker thread — about a second when cached, about a minute after any MPC knob 
 | `arrow_timeout` | 0.5 s | `timer_callback` | Dead-man of the station's arrow-key stream (20 Hz): an older command is not applied — zero thrust, and arrow control stays engaged rather than handing back to autonomous control. |
 
 ### Governor (PID, LoS, MPC path following) — `advance_governor`
+
+📍 `blueboat_control/src/master_control.py:478–485` (defaults) · law `:1098`
 
 `tau_dot = path_speed_scale · fac_along · fac_cross`
 
@@ -75,6 +37,8 @@ worker thread — about a second when cached, about a minute after any MPC knob 
 ---
 
 ## 1. PID path following — law in `PID.PIDLoS.compute`
+
+📍 `blueboat_control/src/master_control.py:489–498` (gains), `:510–511` (`hold_*`) · law `blueboat_control/src/PID/PID.py:99`
 
 > **The `hold_*` pair is only for a reference that has stopped moving** (`station_keeping`, a
 > finished mission, waiting for a YAML). Normally PID steers along the path tangent — but a
@@ -98,6 +62,8 @@ worker thread — about a second when cached, about a minute after any MPC knob 
 ---
 
 ## 2. LoS path following — `los_guidance`
+
+📍 `blueboat_control/src/master_control.py:501–512` · law `:1119`
 
 Surge = authored speed feedforward (no along-track integrator); yaw = P-D on heading error.
 
@@ -128,6 +94,8 @@ Surge = authored speed feedforward (no along-track integrator); yaw = P-D on hea
 
 ## 3. MPC path following — built in `Controller._build_controller`, solved in `ur_mpc.MPCController.solve`
 
+📍 `blueboat_control/src/master_control.py:563–581` (parameters), `:546–559` (`mpc_model`) · solve `blueboat_control/src/MPC/ur_mpc.py:373`
+
 | Parameter | Default real / sim | Effect |
 |---|---|---|
 | `mpc_horizon` N | 15 / **30** | Prediction steps; sets step `dt = mpc_time/N` and QP size `nv = 2N`. |
@@ -145,6 +113,8 @@ Not used by this branch: `outer_*`, `inner_*`, `los_*`, `hold_*`, `point_*`, `ma
 ---
 
 ## 4. Manual target — pursuit in `solve_LoS`, hold in `manual_keep_location`
+
+📍 `blueboat_control/src/master_control.py:516–535` · pursuit `:1165`, hold `:1223`
 
 Active whenever `/blueboat/manual_target ≠ [0,0]`, in **any** `controller_type`.
 
@@ -191,56 +161,15 @@ Active whenever `/blueboat/manual_target ≠ [0,0]`, in **any** `controller_type
 
 **Pinger branch** (`use_pinger:=True`, `LoS`) uses the same pursuit law but no hold:
 
+📍 `blueboat_control/src/master_control.py:519`
+
 | Parameter | Default real / sim | Effect |
 |---|---|---|
 | `safety_distance` | **−1.0** / 1.0 | Arrival range: reverse 1 s then **zero thrust for the rest of the run**. Negative disables it, which is the real-boat default. |
 
 With `PID` + pinger, the §1 gains apply in a zeroed body frame.
 
----
-
-## Simulation configurations (2026-11-13)
-
-One switch on `Sim_launch.py`, two named configurations. `docs/PARAMETER_REGISTER.md` has the
-origin and interval of every number.
-
-| | `sim_config:=field_equivalent` (default) | `sim_config:=legacy` |
-|---|---|---|
-| Plant (`plant`) | `identified`: the BlueBoat hull and actuator identified on field logs | `bluerov2_legacy`: the BlueROV2 table |
-| Gains, MPC model, horizon, weights (`gain_profile`) | the real boat's column (N 15, T 2.5 s, R 0.015) | the sim-tuned column (N 30, T 6 s, R 0.10) |
-| Thrust applied (`thrust_rate_hz`) | 20 Hz, as `robot_interface` | 10 Hz |
-| `/blueboat/odom` (`odom_profile`) | field timing `field_13hz`: 25 Hz bursts and 4 Hz stretches, link delay | Gazebo's own 20 Hz, no delay |
-| Use | any simulated result meant to transfer to the boat | reproducing a simulation made before 2026-11-13 |
-
-```bash
-ros2 launch blueboat_control Sim_launch.py controller_type:=MPC trajectory:=from_yaml:<route>          # field-equivalent
-ros2 launch blueboat_control Sim_launch.py controller_type:=MPC trajectory:=<…> sim_config:=legacy    # as before
-# single pieces, on top of either: plant:=identified|bluerov2_legacy  odom_profile:=passthrough|field_3hz|field_4hz|field_13hz  odom_seed:=<n>
-# the gains of a field day (blueboat_control/config/field_runs/README.md):
-ros2 launch blueboat_control Sim_launch.py controller_type:=PID trajectory:=<…> \
-  tuning_file:=$(ros2 pkg prefix blueboat_control)/share/blueboat_control/config/field_runs/2026_09_07_PID.yaml
-```
-
-What to expect from the identified plant (measured in Gazebo against the pool run): 0.61 /
-0.99 / 1.40 m/s at 2 × 4 / 10 / 20 N; about 20 N for 1.0 m/s; a time constant in yaw of
-1.5 s at rest, and far less turn per Newton under way than the old plant gave (1.3 °/s for a
-12.7 N differential at 1.1 m/s, against 14 °/s). The sim-tuned column was tuned on a hull
-that needed three times the thrust: do not pair it with the identified plant and read
-anything into the result.
-
-The simulator's own launch (`full_mission_launch.py`) and MCS's world runs get the
-field-equivalent configuration from the defaults of each piece; they cannot select `legacy`
-until that launch forwards the argument (`docs/REQUESTS.md` R-6).
-
-**Heave / roll / pitch (2026-11-15, R-8): `vertical_model`.** `Sim_launch.py` defaults to
-`standalone`: it starts no sea node, so the hull is Gazebo's buoyancy box, the Hydrodynamics plugin
-carries the vertical damping, and the CoG stays at the box construction. World runs
-(`full_mission_launch.py`) get `sea_node`: the simulator's sea node owns hydrostatics and damping,
-and the CoG is the physical one. On the box, the physical CoG capsizes the boat (roll GM −0.025 m).
-So `Sim_launch.py vertical_model:=sea_node` only makes sense with a sea node started beside it.
-Register §4.
-
-## Symptom → knob
+## Symptom → Things to try
 
 | Symptom | Mode | Try, in order |
 |---|---|---|
@@ -261,56 +190,64 @@ Register §4.
 | Stops dead at the pinger | pinger | `safety_distance` = −1.0 |
 | Cannot hold on `station_keeping` | PID / LoS | `hold_speed` above the authored speed, then `los_hold_kx`/`umax` or `outer_gains_x` |
 
-## Pinger filter (2026-11-24)
+## Pinger filter
 
-`pinger_estimator` runs a robust Kalman estimate of the pinger's WORLD position from the Water Linked
-raw fixes, placing each fix with the boat pose of its measurement time and holding still between fixes.
-Every parameter, its range and what raising / lowering it does: `blueboat_control/config/pinger_filter.yaml`.
-Presets: **`slow_rov`** (default; a robot crawling at 0.1–0.3 m/s) and **`static_target`** (a pinger
-on a fixed object: position only).
+`pinger_estimator` estimates the pinger's WORLD position from the Water Linked fixes: each fix is placed
+with the boat pose of the moment it was measured, wild fixes are believed less or ignored, and the
+estimate holds still between fixes. It works out of the box: every value below has a default taken from
+the October 2026 recordings. Change one only when you see the symptom given for it.
 
-**Tune live.** `BlueBoat_launch.py` gives the node a tuning file, by default
-`~/.config/blueboat_control/pinger_tuning.yaml`, created on first launch with every parameter listed
-commented out (value, range, what it does). Uncomment a line, change it, save: it applies within a second
-and the estimate is kept (only `model` restarts it). A bad value is refused (reason in the log) and the
-previous set stays.
 
-```yaml
-preset: slow_rov
-params:
-  latency_s: 1.2
-```
 
-The station's pinger filter dialog (with the Field tuning cards and their pictures,
-`config/pinger_tuning/*.png`) sends its set with every `configure`, so its set is the one in force at
-each run start: enter values found live in the dialog to keep them.
+Columns: line in the tuning file · default and its line in `config/pinger_filter.yaml`.
 
-**Field calibration, live, with the pinger still at a known point** (`latency_s` 1.5, `y_sign` +1,
-`mount_yaw_deg` 0 and the lever arm are provisional until this is done). Show the raw-fix layer on the
-station's map, pinger mode `log`, and edit the file while driving:
-1. **Lever arm** first, from the Water Linked receiver layout: its reference point relative to the
-   boat's position point is `lever_x_m` (forward), `lever_y_m` (left).
-2. **`latency_s`:** turn slowly on the spot about 10 m from the pinger. Wrong latency smears the fixes
-   into an arc that shifts with each turn; adjust until they stay in one place.
-3. **`mount_yaw_deg`:** circle the pinger. A ring of fixes around it means the angle is wrong; adjust
-   until the ring becomes a cloud.
-4. **`y_sign`:** drive past with the pinger on your left; it must be drawn on the left.
-5. **`sigma_bearing_deg`** by eye, with the pinger still and then moving: raise it if the filtered
-   pinger jitters, lower it if it lags behind a pinger you can see moving.
+**Geometry: check once, again after moving the Water Linked antenna**
 
-| Symptom | Try, in order |
-|---|---|
-| The filtered pinger swings sideways when the boat turns, still pinger | `latency_s`, then `mount_yaw_deg` |
-| The filtered pinger is mirrored across the boat's axis / runs the wrong way when the boat turns | `y_sign` −1 (check on a still pinger first) |
-| It sits ahead of / behind the true pinger along the boat's travel | `latency_s` ↑ (ahead) / ↓ (behind) |
-| A constant offset that turns with the boat | `lever_x_m`, `lever_y_m` |
-| Too jumpy (follows each noisy fix) | `sigma_bearing_deg` ↑, `range_k` ↑, `sigma_a` ↓; for a fixed pinger `static_target` |
-| Lags a moving pinger, cuts its turns | `sigma_a` ↑, `v_max` ↑ (≤ the robot's top speed) |
-| Many fixes set aside, estimate stuck | `gate_hard` ↑ or `v_hard` ↑; check `reinit_radius_m` / `reinit_n` |
-| Slow to follow a robot that was moved | `reinit_radius_m` ↑ (5–8 m): the default 2 m rarely agrees with field-level noise |
-| Re-acquires (jumps) too often | `reinit_n` ↑, `reinit_radius_m` ↓ |
-| Slow to start / after a long dropout | `init_n` ↓, `init_radius_m` ↑ |
-| Status flips to `coasting` / `stale` during normal tracking | `coast_after_s` / `stale_timeout_s` ↑ (the device gives ~1.6 fixes/s) |
-| Follow mode holds too often | `stale_timeout_s` (filter) and `pinger_stale_timeout` (`master_control`, 3 s) |
-| Everything invalid "no boat pose at the measurement time" | odometry not arriving (`/blueboat/odom`) or arriving with gaps over 2 s |
-| Fixes invalid "position_valid=false" / "valid receivers" | the device's own quality flags; `require_position_valid`, `min_receivers` only if the device misreports |
+| Value | Tuning line | Default (line) | What it is | When to change |
+|---|---|---|---|---|
+| `y_sign` | 9 | `1` (50) | Left/right of the antenna: +1 as installed, −1 mirrored | Only if a pinger on the boat's left is drawn on its right. The October data say +1 |
+| `latency_s` | 8 | `1.5` s (42) | How old a fix is when it arrives (acoustic travel + the unit's processing); the fix is placed with the boat pose of that moment | A still pinger smears into an arc while the boat turns, or sits ahead of / behind its true place along the boat's travel (ahead: raise, behind: lower). Steps of 0.2 s |
+| `mount_yaw_deg` | 11 | `0.0` ° (66) | Rotation of the antenna's forward axis against the bow, counter-clockwise positive | Only after remounting the antenna rotated, or if circling a still pinger draws a ring around it instead of a cloud |
+| `lever_x_m` | 12 | `0.0` m (74) | How far forward of the boat's position point the antenna's reference point is | When you have measured it (Water Linked receiver layout). The error it causes is at most that distance, under 1 m: low priority |
+| `lever_y_m` | 13 | `0.0` m (82) | Same, to the left | Same |
+
+**Smoothing: by eye, any time**
+
+| Value | Tuning line | Default (line) | What it is | When to change |
+|---|---|---|---|---|
+| `sigma_bearing_deg` | 28 | `12.0` ° (178) | How noisy one fix's direction is assumed to be. The main smoothing knob | Jitters while the robot is still: raise (15–20). Lags behind a robot you see moving: lower (8–10). Field data: 13–17° |
+| `sigma_a` | 21 | `0.02` m/s² (129) | How quickly the robot may change speed or direction | Overshoots or cuts the robot's turns: raise. Wanders while the robot is still: lower |
+| `v_max` | 22 | `0.5` m/s (137) | The fastest the estimate may move | Set it a little above the robot's real top speed (brush robot 0.1–0.3 m/s). A faster robot: raise it, or the estimate falls behind |
+| `range_k` | 27 | `0.2` (170) | Distance error per metre of range (0.2 = 20 %) | Far fixes jump towards / away from the boat: raise |
+| `preset` | 4 | `slow_rov` | A starting set: `slow_rov` (a moving robot) or `static_target` (a pinger on a fixed object: position only, the steadiest) | The pinger is on something that does not move: `static_target` |
+
+**Wild fixes and jumps**
+
+| Value | Tuning line | Default (line) | What it is | When to change |
+|---|---|---|---|---|
+| `gate_soft` | 34 | `5.99` (217) | How far (statistically) a fix may land from the estimate before it is believed less; 5.99 lets 95 % of good fixes through | Many wild fixes (walls, a hull, multipath): lower. The estimate refuses to follow a real move: raise |
+| `reinit_radius_m` | 42 | `2.0` m (274) | How close together the doubted fixes must be to make the estimate jump to them | The robot was picked up and put down and the estimate crawls after it: raise to 5–8 m (2 m rarely agrees with field-level noise) |
+| `reinit_n` | 41 | `4` (266) | How many doubted fixes in a row make it jump | It jumps on short bursts of wild fixes: raise |
+
+**Which fixes count, and when to give up**
+
+| Value | Tuning line | Default (line) | What it is | When to change |
+|---|---|---|---|---|
+| `max_range_m` | 16 | `60.0` m (99) | Fixes farther than this are ignored | In a pool: the pool's size, so impossible far-off fixes are dropped |
+| `min_receivers` | 18 | `3` (113) | Fixes heard by fewer receivers are ignored | Only if most fixes are refused with a "valid receivers" reason (`ros2 topic echo /blueboat/pinger/fix`, fields `decision` / `reason`; also in the run bag) |
+| `require_position_valid` | 17 | `true` (107) | Ignore fixes the unit itself flags invalid | Only if most fixes are refused with reason "position_valid=false" (same topic) |
+| `coast_after_s` | 45 | `2.0` s (291) | No new fix for this long: status `coasting` (still followed) | Rarely; it only changes what the panel shows |
+| `stale_timeout_s` | 46 | `6.0` s (299) | No new fix for this long: status `stale`, Follow mode holds the boat in place | The boat stops during short USBL dropouts: raise. It keeps driving to an out-of-date position: lower |
+
+Every other parameter in the file is listed there with its range and effect; the defaults are right for
+the BlueBoat as built.
+
+**Not in the tuning file**
+
+| What | File and line | What it is | When to change |
+|---|---|---|---|
+| `pinger_source` | `blueboat_control/launch/BlueBoat_launch.py:18` (`filter`); or `pinger_source:=legacy` on the launch line | What Follow mode steers to: the filter, or the old v1.1 pinger | Fallback only, if the filter misbehaves in the field |
+| `pinger_preset` | `BlueBoat_launch.py:19` (`slow_rov`) | The preset when the tuning file names none | Prefer `preset:` in the tuning file (line 4), which wins |
+| `pinger_filter_yaml` | `BlueBoat_launch.py:20` | Path of the tuning file (`''`: no live tuning) | To keep several tuning files (one per robot or site) |
+| `pinger_stale_timeout` | `blueboat_control/src/master_control.py:137` (`3.0` s), then `colcon build` | Follow mode also holds when no estimate *message* has arrived for this long | Only if the network drops messages between the nodes; it is not about USBL fixes |
+
